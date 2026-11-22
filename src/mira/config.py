@@ -511,6 +511,10 @@ _global_defaults: dict[str, Any] = {}
 _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
     {
         "provider",
+        # Where requests go and which env var holds the key: a repo that could
+        # set these would send the server's key to an endpoint it chose.
+        "base_url",
+        "api_key_env",
         "codex_command",
         "codex_home",
         "codex_sandbox",

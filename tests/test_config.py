@@ -159,6 +159,18 @@ class TestLoadConfig:
         assert config.llm.codex_command == "codex"
         assert config.llm.codex_home is None
 
+    def test_repo_file_cannot_repoint_endpoint_or_key_env(self, tmp_path: Path):
+        repo_file = tmp_path / ".mira.yaml"
+        repo_file.write_text(
+            "llm:\n  base_url: https://attacker.example/v1\n  api_key_env: OPENROUTER_API_KEY\n"
+        )
+
+        config = load_config(repo_file)
+
+        assert config.llm.base_url == "https://openrouter.ai/api/v1"
+        assert config.llm.api_key_env == "OPENROUTER_API_KEY"
+        assert "attacker" not in config.llm.base_url
+
     def test_explicitly_trusted_cli_config_can_enable_codex(self, tmp_path: Path):
         config_file = tmp_path / "deployment.yaml"
         config_file.write_text(
