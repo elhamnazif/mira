@@ -13,7 +13,7 @@ from typing import Literal
 from pydantic import TypeAdapter, ValidationError
 
 from mira.config import IndexingTemperature, LLMConfig
-from mira.llm import registry
+from mira.llm import registry, slugs
 
 logger = logging.getLogger(__name__)
 _INDEXING_TEMPERATURE: TypeAdapter[IndexingTemperature] = TypeAdapter(IndexingTemperature)
@@ -105,12 +105,13 @@ def estimate_indexing_cost(file_count: int, model: str) -> dict:
 
 
 def get_indexing_model(config: LLMConfig, db_value: str | None = None) -> str:
-    """Resolve the indexing model: DB → config.indexing_model → config.model."""
+    """Resolve the indexing model: DB → config.indexing_model → config.model,
+    or its cheap sibling when config.model is a slug that has one."""
     if db_value:
         return db_value
     if config.indexing_model:
         return config.indexing_model
-    return config.model
+    return slugs.cheap_for(config.model)
 
 
 def get_review_model(config: LLMConfig, db_value: str | None = None) -> str:
@@ -127,7 +128,8 @@ def get_security_model(
     db_value: str | None = None,
     db_review_model: str | None = None,
 ) -> str:
-    """Resolve the security-pass model: DB → config.security_model → review tier.
+    """Resolve the security-pass model: DB → config.security_model → review tier,
+    or the review tier's cheap sibling when it is a slug that has one.
 
     The review-tier fallback includes the dashboard's review_model setting
     (``db_review_model``) — without it, an instance whose review model lives
@@ -135,13 +137,14 @@ def get_security_model(
 
     Never falls back to ``indexing_model`` — the security sweep is the
     highest-stakes cheap pass, and silently downgrading it to the indexing
-    tier trades security recall for indexing cost savings.
+    tier trades security recall for indexing cost savings. A slug's cheap
+    sibling is the slug's own choice, and setting ``security_model`` avoids it.
     """
     if db_value:
         return db_value
     if config.security_model:
         return config.security_model
-    return get_review_model(config, db_review_model)
+    return slugs.cheap_for(get_review_model(config, db_review_model))
 
 
 # Thinking effort used when neither the dashboard nor mira.yaml sets one. The

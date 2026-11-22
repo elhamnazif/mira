@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mira.config import LLMConfig
+from mira.config import LLMConfig, MiraConfig
+from mira.dashboard.models_config import llm_config_for
 from mira.exceptions import ConfigError, LLMError, NonRetriableLLMError
-from mira.llm import provider_profiles, slugs
+from mira.llm import create_llm, provider_profiles, slugs
+from mira.llm.agent_cli import ClaudeCodeProvider
 from mira.llm.provider import LLMProvider
 from mira.llm.slugs import Harness
 
@@ -168,6 +170,115 @@ def test_choose_harness(
 def test_an_override_that_cannot_run_a_slug_is_refused(override: str) -> None:
     with pytest.raises(ConfigError, match=override):
         slugs.choose_harness("zai/glm", {}, override)
+
+
+# ── create_llm ───────────────────────────────────────────────────────
+
+
+def _review_llm(llm: dict, monkeypatch: pytest.MonkeyPatch, **env: str):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    config = MiraConfig.model_validate({"llm": llm}).llm
+    return create_llm(llm_config_for("review", config, use_dashboard=False))
+
+
+def test_create_llm_runs_a_slug_on_its_api_profile(
+    no_claude_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = _review_llm({"model": "zai/glm"}, monkeypatch, ZAI_API_KEY="k" * 20)
+
+    assert isinstance(llm, LLMProvider)
+    assert llm.config.provider == "openai"
+    assert llm.config.model == "zai/glm-5.3"
+    assert llm.config.base_url == "https://api.z.ai/api/paas/v4"
+    assert llm.config.api_key_env == "ZAI_API_KEY"
+    assert llm.config.fallback_model == "zai/glm-5.3-flash"
+    # Mira's default "medium" rounds down to GLM's floor rung.
+    assert llm.config.reasoning_effort == "low"
+
+
+def test_create_llm_runs_an_anthropic_slug_on_claude_code_with_a_token(
+    no_claude_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = _review_llm(
+        {"model": "anthropic/claude-fable", "review_reasoning_effort": "xhigh"},
+        monkeypatch,
+        CLAUDE_CODE_OAUTH_TOKEN="t" * 20,
+    )
+
+    assert isinstance(llm, ClaudeCodeProvider)
+    cmd = llm._command(workspace=False, schema=None, system_prompt_file=None)
+    assert cmd[cmd.index("--model") + 1] == "claude-fable-5"
+    assert cmd[cmd.index("--fallback-model") + 1] == "claude-opus-4-8"
+    assert cmd[cmd.index("--effort") + 1] == "xhigh"
+
+
+def test_an_explicit_endpoint_keeps_its_base_url(
+    no_claude_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = _review_llm(
+        {"model": "deepseek/deepseek-pro", "base_url": "https://litellm.internal/v1"},
+        monkeypatch,
+    )
+
+    assert llm.config.base_url == "https://litellm.internal/v1"
+    assert llm.config.model == "deepseek/deepseek-v4-pro"
+    assert llm.config.fallback_model == "deepseek/deepseek-v4-flash"
+
+
+def test_an_explicit_fallback_model_wins(
+    no_claude_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = _review_llm({"model": "zai/glm", "fallback_model": "zai/glm-4.7"}, monkeypatch)
+    assert llm.config.fallback_model == "zai/glm-4.7"
+
+
+def test_the_opencode_slot_is_not_implemented(no_claude_env: None) -> None:
+    with pytest.raises(ConfigError, match="opencode"):
+        create_llm(LLMConfig(provider="opencode", model="zai/glm"))
+
+
+@pytest.mark.parametrize(
+    "llm",
+    [
+        {"model": "anthropic/claude-sonnet-4-6", "review_reasoning_effort": "max"},
+        {"model": "glm-5.3", "provider": "openai", "base_url": "https://api.z.ai/api/paas/v4"},
+        {"model": "sonnet", "provider": "claude-code"},
+    ],
+)
+def test_a_plain_model_id_is_unchanged(
+    llm: dict, monkeypatch: pytest.MonkeyPatch, no_claude_env: None
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "t" * 20)
+    config = llm_config_for(
+        "review", MiraConfig.model_validate({"llm": llm}).llm, use_dashboard=False
+    )
+    assert slugs.resolve_config(config, {"CLAUDE_CODE_OAUTH_TOKEN": "t"}) is config
+    assert create_llm(config).config == config
+
+
+# ── Cheap siblings ───────────────────────────────────────────────────
+
+
+def test_indexing_and_security_take_the_cheap_sibling() -> None:
+    config = MiraConfig.model_validate({"llm": {"model": "anthropic/claude-opus"}}).llm
+
+    assert llm_config_for("review", config, use_dashboard=False).model == "anthropic/claude-opus"
+    assert (
+        llm_config_for("indexing", config, use_dashboard=False).model == "anthropic/claude-sonnet"
+    )
+    assert (
+        llm_config_for("security", config, use_dashboard=False).model == "anthropic/claude-sonnet"
+    )
+
+
+def test_a_configured_pass_model_beats_the_cheap_sibling() -> None:
+    config = MiraConfig.model_validate(
+        {"llm": {"model": "zai/glm", "indexing_model": "zai/glm", "security_model": "zai/glm"}}
+    ).llm
+
+    assert llm_config_for("indexing", config, use_dashboard=False).model == "zai/glm"
+    assert llm_config_for("security", config, use_dashboard=False).model == "zai/glm"
 
 
 # ── Fallback on a missing model ──────────────────────────────────────
