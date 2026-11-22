@@ -488,3 +488,37 @@ class TestDropOutsideChangedHunks:
 
     def test_unparseable_diff_keeps_everything(self):
         assert drop_outside_changed_hunks([self._comment(99)], {}) != []
+
+
+class TestOneCommentPerRootCause:
+    def _dup(self, path: str, line: int) -> ReviewComment:
+        c = _make_comment(path=path, line=line, title="SQL built by string concatenation")
+        c.body = "The query interpolates user input; use a bound parameter."
+        c.agent_prompt = "Use a bound parameter."
+        return c
+
+    def test_folds_other_sites_into_the_kept_comment(self):
+        result = filter_noise(
+            [self._dup("a.py", 10), self._dup("a.py", 40), self._dup("b.py", 7)],
+            FilterConfig(confidence_threshold=0.0),
+        )
+
+        assert len(result) == 1
+        assert result[0].line == 10
+        assert result[0].body.endswith("Same issue at `a.py:40`, `b.py:7`.")
+        assert result[0].agent_prompt.endswith("Apply the same fix at `a.py:40`, `b.py:7`.")
+
+    def test_a_restatement_of_the_same_spot_adds_no_site(self):
+        result = filter_noise(
+            [self._dup("a.py", 10), self._dup("a.py", 11)],
+            FilterConfig(confidence_threshold=0.0),
+        )
+
+        assert len(result) == 1
+        assert "Same issue at" not in result[0].body
+
+    def test_distinct_findings_stay_separate(self):
+        a = self._dup("a.py", 10)
+        b = _make_comment(path="a.py", line=40, title="Connection leaked on error path")
+
+        assert len(filter_noise([a, b], FilterConfig(confidence_threshold=0.0))) == 2

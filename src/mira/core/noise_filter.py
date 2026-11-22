@@ -101,19 +101,49 @@ def _is_duplicate(
     return title_sim >= title_threshold
 
 
+def _is_other_site(a: ReviewComment, b: ReviewComment) -> bool:
+    """Whether two duplicates sit at different places rather than restating one spot."""
+    if a.path != b.path:
+        return True
+    return not _lines_overlap(a, b) and abs(a.line - b.line) > _NEAR_LINE_DISTANCE
+
+
 def _deduplicate(
     comments: list[ReviewComment],
     title_threshold: float = 0.6,
 ) -> list[ReviewComment]:
-    """Remove duplicate comments using composite similarity."""
-    if not comments:
-        return []
+    """Keep one comment per root cause, naming the other sites in its body.
 
+    The first comment of each duplicate group is kept. A duplicate at another
+    place is folded into it as a site, so the author fixes every occurrence
+    from one comment. The kept comment is updated in place so audit identity
+    holds.
+    """
     kept: list[ReviewComment] = []
+    other_sites: dict[int, list[str]] = {}
     for comment in comments:
-        if not any(_is_duplicate(comment, existing, title_threshold) for existing in kept):
+        match = next(
+            (
+                i
+                for i, existing in enumerate(kept)
+                if _is_duplicate(comment, existing, title_threshold)
+            ),
+            None,
+        )
+        if match is None:
             kept.append(comment)
+        elif _is_other_site(comment, kept[match]):
+            site = f"`{comment.path}:{comment.line}`"
+            sites = other_sites.setdefault(match, [])
+            if site not in sites:
+                sites.append(site)
 
+    for i, sites in other_sites.items():
+        c = kept[i]
+        listed = ", ".join(sites)
+        c.body = f"{c.body.rstrip()}\n\nSame issue at {listed}."
+        if c.agent_prompt:
+            c.agent_prompt = f"{c.agent_prompt.rstrip()} Apply the same fix at {listed}."
     return kept
 
 
