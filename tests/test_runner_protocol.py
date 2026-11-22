@@ -1,0 +1,251 @@
+"""RemoteStateStore answers like LocalStateStore, and its buffered writes,
+applied on the server, leave the rows LocalStateStore writes directly."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+
+import pytest
+
+from mira.config import MiraConfig
+from mira.core.state_store import LocalStateStore, ReviewRecord
+from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord
+from mira.index.store import IndexStore
+from mira.models import PRFingerprint
+from mira.runner_protocol import (
+    PRKey,
+    RecordReview,
+    RemoteStateStore,
+    ResultBundle,
+    StateSnapshot,
+    UsageReport,
+    apply_writes,
+    build_snapshot,
+    runner_config,
+)
+
+PR = PRKey(platform="github", owner="o", repo="r", pr_number=7)
+
+
+def _review(pr_number: int = 7) -> ReviewRecord:
+    return ReviewRecord(
+        pr_number=pr_number,
+        pr_title="Add billing report",
+        pr_url=f"https://github.com/o/r/pull/{pr_number}",
+        author="dev",
+        author_avatar_url="https://avatars/dev",
+        comments_posted=1,
+        blockers=1,
+        warnings=0,
+        suggestions=0,
+        files_reviewed=1,
+        lines_changed=12,
+        tokens_used=900,
+        duration_ms=4000,
+        categories="bug",
+        reviewed_paths=["billing/report.py"],
+        comments=[
+            {
+                "path": "billing/report.py",
+                "line": 3,
+                "severity": "blocker",
+                "category": "bug",
+                "title": "Cents shown as dollars",
+                "body": "Divide by 100.",
+                "github_comment_id": 55,
+            }
+        ],
+    )
+
+
+def _snapshot(**overrides) -> StateSnapshot:
+    fields: dict = {
+        "pr": PR,
+        "repo_record": RepoRecord(owner="o", repo="r", conventions="Use cents.", private=True),
+        "global_rules": ["Style: no prints"],
+        "learned_rules": ["Prefer Decimal"],
+        "last_reviewed_sha": "sha-0",
+        "review_progress": None,
+        "fingerprints": [PRFingerprint(pr_number=3, head_sha="s3", title="t", body="")],
+    }
+    fields.update(overrides)
+    return StateSnapshot(**fields)
+
+
+def _progress(chunk_index: int) -> PRReviewProgress:
+    return PRReviewProgress(
+        owner="o",
+        repo="r",
+        pr_number=7,
+        total_paths=["a.py", "b.py"],
+        reviewed_paths=["a.py"],
+        skipped_paths=["b.py"],
+        chunk_index=chunk_index,
+    )
+
+
+def _review_round(store, sha: str) -> None:
+    """The store calls of one review round, in the order PR1's recording store
+    pinned for review_pr, plus an overlap fingerprint."""
+    store.get_last_reviewed_sha("o", "r", 7, platform="github")
+    store.get_repo("o", "r")
+    store.get_learned_rules("o", "r", platform="github")
+    store.get_global_rules()
+    store.upsert_pr_fingerprint(
+        "o", "r", PRFingerprint(pr_number=7, head_sha=sha, title="t", body=""), platform="github"
+    )
+    store.list_pr_fingerprints("o", "r", platform="github")
+    store.get_repo("o", "r")
+    store.record_review("o", "r", _review(), platform="github")
+    prior = store.get_pr_review_progress("o", "r", 7, platform="github")
+    store.upsert_pr_review_progress(
+        _progress((prior.chunk_index + 1) if prior else 1), platform="github"
+    )
+    store.set_last_reviewed_sha("o", "r", 7, sha, platform="github")
+
+
+def test_reads_come_from_the_snapshot_for_its_pr_only() -> None:
+    snap = _snapshot()
+    store = RemoteStateStore(snap)
+
+    assert store.get_repo("o", "r") == snap.repo_record
+    assert store.get_global_rules() == ["Style: no prints"]
+    assert store.get_learned_rules("o", "r", platform="github") == ["Prefer Decimal"]
+    assert store.get_last_reviewed_sha("o", "r", 7, platform="github") == "sha-0"
+    assert [fp.pr_number for fp in store.list_pr_fingerprints("o", "r", platform="github")] == [3]
+    # Anything outside the snapshot reads as unknown, like an empty database.
+    assert store.get_repo("o", "dependent") is None
+    assert store.get_last_reviewed_sha("o", "r", 8, platform="github") == ""
+    assert store.get_last_reviewed_sha("o", "r", 7, platform="gitlab") == ""
+    assert store.get_learned_rules("o", "other", platform="github") == []
+    assert store.list_pr_fingerprints("o", "other", platform="github") == []
+
+
+def test_reads_after_writes_see_the_written_values() -> None:
+    store = RemoteStateStore(_snapshot())
+    _review_round(store, "sha-1")
+    _review_round(store, "sha-2")
+
+    assert store.get_last_reviewed_sha("o", "r", 7, platform="github") == "sha-2"
+    progress = store.get_pr_review_progress("o", "r", 7, platform="github")
+    assert progress is not None and progress.chunk_index == 2
+    fps = {
+        fp.pr_number: fp.head_sha for fp in store.list_pr_fingerprints("o", "r", platform="github")
+    }
+    assert fps == {3: "s3", 7: "sha-2"}
+    assert [w.op for w in store.writes] == [
+        "upsert_pr_fingerprint",
+        "record_review",
+        "upsert_pr_review_progress",
+        "set_last_reviewed_sha",
+    ] * 2
+
+
+def test_a_write_for_another_pr_is_refused() -> None:
+    store = RemoteStateStore(_snapshot())
+    with pytest.raises(ValueError):
+        store.set_last_reviewed_sha("o", "r", 8, "x", platform="github")
+    with pytest.raises(ValueError):
+        store.record_review("o", "other", _review(), platform="github")
+    with pytest.raises(ValueError):
+        store.upsert_pr_fingerprint(
+            "o",
+            "other",
+            PRFingerprint(pr_number=1, head_sha="", title="", body=""),
+            platform="github",
+        )
+    assert store.writes == []
+
+
+def test_bundle_round_trips_through_json() -> None:
+    store = RemoteStateStore(_snapshot())
+    _review_round(store, "sha-1")
+    usage = UsageReport(harness="claude-code", model="opus", input_tokens=10, cost_usd=0.5)
+    bundle = store.bundle("job-1", "succeeded", usage=usage)
+
+    parsed = ResultBundle.model_validate_json(bundle.model_dump_json())
+    assert parsed == bundle
+    assert isinstance(parsed.writes[1], RecordReview)
+    assert parsed.writes[1].review == _review()
+
+
+@pytest.fixture
+def local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalStateStore:
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    monkeypatch.setattr("mira.dashboard.api._app_db", AppDatabase(url="", admin_password="pw"))
+    return LocalStateStore()
+
+
+def _rows() -> dict:
+    """The review state LocalStateStore persists for PR 7, minus ids and times."""
+    from mira.dashboard import api
+
+    store = IndexStore.open("o", "r")
+    try:
+        events = [
+            {k: v for k, v in asdict(e).items() if k not in {"id", "created_at"}}
+            for e in store.list_review_events_for_pr(7)
+        ]
+        comments = [
+            {k: v for k, v in asdict(c).items() if k not in {"id", "review_id", "created_at"}}
+            for c in store.list_review_comments(7)
+        ]
+        fingerprints = sorted(
+            (fp.pr_number, fp.head_sha, tuple(fp.paths)) for fp in store.list_pr_fingerprints()
+        )
+    finally:
+        store.close()
+    progress = api._app_db.get_pr_review_progress("o", "r", 7, platform="github")
+    return {
+        "sha": api._app_db.get_last_reviewed_sha("o", "r", 7, platform="github"),
+        "progress": progress and {k: v for k, v in asdict(progress).items() if k != "updated_at"},
+        "events": events,
+        "comments": comments,
+        "fingerprints": fingerprints,
+    }
+
+
+def test_applied_writes_equal_direct_local_writes(
+    local: LocalStateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _review_round(local, "sha-1")
+    _review_round(local, "sha-2")
+    direct = _rows()
+
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "applied"))
+    monkeypatch.setattr("mira.dashboard.api._app_db", AppDatabase(url="", admin_password="pw"))
+    for sha in ("sha-1", "sha-2"):
+        remote = RemoteStateStore(build_snapshot(local, PR))
+        _review_round(remote, sha)
+        bundle = ResultBundle.model_validate_json(remote.bundle("j", "succeeded").model_dump_json())
+        apply_writes(local, PR, bundle.writes)
+
+    assert _rows() == direct
+    assert direct["sha"] == "sha-2" and len(direct["events"]) == 2
+
+
+def test_apply_refuses_a_review_of_another_pr_before_writing(local: LocalStateStore) -> None:
+    from mira.runner_protocol import SetLastReviewedSha
+
+    with pytest.raises(ValueError):
+        apply_writes(local, PR, [SetLastReviewedSha(sha="x"), RecordReview(review=_review(8))])
+    assert local.get_last_reviewed_sha("o", "r", 7, platform="github") == ""
+
+
+def test_runner_config_drops_the_servers_own_settings() -> None:
+    config = MiraConfig.model_validate(
+        {
+            "llm": {"provider": "codex", "model": "m", "codex_home": "/srv/codex"},
+            "review": {"runner": "actions", "runs_on": ["self-hosted"], "max_chunks_per_review": 2},
+            "commands": {"allowed_users": ["root"]},
+            "database": {"url": "postgresql://u:secret@db/mira", "admin_password": "pw"},
+        }
+    )
+    data = runner_config(config)
+
+    assert "database" not in data and "commands" not in data
+    assert "provider" not in data["llm"] and "codex_home" not in data["llm"]
+    assert "runner" not in data["review"] and "runs_on" not in data["review"]
+    assert (data["llm"]["model"], data["review"]["max_chunks_per_review"]) == ("m", 2)
+    assert MiraConfig.model_validate(data).review.max_chunks_per_review == 2
