@@ -9,6 +9,7 @@ the PR's content.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -19,13 +20,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastapi import FastAPI, Request
+from pydantic import SecretStr
 
 from mira import config as mira_config
 from mira import runner_client
 from mira.config import MiraConfig, ReviewConfig
 from mira.dashboard.db import AppDatabase
 from mira.dashboard.models_config import llm_config_for
-from mira.exceptions import ConfigError, NonRetriableLLMError
+from mira.exceptions import ConfigError, NonRetriableLLMError, ProviderError
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.provider import LLMProvider
@@ -109,10 +111,17 @@ def oidc_requests() -> list[httpx.QueryParams]:
 
 
 @pytest.fixture
+def revoked() -> list[str]:
+    """The GitHub tokens the runner revoked, in order."""
+    return []
+
+
+@pytest.fixture
 def server(
     db: AppDatabase,  # noqa: F811
     app_auth: ExpiringAppAuth,
     oidc_requests: list[httpx.QueryParams],
+    revoked: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> FastAPI:
     app = FastAPI()
@@ -124,6 +133,11 @@ def server(
         assert request.headers["authorization"] == "bearer request-token"
         oidc_requests.append(request.query_params)
         return {"value": oidc_token(aud=request.query_params["audience"])}
+
+    # The ASGI transport routes by path, so GitHub's revoke lands here too.
+    @app.delete("/installation/token", status_code=204)
+    async def revoke(request: Request) -> None:
+        revoked.append(request.headers["authorization"].removeprefix("token "))
 
     # The runner sets the process's global config from its job spec, which
     # has no server settings. The server here keeps its own.
@@ -152,8 +166,8 @@ def runner_side(
     """Wire the runner's engine to the mock LLM and to a provider whose check
     runs are the real GitHubProvider's. Returns the create_llm mock."""
 
-    def provider(token_supplier: Any) -> AsyncMock:
-        real = GitHubProvider(token_supplier)
+    def provider(token_supplier: Any, **kwargs: Any) -> AsyncMock:
+        real = GitHubProvider(token_supplier, **kwargs)
         pr_content.start_check_run = real.start_check_run
         pr_content.start_queued_check_run = real.start_queued_check_run
         pr_content.finish_check_run = real.finish_check_run
@@ -567,3 +581,103 @@ def test_the_cli_reads_the_endpoint_from_env(monkeypatch: pytest.MonkeyPatch) ->
     assert seen == [
         RunnerLLM(provider="claude-code", model="glm-5.3", base_url="https://api.together.xyz/v1")
     ]
+
+
+async def test_every_token_received_is_revoked_when_the_review_succeeds(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    app_auth: ExpiringAppAuth,
+    revoked: list[str],
+) -> None:
+    # The claimed token is inside the refresh margin, so the run gets two.
+    app_auth._lifetimes = [timedelta(minutes=2), timedelta(hours=1)]
+    seed_job(db)
+
+    assert await _run(server) == 0
+
+    assert sorted(revoked) == ["ghs_job_token_1", "ghs_job_token_2"]
+
+
+async def test_the_token_is_revoked_when_the_review_fails(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    pr_content: AsyncMock,
+    revoked: list[str],
+) -> None:
+    seed_job(db)
+    pr_content.get_pr_diff.side_effect = RuntimeError("diff fetch failed")
+
+    assert await _run(server) == 1
+
+    assert status_of(db) is JobStatus.FAILED
+    assert revoked == ["ghs_job_token_1"]
+
+
+class _Grants:
+    """The server's token route: a new token per refresh, counted."""
+
+    def __init__(self) -> None:
+        self.refreshes = 0
+
+    async def refresh_token(self) -> Any:
+        self.refreshes += 1
+        await asyncio.sleep(0)
+        return SimpleNamespace(
+            github_token=SecretStr(f"ghs_fresh_{self.refreshes}"),
+            token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+
+
+def _spec_with_token(token: str) -> Any:
+    return SimpleNamespace(
+        github_token=SecretStr(token), token_expires_at=datetime.now(UTC) + timedelta(hours=1)
+    )
+
+
+async def test_a_401_refreshes_the_token_once_for_every_caller_and_retries() -> None:
+    grants = _Grants()
+    tokens = runner_client.TokenSupplier(cast(Any, grants), _spec_with_token("ghs_revoked"))
+    provider = GitHubProvider(tokens, on_unauthorized=tokens.invalidate)
+    used: list[str] = []
+
+    async def fake_patch(
+        self: Any, url: str, *, headers: dict[str, str], **_: Any
+    ) -> httpx.Response:
+        token = headers["Authorization"].removeprefix("token ")
+        used.append(token)
+        await asyncio.sleep(0)
+        status = 401 if token == "ghs_revoked" else 200
+        return httpx.Response(status, json={}, request=httpx.Request("PATCH", url))
+
+    pr = SimpleNamespace(owner="test", repo="repo")
+    with patch.object(httpx.AsyncClient, "patch", fake_patch):
+        await asyncio.gather(
+            provider.start_queued_check_run(cast(Any, pr), 501),
+            provider.finish_check_run(cast(Any, pr), 501, "success"),
+        )
+
+    assert grants.refreshes == 1
+    assert used == ["ghs_revoked", "ghs_revoked", "ghs_fresh_1", "ghs_fresh_1"]
+    assert tokens.received == [SecretStr("ghs_revoked"), SecretStr("ghs_fresh_1")]
+
+
+async def test_without_a_refresher_a_401_is_not_retried() -> None:
+    calls: list[str] = []
+
+    async def fake_patch(self: Any, url: str, **_: Any) -> httpx.Response:
+        calls.append(url)
+        return httpx.Response(401, json={}, request=httpx.Request("PATCH", url))
+
+    pr = SimpleNamespace(owner="test", repo="repo")
+    with (
+        patch.object(httpx.AsyncClient, "patch", fake_patch),
+        pytest.raises(ProviderError) as raised,
+    ):
+        await GitHubProvider("ghs_static").finish_check_run(cast(Any, pr), 501, "success")
+
+    assert raised.value.status_code == 401
+    assert len(calls) == 1

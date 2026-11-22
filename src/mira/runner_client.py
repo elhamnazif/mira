@@ -23,7 +23,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from mira.config import MiraConfig, _is_local_host, set_global_defaults_data
 from mira.core.engine import ReviewEngine
@@ -33,6 +33,7 @@ from mira.llm import create_llm
 from mira.llm import provider_profiles as profiles
 from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
 from mira.llm.provider_errors import classify_provider_error
+from mira.providers.github import _GITHUB_API_URL as GITHUB_API_URL
 from mira.providers.github import GitHubProvider
 from mira.runner_protocol import JobSpec, RemoteStateStore, ResultBundle, TokenGrant, UsageReport
 
@@ -186,13 +187,16 @@ def _status(resp: httpx.Response) -> str:
 
 class TokenSupplier:
     """The job's GitHub token, refreshed through the server shortly before it
-    expires. GitHubProvider awaits it before every call."""
+    expires or once GitHub refuses it. GitHubProvider awaits it before every
+    call. It keeps every token it received, so the run can revoke them all
+    when it ends."""
 
     def __init__(self, api: RunnerAPI, spec: JobSpec) -> None:
         self._api = api
         self._token = spec.github_token
         self._expires_at = spec.token_expires_at
         self._lock = asyncio.Lock()
+        self.received = [spec.github_token]
 
     async def __call__(self) -> str:
         async with self._lock:
@@ -200,16 +204,52 @@ class TokenSupplier:
                 await self._refresh()
             return self._token.get_secret_value()
 
-    async def _refresh(self) -> None:
+    async def invalidate(self, stale: str) -> None:
+        """GitHub refused ``stale``. Concurrent callers that saw the same
+        token fail share one refresh: the lock serializes them, and a token
+        already replaced is not refreshed again."""
+        async with self._lock:
+            if self._token.get_secret_value() == stale:
+                logger.warning("GitHub refused the job's token before it expired; refreshing")
+                await self._refresh(refused=True)
+
+    async def _refresh(self, *, refused: bool = False) -> None:
         try:
             grant = await self._api.refresh_token()
         except (RunnerError, ValidationError) as exc:
-            if datetime.now(UTC) >= self._expires_at:
+            if refused or datetime.now(UTC) >= self._expires_at:
                 raise
             logger.warning("GitHub token refresh failed, using the current one: %s", exc)
             return
         self._token, self._expires_at = grant.github_token, grant.token_expires_at
+        self.received.append(grant.github_token)
         logger.info("Refreshed the GitHub token, now valid until %s", self._expires_at)
+
+    async def revoke(self, http: httpx.AsyncClient) -> None:
+        """Revoke every token received, best effort, so none outlives the run.
+        Adapted from Pullfrog's utils/token.ts (MIT, Copyright (c) 2026
+        Pullfrog, Inc.)."""
+        await asyncio.gather(*(_revoke(http, token) for token in self.received))
+
+
+async def _revoke(http: httpx.AsyncClient, token: SecretStr) -> None:
+    try:
+        resp = await http.request(
+            "DELETE",
+            f"{GITHUB_API_URL}/installation/token",
+            headers={
+                "Authorization": f"token {token.get_secret_value()}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=10,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Could not revoke a GitHub token: %s", type(exc).__name__)
+        return
+    # 401: the token had already expired or been revoked.
+    if resp.status_code not in (204, 401):
+        logger.warning("Revoking a GitHub token answered HTTP %s", resp.status_code)
 
 
 @dataclass(frozen=True)
@@ -336,6 +376,17 @@ async def run_job(
         return 0
     logger.info("Claimed job %s: %s at %s", job_id, spec.pr_url, spec.head_sha[:12])
 
+    tokens = TokenSupplier(api, spec)
+    try:
+        return await _review_and_report(api, spec, llm, tokens)
+    finally:
+        await tokens.revoke(http)
+
+
+async def _review_and_report(
+    api: RunnerAPI, spec: JobSpec, llm: RunnerLLM, tokens: TokenSupplier
+) -> int:
+    job_id = spec.job_id
     store = RemoteStateStore(spec.snapshot)
     llms: list[Any] = []
     try:
@@ -350,7 +401,7 @@ async def run_job(
         engine = ReviewEngine(
             config=config,
             llm=llms[0],
-            provider=GitHubProvider(TokenSupplier(api, spec)),
+            provider=GitHubProvider(tokens, on_unauthorized=tokens.invalidate),
             bot_name=spec.bot_name,
             indexing_llm=llms[1],
             security_llm=llms[2],
