@@ -25,10 +25,20 @@ on:
         description: The Mira server's URL
         type: string
         required: true
+    # Set the one the repo's model needs (docs/runner/README.md).
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         description: Claude Code token (`claude setup-token`)
-        required: true
+        required: false
+      ANTHROPIC_AUTH_TOKEN:
+        description: Key for the gateway in the ANTHROPIC_BASE_URL variable, such as a Z.ai Coding Plan key
+        required: false
+      ZAI_API_KEY:
+        description: Z.ai API key, for MIRA_RUNNER_LLM_PROVIDER=zai
+        required: false
+      MIRA_LLM_API_KEY:
+        description: Key for the endpoint in the MIRA_RUNNER_LLM_BASE_URL variable
+        required: false
 
 permissions: {}
 
@@ -112,8 +122,20 @@ jobs:
         working-directory: ${{ runner.temp }}/mira/work
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Optional: a model for every review pass, instead of the server's.
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
+          # In a reusable workflow, vars are the calling repo's variables.
+          # Each is optional; an unset one is empty and means the default.
+          MIRA_RUNNER_LLM_PROVIDER: ${{ vars.MIRA_RUNNER_LLM_PROVIDER }}
           MIRA_RUNNER_MODEL: ${{ vars.MIRA_RUNNER_MODEL }}
+          MIRA_RUNNER_LLM_BASE_URL: ${{ vars.MIRA_RUNNER_LLM_BASE_URL }}
+          MIRA_RUNNER_LLM_API_STYLE: ${{ vars.MIRA_RUNNER_LLM_API_STYLE }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ vars.ANTHROPIC_DEFAULT_OPUS_MODEL }}
+          ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.ANTHROPIC_DEFAULT_SONNET_MODEL }}
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.ANTHROPIC_DEFAULT_HAIKU_MODEL }}
+          API_TIMEOUT_MS: ${{ vars.API_TIMEOUT_MS }}
           JOB_ID: ${{ inputs.job_id }}
           SERVER_URL: ${{ inputs.server_url }}
         run: mira runner --job "$JOB_ID" --server "$SERVER_URL"

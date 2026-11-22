@@ -31,5 +31,10 @@ jobs:
       job_id: ${{ inputs.job_id }}
       runs_on: ${{ inputs.runs_on }}
       server_url: ${{ inputs.server_url }}
+    # Named one by one: `secrets: inherit` only reaches a workflow in the
+    # same organization or enterprise. Unset ones arrive empty.
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+      MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
