@@ -482,12 +482,18 @@ def test_a_result_for_a_job_that_never_ran_conflicts(
     assert state_rows(PR)["events"] == []
 
 
-def test_a_result_after_expiry_conflicts(client: TestClient, db: AppDatabase) -> None:
+def test_a_result_after_expiry_of_a_claimed_job_is_applied(
+    client: TestClient, db: AppDatabase
+) -> None:
     store = _claimed_store(client, db)
     assert db.transition_review_job("job-1", JobStatus.CLAIMED, JobStatus.EXPIRED)
     resp = post_result(client, store.bundle("job-1", "succeeded"))
-    assert resp.status_code == 409 and resp.json()["status"] == "expired"
-    assert state_rows(PR)["sha"] == ""
+    assert resp.json() == {"status": "expired", "applied": True}
+    assert state_rows(PR)["sha"] == "sha-1"
+    assert status_of(db) is JobStatus.EXPIRED
+    # A retry of the same result applies nothing twice.
+    assert post_result(client, store.bundle("job-1", "succeeded")).json()["applied"] is False
+    assert len(state_rows(PR)["events"]) == 1
 
 
 def test_a_failed_result_fails_the_job_and_its_check(

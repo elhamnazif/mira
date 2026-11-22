@@ -236,15 +236,17 @@ def _accept_result(
     whether this call applied the writes, or None when the job cannot take a
     result.
 
-    A superseded job that had been claimed still gets its writes: they
-    describe comments the runner really posted. The usage column is written
+    A job superseded or expired after its claim keeps its status but still
+    gets its writes: they describe comments the runner really posted. The
+    usage column is written
     once, first, so a retried result is never applied twice. A crash after
     it loses that result's writes rather than doubling them.
     """
     if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
         return job.status, False
     was_claimed = job.status is JobStatus.CLAIMED
-    if not (was_claimed or (job.status is JobStatus.SUPERSEDED and job.claimed_at)):
+    ran_late = job.status in (JobStatus.SUPERSEDED, JobStatus.EXPIRED) and job.claimed_at
+    if not (was_claimed or ran_late):
         return None, False
     if not db.record_review_job_result(job.id, bundle.usage.model_dump(mode="json")):
         return job.status, False
