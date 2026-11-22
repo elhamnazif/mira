@@ -152,6 +152,9 @@ class BedrockProvider:
         )
         self._call_converse = self._retry(self._call_converse)
 
+    def preflight(self) -> None:
+        """Nothing to check: boto3 resolves the AWS credential chain on the first call."""
+
     def _thinking_enabled(self) -> bool:
         effort = self.config.reasoning_effort
         return bool(effort and effort != "off")

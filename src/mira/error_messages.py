@@ -31,7 +31,7 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
             'OPENAI_API_KEY) in the environment, or set llm.api_key_env: "" in '
             "your config for a local endpoint that needs no auth."
         ),
-        safe="No API key found",
+        safe="No API key found: {api_key_env} is not set",
     ),
     "api_error": ErrorMessage(
         full="LLM API error {status}: {body}",
@@ -144,7 +144,7 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
     ),
     "claude_auth_missing": ErrorMessage(
         full="Claude Code provider needs one of these environment variables: {keys}",
-        safe="Claude Code credentials are not configured",
+        safe="Claude Code credentials are not set: set one of {keys}",
     ),
     "claude_auth_failed": ErrorMessage(
         full="Claude Code rejected its credentials: {detail}",

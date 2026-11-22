@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm
 from mira.llm.codex_cli import CodexCLIProvider
 
@@ -248,3 +248,34 @@ class TestCodexCLIProvider:
 
         assert msg == {"content": "", "tool_calls": []}
         provider._run_codex.assert_not_awaited()
+
+
+class TestPreflight:
+    def _cli(self, tmp_path: Path) -> Path:
+        script = tmp_path / "codex"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        return script
+
+    def test_passes_with_the_cli_and_an_auth_file(self, tmp_path):
+        (tmp_path / "auth.json").write_text("{}")
+        config = LLMConfig(
+            provider="codex-cli", codex_command=str(self._cli(tmp_path)), codex_home=str(tmp_path)
+        )
+        CodexCLIProvider(config).preflight()
+
+    def test_a_missing_cli_fails(self, tmp_path):
+        config = LLMConfig(provider="codex-cli", codex_command=str(tmp_path / "nope"))
+        with pytest.raises(NonRetriableLLMError) as exc:
+            CodexCLIProvider(config).preflight()
+        assert exc.value.code == "codex_command_not_found"
+
+    def test_a_missing_auth_file_fails(self, tmp_path):
+        config = LLMConfig(
+            provider="codex-cli",
+            codex_command=str(self._cli(tmp_path)),
+            codex_home=str(tmp_path / "home"),
+        )
+        with pytest.raises(NonRetriableLLMError) as exc:
+            CodexCLIProvider(config).preflight()
+        assert exc.value.code == "codex_auth_file_missing"

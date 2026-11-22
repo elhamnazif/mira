@@ -364,6 +364,26 @@ class TestErrors:
         assert exc.value.code == "claude_timeout"
 
 
+class TestPreflight:
+    def test_passes_with_a_credential_and_an_executable(self, tmp_path):
+        script, record = _fake_claude(tmp_path)
+        _provider(script).preflight()
+        assert _calls(record) == []
+
+    def test_missing_credentials_name_the_env_vars(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+        script, _ = _fake_claude(tmp_path)
+        with pytest.raises(NonRetriableLLMError) as exc:
+            _provider(script).preflight()
+        assert exc.value.code == "claude_auth_missing"
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in exc.value.safe_message
+
+    def test_a_missing_executable_fails(self, tmp_path):
+        with pytest.raises(NonRetriableLLMError) as exc:
+            _provider(tmp_path / "no-such-claude").preflight()
+        assert exc.value.code == "claude_command_not_found"
+
+
 class TestRedaction:
     async def test_credentials_are_redacted_from_output(self, tmp_path):
         leaked = {

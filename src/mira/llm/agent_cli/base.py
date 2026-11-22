@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import tempfile
 from abc import ABC, abstractmethod
@@ -202,6 +203,14 @@ class AgentCLIProvider(ABC):
         self.run_log.append(result)
 
     # ── Subprocess ─────────────────────────────────────────────────────
+
+    def preflight(self) -> None:
+        """Raise ``NonRetriableLLMError`` if the CLI's credentials are not set
+        or the CLI is not installed, before any review work starts."""
+        self._auth_env()
+        executable = self._validate_executable()
+        if shutil.which(executable) is None:
+            raise NonRetriableLLMError(f"{self.error_prefix}_command_not_found", command=executable)
 
     def _validate_executable(self) -> str:
         command = self._executable

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import signal
 import tempfile
 from contextlib import suppress
@@ -22,7 +23,7 @@ from pathlib import Path
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError
+from mira.exceptions import LLMError, NonRetriableLLMError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,14 @@ class CodexCLIProvider:
 
     def count_tokens(self, text: str) -> int:
         return max(1, len(text) // 4) if text else 0
+
+    def preflight(self) -> None:
+        if shutil.which(self.config.codex_command) is None:
+            raise NonRetriableLLMError("codex_command_not_found", command=self.config.codex_command)
+        source_home = self.config.codex_home or os.environ.get("CODEX_HOME")
+        auth = Path(source_home).expanduser() / "auth.json" if source_home else None
+        if auth is not None and not auth.is_file():
+            raise NonRetriableLLMError("codex_auth_file_missing", path=str(auth))
 
     def _env(self, runtime_home: str, runtime_codex_home: str) -> dict[str, str]:
         """Build a minimal child environment without Mira service credentials."""

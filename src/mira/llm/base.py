@@ -70,6 +70,11 @@ class LLMProviderProtocol(Protocol):
 
     def count_tokens(self, text: str) -> int: ...
 
+    def preflight(self) -> None:
+        """Raise ``NonRetriableLLMError`` if a call could not even start, such
+        as when a required credential is not set. Makes no network call."""
+        ...
+
     @property
     def usage(self) -> dict[str, int]: ...
 
@@ -95,7 +100,7 @@ def _get_api_key(config: LLMConfig, profile: dict | None = None) -> str:
         # Back-compat with pre-`api_key_env` setups.
         key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
     if not key:
-        raise LLMError("no_api_key", api_key_env=config.api_key_env)
+        raise NonRetriableLLMError("no_api_key", api_key_env=config.api_key_env)
     return key
 
 
@@ -199,6 +204,9 @@ class OpenAICompatibleProvider:
         self._call_llm = self._retry(self._call_llm)
         self._call_llm_with_tools = self._retry(self._call_llm_with_tools)
         self._call_llm_agentic = self._retry(self._call_llm_agentic)
+
+    def preflight(self) -> None:
+        _get_api_key(self.config, self.profile)
 
     # ── Shared helpers ─────────────────────────────────────────────
 
