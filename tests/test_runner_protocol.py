@@ -177,28 +177,30 @@ def local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalStateStore:
     return LocalStateStore()
 
 
-def _rows() -> dict:
-    """The review state LocalStateStore persists for PR 7, minus ids and times."""
+def state_rows(pr: PRKey = PR) -> dict:
+    """The review state LocalStateStore persists for ``pr``, minus ids and times."""
     from mira.dashboard import api
 
-    store = IndexStore.open("o", "r")
+    store = IndexStore.open(pr.owner, pr.repo)
     try:
         events = [
             {k: v for k, v in asdict(e).items() if k not in {"id", "created_at"}}
-            for e in store.list_review_events_for_pr(7)
+            for e in store.list_review_events_for_pr(pr.pr_number)
         ]
         comments = [
             {k: v for k, v in asdict(c).items() if k not in {"id", "review_id", "created_at"}}
-            for c in store.list_review_comments(7)
+            for c in store.list_review_comments(pr.pr_number)
         ]
         fingerprints = sorted(
-            (fp.pr_number, fp.head_sha, tuple(fp.paths)) for fp in store.list_pr_fingerprints()
+            (fp.pr_number, fp.head_sha, tuple(fp.paths), tuple(fp.symbols))
+            for fp in store.list_pr_fingerprints()
         )
     finally:
         store.close()
-    progress = api._app_db.get_pr_review_progress("o", "r", 7, platform="github")
+    db = api._app_db
+    progress = db.get_pr_review_progress(pr.owner, pr.repo, pr.pr_number, platform=pr.platform)
     return {
-        "sha": api._app_db.get_last_reviewed_sha("o", "r", 7, platform="github"),
+        "sha": db.get_last_reviewed_sha(pr.owner, pr.repo, pr.pr_number, platform=pr.platform),
         "progress": progress and {k: v for k, v in asdict(progress).items() if k != "updated_at"},
         "events": events,
         "comments": comments,
@@ -211,7 +213,7 @@ def test_applied_writes_equal_direct_local_writes(
 ) -> None:
     _review_round(local, "sha-1")
     _review_round(local, "sha-2")
-    direct = _rows()
+    direct = state_rows()
 
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "applied"))
     monkeypatch.setattr("mira.dashboard.api._app_db", AppDatabase(url="", admin_password="pw"))
@@ -221,7 +223,7 @@ def test_applied_writes_equal_direct_local_writes(
         bundle = ResultBundle.model_validate_json(remote.bundle("j", "succeeded").model_dump_json())
         apply_writes(local, PR, bundle.writes)
 
-    assert _rows() == direct
+    assert state_rows() == direct
     assert direct["sha"] == "sha-2" and len(direct["events"]) == 2
 
 

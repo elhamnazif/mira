@@ -398,6 +398,15 @@ class ReviewConfig(BaseModel):
     # only: a repo's .mira.yaml cannot set either (see _DEPLOYMENT_ONLY_REVIEW_KEYS).
     runner: RunnerKind = RunnerKind.LOCAL
     runs_on: list[str] = Field(default_factory=lambda: ["ubuntu-latest"], min_length=1)
+    # What a runner must prove with its GitHub Actions OIDC token before the
+    # server hands it a job (mira.platforms.github.oidc). Deployment only.
+    # runner_workflow_refs lists the exact job_workflow_ref values allowed, e.g.
+    # "elhamnazif/mira/.github/workflows/review.yml@refs/heads/main". Empty
+    # rejects every runner.
+    runner_workflow_refs: list[str] = Field(default_factory=list)
+    runner_oidc_audience: str = Field(default="mira", min_length=1)
+    # A claimed job that has not reported back after this long expires.
+    runner_claim_timeout_minutes: int = Field(default=120, ge=1)
 
     @field_validator("runs_on")
     @classmethod
@@ -406,6 +415,18 @@ class ReviewConfig(BaseModel):
         if not all(labels) or any("," in label for label in labels):
             raise ValueError(f"review.runs_on labels must be non-empty, without commas: {v!r}")
         return labels
+
+    @field_validator("runner_workflow_refs")
+    @classmethod
+    def _validate_workflow_refs(cls, v: list[str]) -> list[str]:
+        for ref in v:
+            path, sep, git_ref = ref.partition("@")
+            if not sep or not git_ref or "/.github/workflows/" not in path:
+                raise ValueError(
+                    "review.runner_workflow_refs entries must look like "
+                    f"'owner/repo/.github/workflows/file.yml@refs/heads/main', got {ref!r}"
+                )
+        return v
 
 
 class IndexConfig(BaseModel):
@@ -479,8 +500,17 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
     }
 )
 
-# Where reviews run decides which machine and secrets see the code.
-_DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset({"runner", "runs_on"})
+# Where reviews run decides which machine and secrets see the code, and who
+# may run them.
+_DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset(
+    {
+        "runner",
+        "runs_on",
+        "runner_workflow_refs",
+        "runner_oidc_audience",
+        "runner_claim_timeout_minutes",
+    }
+)
 
 
 def _strip_deployment_only_settings(overlay: dict[str, Any]) -> dict[str, Any]:

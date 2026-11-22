@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 import jwt
@@ -23,6 +26,12 @@ _GITHUB_API_URL = os.environ.get(
     "MIRA_GITHUB_API_URL",
     "https://api.github.com",
 ).rstrip("/")
+
+
+@dataclass(frozen=True)
+class InstallationToken:
+    token: str = field(repr=False)
+    expires_at: datetime
 
 
 def _resolve_private_key(value: str) -> str:
@@ -103,6 +112,28 @@ class GitHubAppAuth:
         self._token_cache[installation_id] = (new_token, new_expires_at)
         logger.debug("Cached installation token for %d", installation_id)
         return new_token
+
+    async def mint_repo_token(
+        self, installation_id: int, repo: str, permissions: Mapping[str, str]
+    ) -> InstallationToken:
+        """A new installation token for one repository, with at most
+        ``permissions``. Never cached: every caller gets its own token."""
+        url = f"{_GITHUB_API_URL}/app/installations/{installation_id}/access_tokens"
+        headers = {
+            "Authorization": f"Bearer {self._generate_jwt()}",
+            "Accept": "application/vnd.github+json",
+        }
+        body = {"repositories": [repo], "permissions": dict(permissions)}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers=headers, json=body)
+        if resp.status_code != 201:
+            raise WebhookError(
+                f"Failed to mint a token for {repo} (HTTP {resp.status_code}): {resp.text[:300]}"
+            )
+        data = resp.json()
+        return InstallationToken(
+            token=data["token"], expires_at=datetime.fromisoformat(data["expires_at"])
+        )
 
     async def get_app_slug(self) -> str | None:
         """Fetch this GitHub App's own slug — the `@mention` handle users type.

@@ -118,6 +118,13 @@ def create_app(
 
         from mira.security.poller import run_forever as run_vuln_poller
 
+        # Expire Actions review jobs no runner picked up or finished.
+        sweep_task = None
+        if app_auth is not None:
+            from mira.platforms.github.runner_api import run_expiry_sweeper
+
+            sweep_task = asyncio.create_task(run_expiry_sweeper(app_auth))
+
         vuln_task = asyncio.create_task(run_vuln_poller())
         vuln_task.add_done_callback(
             lambda t: (
@@ -134,6 +141,8 @@ def create_app(
             fj_task.cancel()
         if bb_task is not None and not bb_task.done():
             bb_task.cancel()
+        if sweep_task is not None and not sweep_task.done():
+            sweep_task.cancel()
         if not vuln_task.done():
             vuln_task.cancel()
 
@@ -244,6 +253,13 @@ def create_app(
                 event, payload, bitbucket_auth, bot_name, background_tasks
             )
             return _json_status(status)
+
+    if app_auth is not None:
+        # The runner API authenticates with GitHub OIDC only. Its paths are
+        # outside /api/, so the dashboard's session middleware lets them by.
+        from mira.platforms.github.runner_api import create_runner_router
+
+        app.include_router(create_runner_router(app_auth, bot_name))
 
     from mira.dashboard.api import register_dashboard
 

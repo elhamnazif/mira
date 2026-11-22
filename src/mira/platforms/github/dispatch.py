@@ -51,7 +51,7 @@ def _failure_message(exc: Exception) -> str:
     return _DISPATCH_FAILED.format(workflow=WORKFLOW_FILE, why=why)
 
 
-async def _finish_check(
+async def finish_check(
     provider: GitHubProvider,
     pr_info: PRInfo,
     check_run_id: int | None,
@@ -79,7 +79,7 @@ async def _retire(provider: GitHubProvider, job: ReviewJob, pr_info: PRInfo) -> 
             logger.warning(
                 "Could not cancel workflow run %s of job %s: %s", job.run_id, job.id, exc
             )
-    await _finish_check(
+    await finish_check(
         provider,
         pr_info,
         job.check_run_id,
@@ -155,7 +155,7 @@ async def dispatch_review(
     except Exception as exc:
         message = _failure_message(exc)
         db.transition_review_job(job.id, JobStatus.DISPATCHED, JobStatus.FAILED, error=message)
-        await _finish_check(
+        await finish_check(
             provider, pr_info, check_run_id, "failure", "Mira runner not started", message
         )
         raise RunnerDispatchError(message) from exc

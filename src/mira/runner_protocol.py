@@ -249,12 +249,18 @@ class RemoteStateStore:
         )
 
 
-def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite]) -> None:
-    """Apply a runner's buffered writes to ``pr``, in order. Raises ValueError,
-    before writing anything, when a review record names another PR."""
+def check_writes(pr: PRKey, writes: Sequence[StateWrite]) -> None:
+    """Raise ValueError when a write does not belong to ``pr``. Only a review
+    record names its PR; every other write takes the job's."""
     for write in writes:
         if isinstance(write, RecordReview) and write.review.pr_number != pr.pr_number:
             raise ValueError(f"review record for PR {write.review.pr_number}, job is {pr}")
+
+
+def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite]) -> None:
+    """Apply a runner's buffered writes to ``pr``, in order, after
+    :func:`check_writes` passes for all of them."""
+    check_writes(pr, writes)
     owner, repo, number, platform = pr.owner, pr.repo, pr.pr_number, pr.platform
     for write in writes:
         match write:
