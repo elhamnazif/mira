@@ -17,17 +17,21 @@ import logging
 import os
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import ValidationError
 
-from mira.config import MiraConfig, set_global_defaults_data
+from mira.config import MiraConfig, _is_local_host, set_global_defaults_data
 from mira.core.engine import ReviewEngine
 from mira.dashboard.models_config import llm_config_for
-from mira.exceptions import MiraError
+from mira.exceptions import ConfigError, MiraError
 from mira.llm import create_llm
+from mira.llm import provider_profiles as profiles
+from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
 from mira.providers.github import GitHubProvider
 from mira.runner_protocol import JobSpec, RemoteStateStore, ResultBundle, TokenGrant, UsageReport
 
@@ -41,6 +45,15 @@ _FORBIDDEN_RETRIES_S: tuple[float, ...] = (5, 10, 15)
 _RETRY_STATUSES = frozenset({502, 503, 504})
 # Refresh the GitHub token this long before it expires.
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
+# The key of an endpoint the runner is pointed at by URL.
+API_KEY_ENV = "MIRA_LLM_API_KEY"
+# Providers that are not an OpenAI-compatible endpoint.
+_NON_ENDPOINT_PROVIDERS = CLAUDE_CODE_PROVIDER_NAMES | {
+    "codex-cli",
+    "codex_cli",
+    "codex",
+    "bedrock",
+}
 
 
 class RunnerError(Exception):
@@ -198,13 +211,60 @@ class TokenSupplier:
         logger.info("Refreshed the GitHub token, now valid until %s", self._expires_at)
 
 
-def job_config(spec: JobSpec, llm_provider: str, model: str | None) -> MiraConfig:
+@dataclass(frozen=True)
+class RunnerLLM:
+    """How this run reaches its model, from the runner's flags.
+
+    ``provider`` is an agent CLI, ``bedrock``, or the name of a
+    ``providers.json`` profile such as ``zai``, which brings its own URL and
+    key env. ``base_url`` points at any OpenAI-compatible endpoint instead,
+    with its key in ``MIRA_LLM_API_KEY``, and then ``provider`` is ignored.
+    """
+
+    provider: str = "claude-code"
+    model: str | None = None
+    base_url: str | None = None
+    api_style: str | None = None
+
+    def settings(self) -> dict[str, Any]:
+        """The llm settings that choose the endpoint. They replace the spec's
+        in full: those describe the server's machine, and a repo's
+        ``.mira.yaml`` can set its URL and key env."""
+        if self.base_url:
+            key_env = API_KEY_ENV
+            # A local endpoint such as Ollama may need no key.
+            host = urlparse(self.base_url).hostname or ""
+            if not os.environ.get(key_env) and _is_local_host(host):
+                key_env = ""
+            return self._endpoint(self.base_url, key_env)
+        if self.provider in _NON_ENDPOINT_PROVIDERS:
+            return {"provider": self.provider}
+        profile = profiles.get(self.provider)
+        if profile is None:
+            raise ConfigError(
+                f"Unknown LLM provider {self.provider!r}: name an agent CLI, bedrock or "
+                "a providers.json profile, or set MIRA_RUNNER_LLM_BASE_URL"
+            )
+        return self._endpoint(profile["base_url"], profile.get("api_key_env") or API_KEY_ENV)
+
+    def _endpoint(self, base_url: str, api_key_env: str) -> dict[str, Any]:
+        return {
+            "provider": "openai",
+            "base_url": base_url,
+            "api_key_env": api_key_env,
+            "api_style": self.api_style or "chat",
+        }
+
+
+def job_config(spec: JobSpec, llm: RunnerLLM) -> MiraConfig:
     """The spec's review config plus the runner's own LLM execution settings,
-    which the server strips. ``model`` replaces every per-purpose model."""
+    which the server strips. ``llm.model`` replaces every per-purpose model."""
     data: dict[str, Any] = {**spec.config, "llm": dict(spec.config.get("llm", {}))}
-    data["llm"]["provider"] = llm_provider
-    if model:
-        data["llm"].update(model=model, review_model=None, indexing_model=None, security_model=None)
+    data["llm"].update(llm.settings())
+    if llm.model:
+        data["llm"].update(
+            model=llm.model, review_model=None, indexing_model=None, security_model=None
+        )
     # Code that reads load_config() instead of the engine's config sees the same.
     set_global_defaults_data(data)
     return MiraConfig.model_validate(data)
@@ -259,8 +319,7 @@ async def run_job(
     job_id: str,
     server_url: str,
     audience: str,
-    llm_provider: str,
-    model: str | None,
+    llm: RunnerLLM,
 ) -> int:
     """Claim, review and report one job. Returns the process exit code."""
     api = RunnerAPI(http, server_url, job_id, audience)
@@ -276,11 +335,14 @@ async def run_job(
     store = RemoteStateStore(spec.snapshot)
     llms: list[Any] = []
     try:
-        config = job_config(spec, llm_provider, model)
+        config = job_config(spec, llm)
         llms = [
             create_llm(llm_config_for(purpose, config.llm, use_dashboard=False))
             for purpose in ("review", "indexing", "security")
         ]
+        # A missing secret fails the job here, not after a review of failed calls.
+        for each in {id(each): each for each in llms}.values():
+            each.preflight()
         engine = ReviewEngine(
             config=config,
             llm=llms[0],
@@ -301,10 +363,19 @@ async def run_job(
             logger.error("Could not report the failure: %s", post_exc)
         return 1
 
-    logger.info("Reviewed %s: %d comments", spec.pr_url, len(result.comments))
+    error = ""
+    if result.all_chunks_failed:
+        # Nothing was reviewed. A partial failure still succeeds: the engine
+        # records the failed paths as retryable. The reasons are Mira's own text.
+        reasons = "; ".join(sorted({f.reason for f in result.failed_chunks if f.reason}))
+        error = f"Review failed: all {result.total_chunks} review chunk(s) failed ({reasons})"
+        logger.error("%s", error)
+    else:
+        logger.info("Reviewed %s: %d comments", spec.pr_url, len(result.comments))
+    outcome: Literal["succeeded", "failed"] = "failed" if error else "succeeded"
     try:
-        await api.post_result(store.bundle(job_id, "succeeded", usage=usage_report(llms)))
+        await api.post_result(store.bundle(job_id, outcome, error=error, usage=usage_report(llms)))
     except RunnerError as exc:
         logger.error("Could not post the result of job %s: %s", job_id, exc)
         return 1
-    return 0
+    return 1 if error else 0

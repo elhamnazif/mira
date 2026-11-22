@@ -291,13 +291,27 @@ def review(
     envvar="MIRA_RUNNER_LLM_PROVIDER",
     default="claude-code",
     show_default=True,
-    help="LLM provider to review with on this machine",
+    help="An agent CLI (claude-code, codex-cli), bedrock, or a providers.json profile (zai)",
 )
 @click.option(
     "--model",
     envvar="MIRA_RUNNER_MODEL",
     default=None,
     help="Model for every review pass. Default: the models in the job's config",
+)
+@click.option(
+    "--llm-base-url",
+    envvar="MIRA_RUNNER_LLM_BASE_URL",
+    default=None,
+    help="An OpenAI-compatible endpoint to review with, keyed by MIRA_LLM_API_KEY. "
+    "Overrides --llm-provider",
+)
+@click.option(
+    "--llm-api-style",
+    envvar="MIRA_RUNNER_LLM_API_STYLE",
+    type=click.Choice(["chat", "responses"]),
+    default=None,
+    help="Protocol of the endpoint. Default: chat",
 )
 @click.option("--verbose", is_flag=True, help="Enable verbose logging")
 def runner(
@@ -306,6 +320,8 @@ def runner(
     audience: str,
     llm_provider: str,
     model: str | None,
+    llm_base_url: str | None,
+    llm_api_style: str | None,
     verbose: bool,
 ) -> None:
     """Review a dispatched job inside its GitHub Actions run."""
@@ -315,7 +331,7 @@ def runner(
     import httpx
 
     from mira.config import check_runner_server_url
-    from mira.runner_client import run_job
+    from mira.runner_client import RunnerLLM, run_job
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -336,8 +352,12 @@ def runner(
                 job_id=job_id,
                 server_url=server_url,
                 audience=audience,
-                llm_provider=llm_provider,
-                model=model or None,
+                llm=RunnerLLM(
+                    provider=llm_provider,
+                    model=model or None,
+                    base_url=llm_base_url or None,
+                    api_style=llm_api_style,
+                ),
             )
 
     sys.exit(asyncio.run(_run()))

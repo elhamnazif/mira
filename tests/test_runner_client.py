@@ -9,26 +9,34 @@ the PR's content.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from fastapi import FastAPI, Request
 
+from mira import config as mira_config
 from mira import runner_client
 from mira.config import MiraConfig, ReviewConfig
 from mira.dashboard.db import AppDatabase
+from mira.dashboard.models_config import llm_config_for
+from mira.exceptions import ConfigError, NonRetriableLLMError
 from mira.index.store import IndexStore
+from mira.llm import create_llm
+from mira.llm.provider import LLMProvider
+from mira.llm.responses import ResponsesProvider
 from mira.platforms.github.auth import InstallationToken
 from mira.platforms.github.oidc import GitHubOIDCVerifier
 from mira.platforms.github.runner_api import create_runner_router
 from mira.providers.github import GitHubProvider
 from mira.runner import JobStatus
-from mira.runner_client import run_job, usage_report
-from mira.runner_protocol import UsageReport
+from mira.runner_client import RunnerLLM, run_job, usage_report
+from mira.runner_protocol import JobSpec, ResultBundle, UsageReport
 from tests.test_engine import mock_llm  # noqa: F401  (fixture)
 from tests.test_runner_api import (
     _KEY,
@@ -157,15 +165,16 @@ def runner_side(
     return create_llm
 
 
-async def _run(app: FastAPI, job_id: str = "job-1", transport: Any = None) -> int:
+async def _run(
+    app: FastAPI, job_id: str = "job-1", transport: Any = None, llm: RunnerLLM | None = None
+) -> int:
     async with httpx.AsyncClient(transport=transport or httpx.ASGITransport(app=app)) as http:
         return await run_job(
             http,
             job_id=job_id,
             server_url=SERVER,
             audience="mira",
-            llm_provider="claude-code",
-            model=None,
+            llm=llm or RunnerLLM(),
         )
 
 
@@ -370,3 +379,191 @@ def test_the_cli_rejects_a_plain_http_server() -> None:
     result = CliRunner().invoke(main, ["runner", "--job", "j", "--server", "http://mira.example"])
     assert result.exit_code == 2
     assert "https" in result.output
+
+
+# Credentials a test machine may have that would mask a missing one.
+_LLM_ENV = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "MIRA_LLM_API_KEY",
+    "ZAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+)
+API_KEY = "sk-endpoint-" + "k" * 32
+
+
+@pytest.fixture
+def no_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _LLM_ENV:
+        monkeypatch.delenv(key, raising=False)
+    # job_config sets the process's global config; put it back afterwards.
+    monkeypatch.setattr(mira_config, "_global_defaults", {})
+
+
+def _bundles(monkeypatch: pytest.MonkeyPatch) -> list[ResultBundle]:
+    """Record every result bundle the runner posts."""
+    posted: list[ResultBundle] = []
+    original = runner_client.RunnerAPI.post_result
+
+    async def post_result(self: Any, bundle: ResultBundle) -> None:
+        posted.append(bundle)
+        await original(self, bundle)
+
+    monkeypatch.setattr(runner_client.RunnerAPI, "post_result", post_result)
+    return posted
+
+
+async def test_a_review_where_every_chunk_failed_fails_and_keeps_the_sha(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    no_llm_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real OpenAI-compatible provider against an endpoint that answers
+    every call with an error: nothing is reviewed, so the job fails and the
+    head is not recorded as reviewed."""
+    seed_job(db)
+    monkeypatch.setattr(runner_client, "create_llm", create_llm)
+    monkeypatch.setenv("MIRA_LLM_API_KEY", API_KEY)
+    posted = _bundles(monkeypatch)
+    llm = RunnerLLM(base_url="https://llm.example/v1", model="vendor/some-model")
+
+    with caplog.at_level(logging.DEBUG):
+        assert await _run(server, llm=llm) == 1
+
+    (bundle,) = posted
+    assert bundle.outcome == "failed"
+    assert bundle.error.startswith("Review failed: all 1 review chunk(s) failed")
+    assert [w for w in bundle.writes if w.op == "set_last_reviewed_sha"] == []
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.FAILED
+    assert not state_rows(PR)["sha"]
+    final = [body for m, url, body, _ in github.requests if url.endswith("/check-runs/501")][-1]
+    assert final["conclusion"] == "failure"
+    assert final["output"]["summary"] == bundle.error
+
+    # Every model call went to the configured endpoint with its key.
+    calls = [(body, auth) for _, url, body, auth in github.requests if "llm.example" in url]
+    assert calls
+    assert {auth for _, auth in calls} == {f"Bearer {API_KEY}"}
+    assert {body["model"] for body, _ in calls} == {"some-model"}
+    assert API_KEY not in caplog.text
+    assert API_KEY not in bundle.model_dump_json()
+
+
+async def test_a_missing_secret_fails_the_job_before_any_review(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    no_llm_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_job(db)
+    monkeypatch.setattr(runner_client, "create_llm", create_llm)
+
+    assert await _run(server) == 1
+
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.error.startswith("NonRetriableLLMError: Claude Code credentials are not set")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in job.error
+    # The PR's check says which secret to set.
+    final = [body for m, url, body, _ in github.requests if url.endswith("/check-runs/501")][-1]
+    assert (final["conclusion"], final["output"]["summary"]) == ("failure", job.error)
+    # It failed before the review started its own check run.
+    assert [m for m, url, *_ in github.requests if url.endswith("/check-runs/501")] == ["PATCH"]
+
+
+def _review_llm(llm: RunnerLLM, repo_llm: dict[str, Any] | None = None) -> Any:
+    spec = cast(JobSpec, SimpleNamespace(config={"llm": repo_llm or {}}))
+    config = runner_client.job_config(spec, llm)
+    return create_llm(llm_config_for("review", config.llm, use_dashboard=False))
+
+
+def test_a_profile_name_builds_that_endpoint(
+    no_llm_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A repo's .mira.yaml can set these; the runner must not send its key there.
+    repo_llm = {"base_url": "https://evil.example/v1", "api_key_env": "GITHUB_TOKEN"}
+    llm = _review_llm(RunnerLLM(provider="zai", model="glm-5.3"), repo_llm)
+
+    assert isinstance(llm, LLMProvider)
+    assert llm.config.base_url == "https://api.z.ai/api/paas/v4"
+    assert llm.config.api_key_env == "ZAI_API_KEY"
+    assert llm.config.model == "glm-5.3"
+    with pytest.raises(NonRetriableLLMError) as exc:
+        llm.preflight()
+    assert "ZAI_API_KEY" in exc.value.safe_message
+
+    monkeypatch.setenv("ZAI_API_KEY", API_KEY)
+    llm.preflight()
+
+
+def test_a_base_url_builds_a_generic_endpoint(
+    no_llm_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm = _review_llm(
+        RunnerLLM(base_url="https://api.together.xyz/v1", model="glm-5.3", api_style="responses")
+    )
+
+    assert isinstance(llm, ResponsesProvider)
+    assert llm.config.base_url == "https://api.together.xyz/v1"
+    assert llm.config.api_key_env == "MIRA_LLM_API_KEY"
+    assert llm.config.model == "glm-5.3"
+    with pytest.raises(NonRetriableLLMError) as exc:
+        llm.preflight()
+    assert "MIRA_LLM_API_KEY" in exc.value.safe_message
+
+    monkeypatch.setenv("MIRA_LLM_API_KEY", API_KEY)
+    llm.preflight()
+
+
+def test_only_a_local_endpoint_may_go_without_a_key(
+    no_llm_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local = RunnerLLM(base_url="http://localhost:11434/v1", model="qwen3")
+    _review_llm(local).preflight()
+
+    monkeypatch.setenv("MIRA_LLM_API_KEY", API_KEY)
+    assert _review_llm(local)._build_headers()["Authorization"] == f"Bearer {API_KEY}"
+
+
+def test_an_unknown_provider_is_refused(no_llm_env: None) -> None:
+    with pytest.raises(ConfigError, match="zia"):
+        _review_llm(RunnerLLM(provider="zia"))
+
+
+def test_the_cli_reads_the_endpoint_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from click.testing import CliRunner
+
+    from mira.cli import main
+
+    seen: list[RunnerLLM] = []
+
+    async def fake_run_job(http: Any, **kwargs: Any) -> int:
+        seen.append(kwargs["llm"])
+        return 0
+
+    monkeypatch.setattr(runner_client, "run_job", fake_run_job)
+    env = {
+        "MIRA_RUNNER_LLM_PROVIDER": "",
+        "MIRA_RUNNER_MODEL": "glm-5.3",
+        "MIRA_RUNNER_LLM_BASE_URL": "https://api.together.xyz/v1",
+        "MIRA_RUNNER_LLM_API_STYLE": "",
+    }
+    result = CliRunner().invoke(
+        main, ["runner", "--job", "j", "--server", "https://mira.example"], env=env
+    )
+
+    assert result.exit_code == 0, result.output
+    # Unset repo variables reach the job as empty strings and mean "default".
+    assert seen == [
+        RunnerLLM(provider="claude-code", model="glm-5.3", base_url="https://api.together.xyz/v1")
+    ]
