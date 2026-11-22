@@ -13,6 +13,10 @@ _NEAR_LINE_DISTANCE = 3
 _NEAR_LINE_TEXT_THRESHOLD = 0.25
 _MIN_TEXT_TOKENS = 8
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
+# Line references in a comment body: `path:12`, `path#L12-L14`, "line 12", "lines 12-14", "L12".
+_PATH_LINE_RE = re.compile(r"([\w./-]+\.\w+)(?::|#L)(\d+)(?:-L?(\d+))?")
+_BARE_LINE_RE = re.compile(r"\b(?:[Ll]ines?\s+|L)(\d+)(?:\s*[-–]\s*L?(\d+))?\b")
+_MAX_CITED_RANGE = 200
 
 
 def _text_similarity(a: str, b: str) -> float:
@@ -97,19 +101,49 @@ def _is_duplicate(
     return title_sim >= title_threshold
 
 
+def _is_other_site(a: ReviewComment, b: ReviewComment) -> bool:
+    """Whether two duplicates sit at different places rather than restating one spot."""
+    if a.path != b.path:
+        return True
+    return not _lines_overlap(a, b) and abs(a.line - b.line) > _NEAR_LINE_DISTANCE
+
+
 def _deduplicate(
     comments: list[ReviewComment],
     title_threshold: float = 0.6,
 ) -> list[ReviewComment]:
-    """Remove duplicate comments using composite similarity."""
-    if not comments:
-        return []
+    """Keep one comment per root cause, naming the other sites in its body.
 
+    The first comment of each duplicate group is kept. A duplicate at another
+    place is folded into it as a site, so the author fixes every occurrence
+    from one comment. The kept comment is updated in place so audit identity
+    holds.
+    """
     kept: list[ReviewComment] = []
+    other_sites: dict[int, list[str]] = {}
     for comment in comments:
-        if not any(_is_duplicate(comment, existing, title_threshold) for existing in kept):
+        match = next(
+            (
+                i
+                for i, existing in enumerate(kept)
+                if _is_duplicate(comment, existing, title_threshold)
+            ),
+            None,
+        )
+        if match is None:
             kept.append(comment)
+        elif _is_other_site(comment, kept[match]):
+            site = f"`{comment.path}:{comment.line}`"
+            sites = other_sites.setdefault(match, [])
+            if site not in sites:
+                sites.append(site)
 
+    for i, sites in other_sites.items():
+        c = kept[i]
+        listed = ", ".join(sites)
+        c.body = f"{c.body.rstrip()}\n\nSame issue at {listed}."
+        if c.agent_prompt:
+            c.agent_prompt = f"{c.agent_prompt.rstrip()} Apply the same fix at {listed}."
     return kept
 
 
@@ -191,4 +225,47 @@ def drop_already_posted(
         if any(c.line <= ln <= end for ln in open_lines.get(c.path, [])):
             continue
         kept.append(c)
+    return kept
+
+
+def _cited_lines(comment: ReviewComment) -> set[tuple[str, int]]:
+    """``(path, line)`` pairs the comment's body names; a bare "line N" means its own file."""
+    cited: set[tuple[str, int]] = set()
+
+    def _add(path: str, start: str, end: str | None) -> None:
+        first = int(start)
+        last = int(end) if end else first
+        for ln in range(first, min(last, first + _MAX_CITED_RANGE) + 1):
+            cited.add((path, ln))
+
+    body = comment.body or ""
+    for m in _PATH_LINE_RE.finditer(body):
+        _add(m.group(1), m.group(2), m.group(3))
+    for m in _BARE_LINE_RE.finditer(_PATH_LINE_RE.sub("", body)):
+        _add(comment.path, m.group(1), m.group(2))
+    return cited
+
+
+def drop_outside_changed_hunks(
+    comments: list[ReviewComment],
+    changed: dict[str, set[int]],
+) -> list[ReviewComment]:
+    """Keep findings whose root cause is in lines the reviewed diff changed.
+
+    ``changed`` maps each path to the new-side lines its hunks cover. A
+    finding anchored outside every hunk is kept only when its body names a
+    changed line, which is how a round-2 finding on untouched code that the
+    new commits made worse survives. An empty map (unparseable diff) keeps
+    everything.
+    """
+    if not changed:
+        return comments
+
+    kept: list[ReviewComment] = []
+    for c in comments:
+        anchored = range(c.line, max(c.line, c.end_line or c.line) + 1)
+        if any(ln in changed.get(c.path, ()) for ln in anchored) or any(
+            ln in changed.get(path, ()) for path, ln in _cited_lines(c)
+        ):
+            kept.append(c)
     return kept

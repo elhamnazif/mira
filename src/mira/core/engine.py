@@ -21,7 +21,11 @@ from mira.core.context import expand_context
 from mira.core.diff_parser import parse_diff
 from mira.core.ensemble import merge_ensemble_runs
 from mira.core.file_filter import filter_files
-from mira.core.noise_filter import drop_already_posted, filter_noise
+from mira.core.noise_filter import (
+    drop_already_posted,
+    drop_outside_changed_hunks,
+    filter_noise,
+)
 from mira.core.passes import (
     agentic_review_loop,
     cap_review_summary,
@@ -2288,6 +2292,18 @@ class ReviewEngine:
         reviewed_paths = [p for p in selected_paths if p not in failed_path_set]
 
         all_comments = [classify_severity(c) for c in all_comments]
+
+        # Before dedup, so an out-of-scope finding can't stand in for an
+        # in-scope duplicate. Round 2+ reviews the incremental diff, so this
+        # is where "new since the last review" is enforced.
+        in_scope = drop_outside_changed_hunks(all_comments, _diff_line_map(diff_text))
+        _audit_stage(audit, "root_cause_scope", all_comments, in_scope)
+        if len(in_scope) != len(all_comments):
+            logger.info(
+                "Dropped %d comment(s) outside the changed hunks",
+                len(all_comments) - len(in_scope),
+            )
+        all_comments = in_scope
 
         final_comments = filter_noise(
             all_comments,

@@ -105,6 +105,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
           isOutdated
           comments(first: 1) {
             nodes {
+              databaseId
               author { login }
               body
               path
@@ -1050,6 +1051,7 @@ class GitHubProvider(BaseProvider):
                         line=first.get("line") or first.get("originalLine") or 0,
                         body=first.get("body", ""),
                         is_outdated=bool(node["isOutdated"]),
+                        comment_id=first.get("databaseId"),
                     )
                 )
 

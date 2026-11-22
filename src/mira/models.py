@@ -620,6 +620,9 @@ class UnresolvedThread:
     line: int
     body: str
     is_outdated: bool = False
+    # The root comment's numeric id, which replies thread under. None when the
+    # platform has no threaded reply.
+    comment_id: int | None = None
 
 
 @dataclass
@@ -632,6 +635,7 @@ class BotThreadRecord:
     body: str
     is_resolved: bool
     is_outdated: bool = False
+    comment_id: int | None = None
 
 
 @dataclass

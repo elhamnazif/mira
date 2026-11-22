@@ -106,6 +106,31 @@ async def verify_fixes(
     return parse_verify_fixes_response(response)
 
 
+async def _reply_addressed(
+    provider: BaseProvider, pr_info: PRInfo, threads: list[UnresolvedThread]
+) -> list[str]:
+    """Reply "Addressed in <sha>" on each thread; return the ids that got the reply.
+
+    A thread is resolved only after its reply lands, so the author sees why
+    it closed. One with no reply id, or whose reply fails, stays open and is
+    verified again next round.
+    """
+    sha = pr_info.head_sha[:7]
+    body = f"Addressed in `{sha}`." if sha else "Addressed in the latest commits."
+    replied: list[str] = []
+    for t in threads:
+        if t.comment_id is None:
+            logger.info("Leaving thread %s open: the platform has no threaded reply", t.thread_id)
+            continue
+        try:
+            await provider.reply_to_review_comment(pr_info, t.comment_id, body)
+        except Exception as exc:
+            logger.warning("Leaving thread %s open: reply failed: %s", t.thread_id, exc)
+            continue
+        replied.append(t.thread_id)
+    return replied
+
+
 async def resolve_verified_threads(
     provider: BaseProvider,
     llm: LLMProvider,
@@ -114,6 +139,9 @@ async def resolve_verified_threads(
     dry_run: bool,
 ) -> tuple[int, int, list[UnresolvedThread], list[ThreadDecision]]:
     """Resolve unresolved bot threads the LLM confirms as fixed.
+
+    Only the bot's own threads are fetched. Each verified thread gets an
+    "Addressed in <sha>" reply before it is resolved.
 
     Returns (threads_checked, threads_resolved, remaining_unresolved, decisions).
     """
@@ -173,7 +201,11 @@ async def resolve_verified_threads(
             resolved = len(verified_ids)
             logger.info("Dry run: would resolve %d thread(s): %s", resolved, verified_ids)
         else:
-            resolved = await provider.resolve_threads(pr_info, verified_ids)
+            retired = await _reply_addressed(
+                provider, pr_info, [t for t in threads if t.thread_id in verified_set]
+            )
+            if retired:
+                resolved = await provider.resolve_threads(pr_info, retired)
             if resolved < len(verified_ids):
                 logger.error(
                     "Failed to resolve %d/%d verified-fixed thread(s) on PR %s",

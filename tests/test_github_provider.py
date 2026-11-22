@@ -956,6 +956,7 @@ def _make_thread_node(
         "comments": {
             "nodes": [
                 {
+                    "databaseId": 900 + int(thread_id.lstrip("T") or 0),
                     "author": author,
                     "body": body,
                     "path": path,
@@ -1211,6 +1212,7 @@ class TestGetUnresolvedBotThreads:
         assert result[2].thread_id == "T5"
         assert result[2].path == "b.py"
         assert result[2].line == 5
+        assert [t.comment_id for t in result] == [901, 903, 905]
 
     @pytest.mark.asyncio
     async def test_handles_pagination(self):

@@ -1618,8 +1618,16 @@ class TestThreadResolution:
     @pytest.fixture
     def threads(self) -> list[UnresolvedThread]:
         return [
-            UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="Hardcoded secret"),
-            UnresolvedThread(thread_id="T2", path="src/app.py", line=25, body="Missing null check"),
+            UnresolvedThread(
+                thread_id="T1", path="src/app.py", line=10, body="Hardcoded secret", comment_id=101
+            ),
+            UnresolvedThread(
+                thread_id="T2",
+                path="src/app.py",
+                line=25,
+                body="Missing null check",
+                comment_id=102,
+            ),
         ]
 
     @pytest.fixture
@@ -3923,3 +3931,100 @@ class TestReviewStateStoreCalls:
         assert [(fp.pr_number, fp.head_sha) for fp in saved] == [(1, "sha-1")]
         assert saved[0].paths
         assert "list_pr_fingerprints" in store.calls
+
+
+class TestRootCauseScope:
+    """Round 2 keeps findings rooted in the new commits, plus regressions they caused."""
+
+    _FULL = (
+        "diff --git a/a.py b/a.py\nnew file mode 100644\n--- /dev/null\n+++ b/a.py\n"
+        "@@ -0,0 +1,30 @@\n" + "".join(f"+line{i}\n" for i in range(1, 31))
+    )
+    _INCREMENTAL = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -22,7 +22,7 @@\n"
+        " line22\n line23\n line24\n-line25\n+parse(None)\n line26\n line27\n line28\n"
+    )
+
+    @staticmethod
+    def _finding(line: int, category: str, title: str, body: str) -> dict:
+        return {
+            "path": "a.py",
+            "line": line,
+            "severity": "warning",
+            "category": category,
+            "title": title,
+            "body": body,
+            "confidence": 0.9,
+        }
+
+    async def _review(self, mock_llm, monkeypatch, *, round_two: bool) -> list[tuple[int, str]]:
+        from mira.models import BotThreadRecord
+
+        mock_llm.review = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "comments": [
+                        self._finding(25, "bug", "Passes None to parse", "Crashes at runtime."),
+                        self._finding(3, "bug", "Unchecked index", "Old code indexes blindly."),
+                        self._finding(
+                            8,
+                            "error-handling",
+                            "Parser dereferences None",
+                            "The new call at line 25 passes None, which this parser dereferences.",
+                        ),
+                    ],
+                    "summary": "",
+                    "metadata": {"reviewed_files": 1},
+                }
+            )
+        )
+        provider = AsyncMock()
+        provider.get_pr_info.return_value = PRInfo(
+            title="t",
+            description="",
+            base_branch="main",
+            head_branch="f",
+            url="https://github.com/o/r/pull/1",
+            number=1,
+            owner="o",
+            repo="r",
+            head_sha="HEAD_SHA",
+        )
+        provider.get_pr_diff.return_value = self._FULL
+        provider.get_compare_diff.return_value = self._INCREMENTAL
+        provider.get_unresolved_bot_threads.return_value = []
+        provider.get_all_bot_threads.return_value = (
+            [BotThreadRecord(thread_id="t", path="a.py", line=30, body="x", is_resolved=True)]
+            if round_two
+            else []
+        )
+        provider.find_bot_comment.return_value = None
+
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_repo = MagicMock(return_value=None)
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        config = MiraConfig()
+        config.review.overlap.enabled = False
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=provider, bot_name="mira", state=LocalStateStore()
+        )
+        result = await engine.review_pr("https://github.com/o/r/pull/1")
+        return sorted((c.line, c.title) for c in result.comments)
+
+    @pytest.mark.asyncio
+    async def test_round_2_keeps_new_lines_and_regressions_that_cite_them(
+        self, mock_llm, monkeypatch
+    ):
+        kept = await self._review(mock_llm, monkeypatch, round_two=True)
+
+        # Line 3 is PR code the new commits never touched; line 8 is too, but
+        # its body names the changed line 25 that made it worse.
+        assert kept == [(8, "Parser dereferences None"), (25, "Passes None to parse")]
+
+    @pytest.mark.asyncio
+    async def test_round_1_keeps_every_line_the_pr_changed(self, mock_llm, monkeypatch):
+        kept = await self._review(mock_llm, monkeypatch, round_two=False)
+
+        assert [line for line, _ in kept] == [3, 8, 25]
