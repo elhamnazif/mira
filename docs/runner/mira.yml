@@ -39,3 +39,4 @@ jobs:
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
       MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
       ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}
+      OPENCODE_AUTH_CONTENT: ${{ secrets.OPENCODE_AUTH_CONTENT }}

@@ -42,6 +42,9 @@ on:
       ANTHROPIC_CUSTOM_HEADERS:
         description: 'Extra headers for the ANTHROPIC_BASE_URL gateway, one "Name: value" per line'
         required: false
+      OPENCODE_AUTH_CONTENT:
+        description: An OpenCode auth.json, for MIRA_RUNNER_LLM_PROVIDER=opencode on a subscription
+        required: false
 
 permissions: {}
 
@@ -121,6 +124,15 @@ jobs:
           mira --version
           claude --version
 
+      # Only for MIRA_RUNNER_LLM_PROVIDER=opencode. npm 11+ skips install
+      # scripts unless allowed, and opencode-ai's fetches its binary.
+      - name: Install OpenCode
+        if: vars.MIRA_RUNNER_LLM_PROVIDER == 'opencode'
+        run: |
+          set -euo pipefail
+          npm install -g --allow-scripts=opencode-ai opencode-ai@1.18.29
+          opencode --version
+
       - name: Review
         id: review
         working-directory: ${{ runner.temp }}/mira/work
@@ -130,6 +142,7 @@ jobs:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
           ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}
+          OPENCODE_AUTH_CONTENT: ${{ secrets.OPENCODE_AUTH_CONTENT }}
           # In a reusable workflow, vars are the calling repo's variables.
           # Each is optional; an unset one is empty and means the default.
           MIRA_RUNNER_LLM_PROVIDER: ${{ vars.MIRA_RUNNER_LLM_PROVIDER }}
@@ -141,6 +154,9 @@ jobs:
           ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.ANTHROPIC_DEFAULT_SONNET_MODEL }}
           ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.ANTHROPIC_DEFAULT_HAIKU_MODEL }}
           API_TIMEOUT_MS: ${{ vars.API_TIMEOUT_MS }}
+          OPENAI_COMPATIBLE_BASE_URL: ${{ vars.OPENAI_COMPATIBLE_BASE_URL }}
+          OPENAI_COMPATIBLE_CONTEXT: ${{ vars.OPENAI_COMPATIBLE_CONTEXT }}
+          OPENAI_COMPATIBLE_MAX_OUTPUT: ${{ vars.OPENAI_COMPATIBLE_MAX_OUTPUT }}
           JOB_ID: ${{ inputs.job_id }}
           SERVER_URL: ${{ inputs.server_url }}
         # Under the job's timeout-minutes, so the review stops and reports

@@ -247,9 +247,12 @@ def test_an_explicit_fallback_model_wins(
     assert llm.config.fallback_model == "zai/glm-4.7"
 
 
-def test_the_opencode_slot_is_not_implemented(no_claude_env: None) -> None:
-    with pytest.raises(ConfigError, match="opencode"):
-        create_llm(LLMConfig(provider="opencode", model="zai/glm"))
+def test_the_opencode_override_builds_opencode(no_claude_env: None) -> None:
+    from mira.llm.agent_cli import OpenCodeProvider
+
+    llm = create_llm(LLMConfig(provider="opencode", model="zai/glm"))
+    assert isinstance(llm, OpenCodeProvider)
+    assert llm.config.model == "zai/glm-5.3"
 
 
 @pytest.mark.parametrize(

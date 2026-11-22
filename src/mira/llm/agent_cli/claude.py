@@ -31,6 +31,11 @@ Security posture of every invocation (checked against Claude Code 2.1.330):
   OAuth credentials, which would break subscription auth.
 * The child process gets a scrubbed environment and a throwaway ``HOME``
   (see ``AgentCLIProvider._child_env``).
+
+Output is ``--output-format stream-json`` with partial messages, so the stall
+watchdog sees each token arrive. ``system`` events (startup, API retries) do
+not count as progress. The final ``result`` event carries the same fields
+``--output-format json`` prints.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ from typing import Any
 
 from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
-from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult
+from mira.llm.agent_cli.base import AgentCLIProvider, CLICall, CLIRunResult
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +144,7 @@ class ClaudeCodeProvider(AgentCLIProvider):
                 values.append(value)
         return values
 
-    def _extra_env(self) -> dict[str, str]:
+    def _extra_env(self, call: CLICall) -> dict[str, str]:
         return {
             # A long-running server must not self-update its pinned CLI.
             "DISABLE_AUTOUPDATER": "1",
@@ -159,7 +164,9 @@ class ClaudeCodeProvider(AgentCLIProvider):
             self._executable,
             "-p",
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
             "--no-session-persistence",
             "--setting-sources",
             "",
@@ -184,12 +191,16 @@ class ClaudeCodeProvider(AgentCLIProvider):
             cmd += ["--effort", effort]
         return cmd
 
+    def _is_progress(self, line: bytes) -> bool:
+        return bool(line.strip()) and _event_type(line) != "system"
+
+    def _keeps_line(self, line: bytes) -> bool:
+        # Token deltas only feed the watchdog; the result event repeats what matters.
+        return _event_type(line) != "stream_event"
+
     def _parse_output(self, stdout: str, stderr: str, returncode: int) -> CLIRunResult:
-        try:
-            payload = json.loads(stdout) if stdout.strip() else None
-        except ValueError:
-            payload = None
-        if not isinstance(payload, dict):
+        payload = _result_event(stdout)
+        if payload is None:
             detail = (stderr or stdout).strip()[-2000:]
             raise LLMError("claude_exit_failed", exit_code=returncode, detail=detail)
 
@@ -214,6 +225,28 @@ class ClaudeCodeProvider(AgentCLIProvider):
         )
         _apply_model_usage(result, payload)
         return result
+
+
+def _event_type(line: bytes) -> str | None:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    return event.get("type") if isinstance(event, dict) else None
+
+
+def _result_event(stdout: str) -> dict[str, Any] | None:
+    """The last ``{"type": "result"}`` event in a stream-json transcript."""
+    for line in reversed(stdout.splitlines()):
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return None
 
 
 def _apply_model_usage(result: CLIRunResult, payload: dict[str, Any]) -> None:

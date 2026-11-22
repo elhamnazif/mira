@@ -86,6 +86,22 @@ the runner's own network, such as `http://localhost:11434/v1` for Ollama on a
 self-hosted runner, may go without `MIRA_LLM_API_KEY`. Any other endpoint
 needs it.
 
+**OpenCode**, with any provider OpenCode knows.
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `MIRA_RUNNER_LLM_PROVIDER` | `opencode` |
+| Variable | `MIRA_RUNNER_MODEL` | `<provider>/<model>`, e.g. `zai/glm-5.3` or `deepseek/deepseek-chat` |
+| Secret | `MIRA_LLM_API_KEY` | the provider's key (`ZAI_API_KEY` also works for `zai`) |
+| Secret | `OPENCODE_AUTH_CONTENT` | instead of a key: the contents of an OpenCode `auth.json`, for a subscription |
+
+For an OpenAI-compatible endpoint OpenCode doesn't know, use the model
+`openai-compatible/<model>` with the key in `MIRA_LLM_API_KEY` and the
+variables `OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_CONTEXT` and
+`OPENAI_COMPATIBLE_MAX_OUTPUT` (the model's context and output limits in
+tokens). OpenCode runs outside the checkout and reads it by absolute path,
+so a reviewed repo's `.opencode` plugins, tools and MCP servers never load.
+
 ## Configure the server
 
 In the server's deployment config:
