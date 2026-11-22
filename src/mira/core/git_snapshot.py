@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from functools import cached_property
 from pathlib import Path
 
 from mira.exceptions import MiraError
@@ -49,6 +50,11 @@ class GitSnapshot:
                 f"Could not read the local Git snapshot: {detail or 'no result'}"
             ) from exc
         return result.stdout
+
+    @cached_property
+    def root(self) -> Path:
+        """The checkout's top-level directory."""
+        return Path(self._git("rev-parse", "--show-toplevel").decode().strip())
 
     def diff(self) -> str:
         """Return the branch changes since it diverged from the requested base."""

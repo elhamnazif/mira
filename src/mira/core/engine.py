@@ -5,8 +5,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ from mira.core.threads import (
     thread_severity,
     thread_title,
 )
+from mira.core.workspace import pr_workspace
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
 from mira.index.context import SourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
@@ -587,6 +589,12 @@ def filter_blast_radius_for_visibility(
     return [d for d in dependents if dependent_private(d["repo"]) is False]
 
 
+def _has_workspace_agent(llm: object) -> bool:
+    """Whether ``llm`` reviews through ``run_review_agent`` in a checkout."""
+    # ``is True`` so a mock's auto-created attribute does not opt in.
+    return getattr(llm, "supports_workspace_agent", False) is True
+
+
 class ReviewEngine:
     """Orchestrates the full PR review pipeline."""
 
@@ -614,6 +622,8 @@ class ReviewEngine:
         self._index_was_empty = False
         self._agentic_source_fetcher: SourceFetcher | None = None
         self._agentic_repo_tree: list[str] = []
+        # Checkout the review LLM's own agent reads, when it supports one.
+        self._workspace: Path | None = None
 
     async def _post_placeholder_comment(self, pr_info: PRInfo) -> int | None:
         """Post an immediate 'Reviewing this PR...' comment and return its ID.
@@ -887,12 +897,30 @@ class ReviewEngine:
 
         run_id = await self._start_check(pr_info)
         try:
-            result = await self._review_pr(pr_info)
+            async with self._pr_workspace(pr_info):
+                result = await self._review_pr(pr_info)
         except BaseException:
             await self._finish_check(pr_info, run_id, "failure", None)
             raise
         await self._finish_check(pr_info, run_id, self._check_status_key(result), result)
         return result
+
+    @contextlib.asynccontextmanager
+    async def _pr_workspace(self, pr_info: PRInfo) -> AsyncIterator[None]:
+        """Hold a checkout of the PR head for the review LLM's agent, if it can use one."""
+        async with contextlib.AsyncExitStack() as stack:
+            if _has_workspace_agent(self.llm):
+                assert self.provider is not None
+                try:
+                    source = await self.provider.checkout_source(pr_info)
+                    if source is not None:
+                        self._workspace = await stack.enter_async_context(pr_workspace(source))
+                except Exception as exc:
+                    logger.warning("PR checkout failed, reviewing without a workspace: %s", exc)
+            try:
+                yield
+            finally:
+                self._workspace = None
 
     async def _review_pr(self, pr_info: PRInfo) -> ReviewResult:
         """Core review pipeline: review the fetched PR and post results.
@@ -1491,7 +1519,13 @@ class ReviewEngine:
         self, diff_text: str, *, local_snapshot: GitSnapshot | None = None
     ) -> ReviewResult:
         """Review a diff without a Git hosting provider."""
-        return await self._review_diff_internal(diff_text, local_snapshot=local_snapshot)
+        if local_snapshot is not None and _has_workspace_agent(self.llm):
+            # The agent reads the working tree, so uncommitted changes are visible to it.
+            self._workspace = local_snapshot.root
+        try:
+            return await self._review_diff_internal(diff_text, local_snapshot=local_snapshot)
+        finally:
+            self._workspace = None
 
     async def _review_diff_internal(
         self,
@@ -1915,7 +1949,12 @@ class ReviewEngine:
                             parsed.summary or "",
                         )
 
-                    if self.config.review.agentic_tools and source_fetcher is not None:
+                    if self._workspace is not None and _has_workspace_agent(self.llm):
+                        raw_response = await self.llm.run_review_agent(  # type: ignore[attr-defined]
+                            messages, self._workspace
+                        )
+                        audit.append({"stage": "agent_cli", "chunk": idx})
+                    elif self.config.review.agentic_tools and source_fetcher is not None:
                         from mira.llm.agentic_tools import AgenticToolExecutor
 
                         executor = AgenticToolExecutor(
