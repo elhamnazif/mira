@@ -23,7 +23,7 @@ from mira.core.engine import (
 )
 from mira.core.state_store import LocalStateStore, ReviewRecord
 from mira.core.threads import _extract_sections
-from mira.dashboard.db import PRReviewProgress
+from mira.dashboard.db import PRReviewProgress, ReviewedVersion
 from mira.exceptions import ProviderError
 from mira.llm.provider import LLMProvider
 from mira.models import (
@@ -2101,6 +2101,7 @@ class TestIncrementalDiff:
                 owner="o",
                 repo="r",
                 head_sha="HEAD_SHA",
+                base_sha="BASE_SHA",
             )
         )
         mock_provider.get_pr_diff = AsyncMock(return_value=full_diff)
@@ -2126,9 +2127,9 @@ class TestIncrementalDiff:
         )
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion("OLD_SHA"))
         mock_db.get_repo = MagicMock(return_value=None)
-        mock_db.set_last_reviewed_sha = MagicMock()
+        mock_db.set_last_reviewed = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
         captured: dict = {}
@@ -2168,9 +2169,9 @@ class TestIncrementalDiff:
         )
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion())
         mock_db.get_repo = MagicMock(return_value=None)
-        mock_db.set_last_reviewed_sha = MagicMock()
+        mock_db.set_last_reviewed = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
         captured: dict = {}
@@ -2203,9 +2204,9 @@ class TestIncrementalDiff:
         mock_provider = self._provider_with_threads_and_compare(threads=[])
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion("OLD_SHA"))
         mock_db.get_repo = MagicMock(return_value=None)
-        mock_db.set_last_reviewed_sha = MagicMock()
+        mock_db.set_last_reviewed = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
         async def fake_internal(self, diff_text, **kwargs):
@@ -2228,16 +2229,16 @@ class TestIncrementalDiff:
 
     @pytest.mark.asyncio
     async def test_records_head_sha_after_review(self, monkeypatch):
-        """After a successful review, the current head SHA is anchored so
-        round 2 has a base for the incremental diff."""
+        """After a successful review, the current head and base SHAs are
+        anchored so round 2 has a version to diff against."""
         from mira.core.engine import ReviewEngine
 
         mock_provider = self._provider_with_threads_and_compare(threads=[])
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion())
         mock_db.get_repo = MagicMock(return_value=None)
-        mock_db.set_last_reviewed_sha = MagicMock()
+        mock_db.set_last_reviewed = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
         async def fake_internal(self, diff_text, **kwargs):
@@ -2256,8 +2257,8 @@ class TestIncrementalDiff:
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
-        mock_db.set_last_reviewed_sha.assert_called_once_with(
-            "o", "r", 1, "HEAD_SHA", platform="github"
+        mock_db.set_last_reviewed.assert_called_once_with(
+            "o", "r", 1, ReviewedVersion("HEAD_SHA", "BASE_SHA"), platform="github"
         )
 
     @pytest.mark.asyncio
@@ -2273,9 +2274,9 @@ class TestIncrementalDiff:
 
         mock_provider = self._provider_with_threads_and_compare(threads=[])
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion())
         mock_db.get_repo = MagicMock(return_value=None)
-        mock_db.set_last_reviewed_sha = MagicMock()
+        mock_db.set_last_reviewed = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
         async def fake_internal(self, diff_text, **kwargs):
@@ -2294,7 +2295,7 @@ class TestIncrementalDiff:
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
-        assert mock_db.set_last_reviewed_sha.called is anchored
+        assert mock_db.set_last_reviewed.called is anchored
 
 
 class TestSelfCritique:
@@ -2895,7 +2896,7 @@ class TestGlobalRules:
 
         mock_db = MagicMock()
         mock_db.get_global_rules_text.return_value = ["Security: Never log tokens"]
-        mock_db.get_last_reviewed_sha.return_value = ""
+        mock_db.get_last_reviewed.return_value = ReviewedVersion()
         mock_db.get_repo.return_value = None
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
@@ -3402,9 +3403,9 @@ class TestIncrementalWalkthroughScope:
         from mira.models import ReviewResult, WalkthroughResult
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value=last_sha)
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion(last_sha))
         mock_db.get_repo = MagicMock(return_value=None)
-        mock_db.set_last_reviewed_sha = MagicMock()
+        mock_db.set_last_reviewed = MagicMock()
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
         async def fake_internal(self, diff_text, **kwargs):
@@ -3761,13 +3762,13 @@ class _RecordingStateStore:
         self.calls.append("list_manifest_package_names")
         return []
 
-    def get_last_reviewed_sha(self, owner, repo, pr_number, *, platform):
-        self.calls.append("get_last_reviewed_sha")
-        return self.last_sha.get(pr_number, "")
+    def get_last_reviewed(self, owner, repo, pr_number, *, platform):
+        self.calls.append("get_last_reviewed")
+        return ReviewedVersion(self.last_sha.get(pr_number, ""))
 
-    def set_last_reviewed_sha(self, owner, repo, pr_number, sha, *, platform):
-        self.calls.append("set_last_reviewed_sha")
-        self.last_sha[pr_number] = sha
+    def set_last_reviewed(self, owner, repo, pr_number, version, *, platform):
+        self.calls.append("set_last_reviewed")
+        self.last_sha[pr_number] = version.head_sha
 
     def get_pr_review_progress(self, owner, repo, pr_number, *, platform):
         self.calls.append("get_pr_review_progress")
@@ -3835,7 +3836,7 @@ class TestReviewStateStoreCalls:
             "record_review",
             "get_pr_review_progress",
             "upsert_pr_review_progress",
-            "set_last_reviewed_sha",
+            "set_last_reviewed",
         ]
         assert store.last_sha == {1: "sha-1"}
         assert store.reviews[0].comments_posted == len(result.comments) > 0
@@ -3854,7 +3855,7 @@ class TestReviewStateStoreCalls:
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert store.calls == [
-            "get_last_reviewed_sha",
+            "get_last_reviewed",
             "get_repo",
             "get_learned_rules",
             "list_review_context",
@@ -3863,7 +3864,7 @@ class TestReviewStateStoreCalls:
             "record_review",
             "get_pr_review_progress",
             "upsert_pr_review_progress",
-            "set_last_reviewed_sha",
+            "set_last_reviewed",
         ]
         args = second.get_compare_diff.call_args.args
         assert (args[1], args[2]) == ("sha-1", "sha-2")
@@ -4001,7 +4002,7 @@ class TestRootCauseScope:
         provider.find_bot_comment.return_value = None
 
         mock_db = MagicMock()
-        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_last_reviewed = MagicMock(return_value=ReviewedVersion("OLD_SHA"))
         mock_db.get_repo = MagicMock(return_value=None)
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 

@@ -44,6 +44,7 @@ from mira.core.threads import (
     thread_title,
 )
 from mira.core.workspace import pr_workspace
+from mira.dashboard.db import ReviewedVersion
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
 from mira.index.context import SourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
@@ -1075,12 +1076,12 @@ class ReviewEngine:
         full_diff_text = diff_text
         if review_round >= 2 and pr_info.head_sha:
             try:
-                last_sha = state.get_last_reviewed_sha(
+                last_sha = state.get_last_reviewed(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
                     platform=pr_info.platform,
-                )
+                ).head_sha
                 if last_sha and last_sha != pr_info.head_sha:
                     incremental = await self.provider.get_compare_diff(
                         pr_info,
@@ -1513,11 +1514,11 @@ class ReviewEngine:
         # the next push would skip the changes it never saw.
         if pr_info.head_sha and not result.all_chunks_failed:
             try:
-                state.set_last_reviewed_sha(
+                state.set_last_reviewed(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
-                    pr_info.head_sha,
+                    ReviewedVersion(head_sha=pr_info.head_sha, base_sha=pr_info.base_sha),
                     platform=pr_info.platform,
                 )
             except Exception as exc:

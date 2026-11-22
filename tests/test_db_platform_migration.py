@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from mira.dashboard.db import AppDatabase
+from mira.dashboard.db import AppDatabase, ReviewedVersion
 
 # The pre-migration repos/pr_review_progress schema (no platform column,
 # PK on owner/repo). Mirrors what shipped before GitLab support.
@@ -66,7 +66,10 @@ def test_migrates_old_db_preserving_rows(tmp_path):
     assert rec.status == "ready"
     assert rec.installation_id == 42
     assert rec.private is True
-    assert db.get_last_reviewed_sha("acme", "web", 3) == "deadbeef"
+    assert db.get_last_reviewed("acme", "web", 3) == ReviewedVersion("deadbeef")
+    # The base SHA column is added, so the next review can record one.
+    db.set_last_reviewed("acme", "web", 3, ReviewedVersion("cafe", "base1"))
+    assert db.get_last_reviewed("acme", "web", 3) == ReviewedVersion("cafe", "base1")
 
     # New PK allows a same-named repo on another platform to coexist.
     db.register_repo("acme", "web", platform="gitlab")

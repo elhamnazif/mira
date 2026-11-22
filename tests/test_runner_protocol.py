@@ -10,7 +10,7 @@ import pytest
 
 from mira.config import MiraConfig
 from mira.core.state_store import LocalStateStore, ReviewRecord
-from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord
+from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
 from mira.runner_protocol import (
@@ -90,7 +90,7 @@ def _progress(chunk_index: int) -> PRReviewProgress:
 def _review_round(store, sha: str) -> None:
     """The store calls of one review round, in the order PR1's recording store
     pinned for review_pr, plus an overlap fingerprint."""
-    store.get_last_reviewed_sha("o", "r", 7, platform="github")
+    store.get_last_reviewed("o", "r", 7, platform="github")
     store.get_repo("o", "r")
     store.get_learned_rules("o", "r", platform="github")
     store.get_global_rules()
@@ -104,7 +104,7 @@ def _review_round(store, sha: str) -> None:
     store.upsert_pr_review_progress(
         _progress((prior.chunk_index + 1) if prior else 1), platform="github"
     )
-    store.set_last_reviewed_sha("o", "r", 7, sha, platform="github")
+    store.set_last_reviewed("o", "r", 7, ReviewedVersion(sha, f"base-{sha}"), platform="github")
 
 
 def test_reads_come_from_the_snapshot_for_its_pr_only() -> None:
@@ -116,12 +116,12 @@ def test_reads_come_from_the_snapshot_for_its_pr_only() -> None:
     assert store.get_learned_rules("o", "r", platform="github") == ["Prefer Decimal"]
     assert store.list_review_context("o", "r", platform="github") == snap.review_context
     assert store.list_manifest_package_names("o", "r", platform="github") == ["httpx", "pydantic"]
-    assert store.get_last_reviewed_sha("o", "r", 7, platform="github") == "sha-0"
+    assert store.get_last_reviewed("o", "r", 7, platform="github") == ReviewedVersion("sha-0")
     assert [fp.pr_number for fp in store.list_pr_fingerprints("o", "r", platform="github")] == [3]
     # Anything outside the snapshot reads as unknown, like an empty database.
     assert store.get_repo("o", "dependent") is None
-    assert store.get_last_reviewed_sha("o", "r", 8, platform="github") == ""
-    assert store.get_last_reviewed_sha("o", "r", 7, platform="gitlab") == ""
+    assert store.get_last_reviewed("o", "r", 8, platform="github") == ReviewedVersion()
+    assert store.get_last_reviewed("o", "r", 7, platform="gitlab") == ReviewedVersion()
     assert store.get_learned_rules("o", "other", platform="github") == []
     assert store.list_pr_fingerprints("o", "other", platform="github") == []
     assert store.list_review_context("o", "other", platform="github") == []
@@ -133,7 +133,9 @@ def test_reads_after_writes_see_the_written_values() -> None:
     _review_round(store, "sha-1")
     _review_round(store, "sha-2")
 
-    assert store.get_last_reviewed_sha("o", "r", 7, platform="github") == "sha-2"
+    assert store.get_last_reviewed("o", "r", 7, platform="github") == ReviewedVersion(
+        "sha-2", "base-sha-2"
+    )
     progress = store.get_pr_review_progress("o", "r", 7, platform="github")
     assert progress is not None and progress.chunk_index == 2
     fps = {
@@ -151,7 +153,7 @@ def test_reads_after_writes_see_the_written_values() -> None:
 def test_a_write_for_another_pr_is_refused() -> None:
     store = RemoteStateStore(_snapshot())
     with pytest.raises(ValueError):
-        store.set_last_reviewed_sha("o", "r", 8, "x", platform="github")
+        store.set_last_reviewed("o", "r", 8, ReviewedVersion("x"), platform="github")
     with pytest.raises(ValueError):
         store.record_review("o", "other", _review(), platform="github")
     with pytest.raises(ValueError):
@@ -205,8 +207,10 @@ def state_rows(pr: PRKey = PR) -> dict:
         store.close()
     db = api._app_db
     progress = db.get_pr_review_progress(pr.owner, pr.repo, pr.pr_number, platform=pr.platform)
+    last = db.get_last_reviewed(pr.owner, pr.repo, pr.pr_number, platform=pr.platform)
     return {
-        "sha": db.get_last_reviewed_sha(pr.owner, pr.repo, pr.pr_number, platform=pr.platform),
+        "sha": last.head_sha,
+        "base_sha": last.base_sha,
         "progress": progress and {k: v for k, v in asdict(progress).items() if k != "updated_at"},
         "events": events,
         "comments": comments,
@@ -231,6 +235,7 @@ def test_applied_writes_equal_direct_local_writes(
 
     assert state_rows() == direct
     assert direct["sha"] == "sha-2" and len(direct["events"]) == 2
+    assert direct["base_sha"] == "base-sha-2"
 
 
 def test_snapshot_carries_the_dashboards_review_context_and_manifest_packages(
@@ -268,7 +273,7 @@ def test_apply_refuses_a_review_of_another_pr_before_writing(local: LocalStateSt
 
     with pytest.raises(ValueError):
         apply_writes(local, PR, [SetLastReviewedSha(sha="x"), RecordReview(review=_review(8))])
-    assert local.get_last_reviewed_sha("o", "r", 7, platform="github") == ""
+    assert local.get_last_reviewed("o", "r", 7, platform="github") == ReviewedVersion()
 
 
 def test_runner_config_drops_the_servers_own_settings() -> None:

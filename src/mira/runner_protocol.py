@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, SecretStr
 
 from mira.config import MiraConfig, _strip_deployment_only_settings
 from mira.core.state_store import ReviewRecord, ReviewStateStore
-from mira.dashboard.db import PRReviewProgress, RepoRecord
+from mira.dashboard.db import PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import ReviewContext
 from mira.models import PRFingerprint
 
@@ -61,6 +61,7 @@ class StateSnapshot(_Wire):
     review_context: list[ReviewContext]
     manifest_package_names: list[str]
     last_reviewed_sha: str
+    last_reviewed_base_sha: str = ""
     review_progress: PRReviewProgress | None
     fingerprints: list[PRFingerprint]
 
@@ -68,6 +69,7 @@ class StateSnapshot(_Wire):
 class SetLastReviewedSha(_Wire):
     op: Literal["set_last_reviewed_sha"] = "set_last_reviewed_sha"
     sha: str
+    base_sha: str = ""
 
 
 class UpsertPRReviewProgress(_Wire):
@@ -144,6 +146,7 @@ def runner_config(config: MiraConfig) -> dict[str, Any]:
 
 def build_snapshot(store: ReviewStateStore, pr: PRKey) -> StateSnapshot:
     owner, repo, number, platform = pr.owner, pr.repo, pr.pr_number, pr.platform
+    last = store.get_last_reviewed(owner, repo, number, platform=platform)
     return StateSnapshot(
         pr=pr,
         repo_record=store.get_repo(owner, repo),
@@ -151,7 +154,8 @@ def build_snapshot(store: ReviewStateStore, pr: PRKey) -> StateSnapshot:
         learned_rules=store.get_learned_rules(owner, repo, platform=platform),
         review_context=store.list_review_context(owner, repo, platform=platform),
         manifest_package_names=store.list_manifest_package_names(owner, repo, platform=platform),
-        last_reviewed_sha=store.get_last_reviewed_sha(owner, repo, number, platform=platform),
+        last_reviewed_sha=last.head_sha,
+        last_reviewed_base_sha=last.base_sha,
         review_progress=store.get_pr_review_progress(owner, repo, number, platform=platform),
         fingerprints=store.list_pr_fingerprints(owner, repo, platform=platform),
     )
@@ -166,7 +170,7 @@ class RemoteStateStore:
 
     def __init__(self, snapshot: StateSnapshot) -> None:
         self._snapshot = snapshot
-        self._last_sha = snapshot.last_reviewed_sha
+        self._last = ReviewedVersion(snapshot.last_reviewed_sha, snapshot.last_reviewed_base_sha)
         self._progress = snapshot.review_progress
         self._fingerprints = {fp.pr_number: fp for fp in snapshot.fingerprints}
         self.writes: list[StateWrite] = []
@@ -205,15 +209,17 @@ class RemoteStateStore:
             return []
         return list(self._snapshot.manifest_package_names)
 
-    def get_last_reviewed_sha(self, owner: str, repo: str, pr_number: int, *, platform: str) -> str:
-        return self._last_sha if self._is_pr(owner, repo, pr_number, platform) else ""
+    def get_last_reviewed(
+        self, owner: str, repo: str, pr_number: int, *, platform: str
+    ) -> ReviewedVersion:
+        return self._last if self._is_pr(owner, repo, pr_number, platform) else ReviewedVersion()
 
-    def set_last_reviewed_sha(
-        self, owner: str, repo: str, pr_number: int, sha: str, *, platform: str
+    def set_last_reviewed(
+        self, owner: str, repo: str, pr_number: int, version: ReviewedVersion, *, platform: str
     ) -> None:
         self._check_pr(owner, repo, pr_number, platform)
-        self._last_sha = sha
-        self.writes.append(SetLastReviewedSha(sha=sha))
+        self._last = version
+        self.writes.append(SetLastReviewedSha(sha=version.head_sha, base_sha=version.base_sha))
 
     def get_pr_review_progress(
         self, owner: str, repo: str, pr_number: int, *, platform: str
@@ -280,8 +286,9 @@ def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite
     owner, repo, number, platform = pr.owner, pr.repo, pr.pr_number, pr.platform
     for write in writes:
         match write:
-            case SetLastReviewedSha(sha=sha):
-                store.set_last_reviewed_sha(owner, repo, number, sha, platform=platform)
+            case SetLastReviewedSha(sha=sha, base_sha=base_sha):
+                version = ReviewedVersion(head_sha=sha, base_sha=base_sha)
+                store.set_last_reviewed(owner, repo, number, version, platform=platform)
             case UpsertPRReviewProgress():
                 progress = PRReviewProgress(
                     owner=owner,

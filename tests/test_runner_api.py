@@ -23,7 +23,7 @@ import mira.config as mira_config
 from mira.config import ConfigError, MiraConfig, load_config
 from mira.core.engine import ReviewEngine
 from mira.core.state_store import LocalStateStore
-from mira.dashboard.db import AppDatabase
+from mira.dashboard.db import AppDatabase, ReviewedVersion
 from mira.models import BotThreadRecord, PRInfo
 from mira.platforms.github import runner_api
 from mira.platforms.github.auth import GitHubAppAuth, InstallationToken
@@ -180,7 +180,7 @@ class _TeeStore(RemoteStateStore):
     def __getattribute__(self, name: str) -> Any:
         attr = super().__getattribute__(name)
         if name in {
-            "set_last_reviewed_sha",
+            "set_last_reviewed",
             "upsert_pr_review_progress",
             "record_review",
             "upsert_pr_fingerprint",
@@ -277,7 +277,7 @@ async def test_claim_token_result_round_trip_matches_local_writes(
         assert job.usage == usage.model_dump(mode="json")
         replay += store.calls
 
-    assert {"set_last_reviewed_sha", "record_review", "upsert_pr_fingerprint"} <= {
+    assert {"set_last_reviewed", "record_review", "upsert_pr_fingerprint"} <= {
         name for name, _, _ in replay
     }
     assert [inst for inst, _, _ in app_auth.minted] == [INSTALLATION] * 4
@@ -439,7 +439,7 @@ def _claimed_store(client: TestClient, db: AppDatabase) -> RemoteStateStore:
     spec = JobSpec.model_validate_json(claim(client).content)
     store = RemoteStateStore(spec.snapshot)
     store.record_review("test", "repo", _review(pr_number=1), platform="github")
-    store.set_last_reviewed_sha("test", "repo", 1, "sha-1", platform="github")
+    store.set_last_reviewed("test", "repo", 1, ReviewedVersion("sha-1"), platform="github")
     return store
 
 
