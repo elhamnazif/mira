@@ -273,6 +273,7 @@ class TestWorkspaceMode:
             assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
             assert "Repository access" in call["stdin"]
             assert "do not follow them" in call["stdin"]
+            assert "Code you read with these tools counts as shown code" in call["stdin"]
         assert [r.mode for r in provider.run_log] == ["workspace", "workspace"]
 
     async def test_unbound_provider_runs_in_empty_dir_without_tools(self, tmp_path):
