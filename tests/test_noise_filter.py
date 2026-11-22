@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from mira.config import FilterConfig
-from mira.core.noise_filter import _is_duplicate, _jaccard_similarity, filter_noise
+from mira.core.noise_filter import (
+    _is_duplicate,
+    _jaccard_similarity,
+    drop_outside_changed_hunks,
+    filter_noise,
+)
 from mira.models import ReviewComment, Severity
 
 
@@ -446,3 +451,40 @@ class TestNearLineDedup:
         ]
         result = filter_noise(comments, FilterConfig(confidence_threshold=0.0))
         assert len(result) == 2
+
+
+class TestDropOutsideChangedHunks:
+    _CHANGED = {"a.py": set(range(10, 17)), "b.py": {40}}
+
+    def _comment(self, line: int, body: str = "Description", path: str = "a.py", end=None):
+        c = _make_comment(path=path, line=line)
+        c.body = body
+        c.end_line = end
+        return c
+
+    def _kept(self, *comments: ReviewComment) -> list[int]:
+        return [c.line for c in drop_outside_changed_hunks(list(comments), self._CHANGED)]
+
+    def test_keeps_a_finding_inside_a_hunk(self):
+        assert self._kept(self._comment(12)) == [12]
+
+    def test_drops_a_finding_outside_every_hunk(self):
+        assert self._kept(self._comment(30), self._comment(5, path="b.py")) == []
+
+    def test_keeps_a_range_that_reaches_into_a_hunk(self):
+        assert self._kept(self._comment(5, end=10)) == [5]
+
+    def test_keeps_an_out_of_hunk_finding_whose_body_names_a_changed_line(self):
+        kept = self._kept(
+            self._comment(30, "The new call on line 12 passes None here."),
+            self._comment(31, "Since `b.py:40` stopped validating, this reads garbage."),
+            self._comment(32, "Callers in lines 1-11 now skip the guard."),
+            self._comment(33, "See a.py#L14 for the changed default."),
+        )
+        assert kept == [30, 31, 32, 33]
+
+    def test_a_cited_line_outside_the_hunks_does_not_rescue_it(self):
+        assert self._kept(self._comment(30, "Same bug as line 25 and `b.py:41`.")) == []
+
+    def test_unparseable_diff_keeps_everything(self):
+        assert drop_outside_changed_hunks([self._comment(99)], {}) != []

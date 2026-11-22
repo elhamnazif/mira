@@ -261,7 +261,7 @@ def convert_to_review_comments(
     """Convert LLM response comments to ReviewComment models.
 
     Filters out comments with hallucinated file paths if valid_paths is provided.
-    When diff_files is given, ensures line numbers are within diff ranges and
+    When diff_files is given, snaps line numbers within 5 lines of a hunk into it and
     checks ``existing_code`` against the hunks: a quote that cannot be located
     is cleared (along with any suggestion anchored on it) rather than taking
     the finding down with it — the line number and body are still valid, and
@@ -282,6 +282,9 @@ def convert_to_review_comments(
         if c.line < 1:
             continue
 
+        # A near miss is snapped into its hunk. A far one is left for the
+        # engine's root-cause scope filter, which keeps it only when its body
+        # names a changed line.
         if diff_ranges and c.path in diff_ranges:
             file_ranges = diff_ranges[c.path]
             if not any(start <= c.line <= end for start, end in file_ranges):
@@ -289,8 +292,6 @@ def convert_to_review_comments(
                 if snapped is not None:
                     c.line = snapped
                     c.end_line = None
-                else:
-                    continue
 
         if c.suggestion and not c.body.strip():
             continue
