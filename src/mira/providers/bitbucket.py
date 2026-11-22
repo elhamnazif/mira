@@ -662,6 +662,7 @@ class BitbucketProvider(BaseProvider):
                 line=t.line,
                 body=t.body,
                 is_outdated=t.is_outdated,
+                comment_id=int(t.thread_id),
             )
             for t in threads
             if not t.is_resolved

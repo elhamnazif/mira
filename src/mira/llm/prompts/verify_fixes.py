@@ -76,7 +76,7 @@ def build_verify_fixes_prompt(
         issue_lines: list[str] = []
         for idx, t in enumerate(threads, 1):
             line_label = f"Line {t.line}" if t.line > 0 else "Location unknown (outdated comment)"
-            outdated_tag = " [OUTDATED — code has changed]" if t.is_outdated else ""
+            outdated_tag = " [OUTDATED]" if t.is_outdated else ""
             issue_lines.append(
                 f'{idx}. (id: "{t.thread_id}") {line_label}{outdated_tag}: '
                 f"{_extract_issue_description(t.body)}"
@@ -97,19 +97,19 @@ def build_verify_fixes_prompt(
                 "(full or relevant sections) with line numbers, and a list of "
                 "previously flagged issues.\n\n"
                 "For each issue:\n"
-                "1. Look at the referenced line number in the current code.\n"
-                "2. Check if the EXACT problematic code pattern described in "
-                "the issue is still present at or near that line.\n"
-                "3. Mark as fixed (true) if ANY of these apply:\n"
-                "   - The problematic pattern has been removed or replaced.\n"
-                "   - The issue description does not match the actual code "
-                "(i.e. the issue was wrong or outdated).\n"
-                "   - The code at the referenced location has changed such "
-                "that the concern no longer applies.\n"
-                "4. Mark as not fixed (false) ONLY if the exact problematic "
-                "pattern described in the issue is still clearly present.\n\n"
-                "Issues tagged [OUTDATED] have been flagged by GitHub as having "
-                "changed code around them — these are very likely fixed.\n\n"
+                "1. Find the code the issue describes: at the referenced line, "
+                "or where it moved to if the code shifted.\n"
+                "2. Mark as fixed (true) only when every concern the issue "
+                "raises is resolved in the current code: the problematic "
+                "pattern is gone or corrected.\n"
+                "3. Mark as not fixed (false) when any concern remains, when the "
+                "fix is partial, or when you are unsure. Code that was "
+                "reformatted, renamed, or moved but still has the problem is "
+                "not fixed.\n\n"
+                "Issues tagged [OUTDATED] only had their anchor moved by the "
+                "platform (shifted lines, a force-push, a rename). That says "
+                "nothing about whether the issue was addressed: judge them the "
+                "same way.\n\n"
                 "Respond with ONLY the JSON object below, no other text:\n"
                 '{"results": [{"id": "<thread_id>", "fixed": true/false}, ...]}'
             ),

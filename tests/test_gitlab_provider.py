@@ -335,6 +335,7 @@ class TestBotThreadIdentity:
                 "id": "d1",
                 "notes": [
                     {
+                        "id": 11,
                         "author": {"username": "project_99_bot_x"},
                         "position": {"new_path": "a.py", "new_line": 5},
                         "body": "bot finding",
@@ -362,7 +363,7 @@ class TestBotThreadIdentity:
 
         with _patch(handler):
             threads = await GitLabProvider("tok").get_unresolved_bot_threads(_PR, "mira")
-        assert [t.thread_id for t in threads] == ["d1"]
+        assert [(t.thread_id, t.comment_id) for t in threads] == [("d1", 11)]
 
 
 class TestGetFileContent:

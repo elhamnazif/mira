@@ -365,7 +365,7 @@ class TestThreads:
         ctx, _ = _patch(self._handler)
         with ctx:
             threads = await BitbucketProvider("tok").get_unresolved_bot_threads(_pr_info())
-        assert [t.thread_id for t in threads] == ["1"]
+        assert [(t.thread_id, t.comment_id) for t in threads] == [("1", 1)]
 
     @pytest.mark.asyncio
     async def test_thread_id_walks_to_root(self):

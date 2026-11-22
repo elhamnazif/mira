@@ -1618,8 +1618,16 @@ class TestThreadResolution:
     @pytest.fixture
     def threads(self) -> list[UnresolvedThread]:
         return [
-            UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="Hardcoded secret"),
-            UnresolvedThread(thread_id="T2", path="src/app.py", line=25, body="Missing null check"),
+            UnresolvedThread(
+                thread_id="T1", path="src/app.py", line=10, body="Hardcoded secret", comment_id=101
+            ),
+            UnresolvedThread(
+                thread_id="T2",
+                path="src/app.py",
+                line=25,
+                body="Missing null check",
+                comment_id=102,
+            ),
         ]
 
     @pytest.fixture

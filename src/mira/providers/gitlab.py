@@ -463,6 +463,7 @@ class GitLabProvider(BaseProvider):
                     line=int(pos.get("new_line") or pos.get("old_line") or 0),
                     body=note.get("body") or "",
                     is_resolved=bool(note.get("resolved")),
+                    comment_id=note.get("id"),
                 )
             )
         return records
@@ -472,7 +473,13 @@ class GitLabProvider(BaseProvider):
     ) -> list[UnresolvedThread]:
         threads = await self.get_all_bot_threads(pr_info, bot_login)
         return [
-            UnresolvedThread(thread_id=t.thread_id, path=t.path, line=t.line, body=t.body)
+            UnresolvedThread(
+                thread_id=t.thread_id,
+                path=t.path,
+                line=t.line,
+                body=t.body,
+                comment_id=t.comment_id,
+            )
             for t in threads
             if not t.is_resolved
         ]
