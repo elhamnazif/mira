@@ -54,6 +54,16 @@ class Severity(enum.IntEnum):
         }[self]
 
 
+# A real defect in these categories breaks behavior, so it is never below
+# warning. Doubt belongs in the finding's confidence, not its severity.
+SEVERITY_FLOOR: dict[str, Severity] = {
+    "bug": Severity.WARNING,
+    "security": Severity.WARNING,
+    "race-condition": Severity.WARNING,
+    "resource-leak": Severity.WARNING,
+}
+
+
 @dataclass
 class HunkInfo:
     """A single diff hunk within a file."""

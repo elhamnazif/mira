@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 from mira.exceptions import ResponseParseError
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.models import (
+    SEVERITY_FLOOR,
     FileChangeType,
     FileDiff,
     ReviewComment,
@@ -22,15 +23,6 @@ from mira.models import (
 )
 
 logger = logging.getLogger(__name__)
-
-# A real defect in these categories breaks behavior, so it is never below
-# warning. Doubt belongs in the finding's confidence, not its severity.
-SEVERITY_FLOOR: dict[str, Severity] = {
-    "bug": Severity.WARNING,
-    "security": Severity.WARNING,
-    "race-condition": Severity.WARNING,
-    "resource-leak": Severity.WARNING,
-}
 
 
 class LLMComment(BaseModel):

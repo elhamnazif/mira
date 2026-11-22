@@ -5,8 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from mira.llm.response_parser import SEVERITY_FLOOR
-from mira.models import ReviewComment, Severity
+from mira.models import SEVERITY_FLOOR, ReviewComment, Severity
 
 # Exploitable vulnerabilities — these deserve BLOCKER
 _EXPLOITABLE_KEYWORDS = [
