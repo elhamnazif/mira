@@ -941,7 +941,13 @@ async def handle_pr_merged(
             author=(pr.get("user") or {}).get("login", ""),
         )
         merged_by = (pr.get("merged_by") or {}).get("login", "")
-        await run_pr_merged_learning(provider, pr_info, bot_name, merged_by)
+        await run_pr_merged_learning(
+            provider,
+            pr_info,
+            bot_name,
+            merged_by,
+            use_model=_runner_target(owner, repo).kind is not RunnerKind.ACTIONS,
+        )
     except Exception:
         logger.exception("Error handling pr_merged event on %s", pr_url)
 

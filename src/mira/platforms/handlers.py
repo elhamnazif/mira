@@ -418,9 +418,14 @@ async def run_pr_merged_learning(
     bot_name: str,
     merged_by: str,
     platform: str = "github",
+    *,
+    use_model: bool = True,
 ) -> None:
     """Platform-neutral merge-time learning: record accept/reject + human-review
-    signals and synthesize rules. Shared by GitHub and GitLab."""
+    signals and synthesize rules. Shared by GitHub and GitLab.
+
+    ``use_model=False`` keeps the deterministic rules but skips the model pass
+    over human reviews, for a server that runs no model."""
     from mira.providers.formatting import parse_bot_comment_metadata
 
     owner, repo, number, pr_url = pr_info.owner, pr_info.repo, pr_info.number, pr_info.url
@@ -507,7 +512,7 @@ async def run_pr_merged_learning(
 
         deterministic_rules = synthesize_rules(store)
 
-        if human_recorded > 0:
+        if human_recorded > 0 and use_model:
             try:
                 config = load_config()
                 from mira.dashboard.models_config import llm_config_for

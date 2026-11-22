@@ -591,3 +591,45 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
     fake_llm.complete.assert_not_called()
 
     store.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "use_model"),
+    [("actions", False), ("local", True)],
+)
+async def test_handle_pr_merged_runs_no_model_on_an_actions_repo(monkeypatch, kind, use_model):
+    """A repo that reviews on Actions keeps merge learning but runs no model on the server."""
+    from mira.platforms.github import webhook
+    from mira.runner import RunnerKind, RunnerTarget
+
+    target = (
+        RunnerTarget(RunnerKind.ACTIONS, ("ubuntu-latest",))
+        if kind == "actions"
+        else RunnerTarget(RunnerKind.LOCAL, ())
+    )
+    monkeypatch.setattr(webhook, "_runner_target", lambda owner, repo: target)
+    monkeypatch.setattr(webhook, "_record_pr_contribution", lambda *a, **kw: None)
+    monkeypatch.setattr(webhook, "create_provider", lambda *a, **kw: MagicMock())
+    calls: list[dict] = []
+
+    async def fake_learning(*args, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(webhook, "run_pr_merged_learning", fake_learning)
+    payload = {
+        "installation": {"id": 1},
+        "pull_request": {
+            "number": 7,
+            "merged": True,
+            "merged_by": {"login": "alice"},
+            "title": "t",
+            "body": "",
+            "base": {"ref": "main"},
+            "head": {"ref": "f"},
+        },
+        "repository": {"owner": {"login": "acme"}, "name": "web"},
+    }
+
+    await webhook.handle_pr_merged(payload, MagicMock(), "mira")
+
+    assert calls == [{"use_model": use_model}]
