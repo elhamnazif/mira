@@ -29,6 +29,7 @@ from mira.platforms.handlers import (
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
     _open_store,
+    classify_command,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -44,7 +45,7 @@ from mira.platforms.mentions import (
 )
 from mira.providers import create_provider
 from mira.providers.github import GitHubProvider
-from mira.runner import RunnerKind, resolve_runner_target
+from mira.runner import RunnerKind, RunnerTarget, resolve_runner_target
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +421,8 @@ async def _handle_thread_freeform_reply(
         # Record the human reply for the activity conversation timeline
         # (best-effort — never let bookkeeping break the reply handler).
         _record_human_reply(owner, repo, number, pr_info.url, comment)
+        if _skip_model_command(owner, repo, number, "a thread reply"):
+            return
 
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         user_reply = strip_mentions(comment["body"], names)
@@ -611,6 +614,30 @@ async def dispatch_github_event(
     return "ignored"
 
 
+def _runner_target(owner: str, repo: str) -> RunnerTarget:
+    record = _get_app_db().get_repo(owner, repo)
+    return resolve_runner_target(record.runner if record else "", load_config().review)
+
+
+# The @mention commands that run a model. On a repo that reviews on Actions
+# the server runs none of them; until they are dispatched as jobs, they are
+# skipped. help, pause, resume and reject run no model and still work.
+_MODEL_COMMANDS = frozenset({"review", "review_rest", "ask"})
+
+
+def _skip_model_command(owner: str, repo: str, number: int, what: str) -> bool:
+    if _runner_target(owner, repo).kind is not RunnerKind.ACTIONS:
+        return False
+    logger.info(
+        "Skipped %s on %s/%s#%d: this repo reviews on GitHub Actions, and the server runs no model",
+        what,
+        owner,
+        repo,
+        number,
+    )
+    return True
+
+
 async def handle_pull_request(
     payload: dict[str, Any],
     app_auth: GitHubAppAuth,
@@ -638,10 +665,7 @@ async def handle_pull_request(
         # the review itself fails. Idempotent on every synchronize re-fire.
         _record_pr_contribution(payload, "pr_opened")
 
-        db = _get_app_db()
-        record = db.get_repo(owner, repo)
-        review = load_config().review
-        target = resolve_runner_target(record.runner if record else "", review)
+        target = _runner_target(owner, repo)
         if target.kind is RunnerKind.ACTIONS:
             assert isinstance(provider, GitHubProvider)
             pr_info = PRInfo(
@@ -657,12 +681,12 @@ async def handle_pull_request(
             )
             await dispatch_review(
                 provider,
-                db,
+                _get_app_db(),
                 pr_info,
                 default_branch=payload["repository"]["default_branch"],
                 installation_id=installation_id,
                 runs_on=target.runs_on,
-                server_url=review.runner_server_url,
+                server_url=load_config().review.runner_server_url,
             )
             return
 
@@ -704,6 +728,11 @@ async def handle_comment(
         repo = payload["repository"]["name"]
         number = payload["issue"]["number"]
         pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        command = classify_command(question, [])
+        if command in _MODEL_COMMANDS and _skip_model_command(
+            owner, repo, number, f"@{bot_name} {command}"
+        ):
+            return
 
         provider = create_provider(
             "github", partial(app_auth.get_installation_token, installation_id)
