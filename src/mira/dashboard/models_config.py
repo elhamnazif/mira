@@ -13,7 +13,7 @@ from typing import Literal
 from pydantic import TypeAdapter, ValidationError
 
 from mira.config import IndexingTemperature, LLMConfig
-from mira.llm import registry
+from mira.llm import registry, slugs
 
 logger = logging.getLogger(__name__)
 _INDEXING_TEMPERATURE: TypeAdapter[IndexingTemperature] = TypeAdapter(IndexingTemperature)
@@ -105,12 +105,13 @@ def estimate_indexing_cost(file_count: int, model: str) -> dict:
 
 
 def get_indexing_model(config: LLMConfig, db_value: str | None = None) -> str:
-    """Resolve the indexing model: DB → config.indexing_model → config.model."""
+    """Resolve the indexing model: DB → config.indexing_model → config.model,
+    or its cheap sibling when config.model is a slug that has one."""
     if db_value:
         return db_value
     if config.indexing_model:
         return config.indexing_model
-    return config.model
+    return slugs.cheap_for(config.model)
 
 
 def get_review_model(config: LLMConfig, db_value: str | None = None) -> str:
@@ -135,7 +136,8 @@ def get_security_model(
 
     Never falls back to ``indexing_model`` — the security sweep is the
     highest-stakes cheap pass, and silently downgrading it to the indexing
-    tier trades security recall for indexing cost savings.
+    tier trades security recall for indexing cost savings. The same holds for
+    a slug's cheap sibling, so it is never used here.
     """
     if db_value:
         return db_value

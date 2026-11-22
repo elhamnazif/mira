@@ -124,6 +124,8 @@ class ClaudeCodeProvider(AgentCLIProvider):
             cmd += ["--append-system-prompt-file", system_prompt_file]
         if self.config.model not in _DEFAULT_MODEL_IDS:
             cmd += ["--model", self.config.model]
+        if self.config.fallback_model and self.config.fallback_model != self.config.model:
+            cmd += ["--fallback-model", self.config.fallback_model]
         effort = (self.config.reasoning_effort or "").lower()
         if effort in _EFFORT_LEVELS:
             cmd += ["--effort", effort]

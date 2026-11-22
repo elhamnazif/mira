@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import os
+
 from mira.config import LLMConfig
+from mira.exceptions import ConfigError
 from mira.llm.base import LLMProviderProtocol
 
 
 def create_llm(config: LLMConfig) -> LLMProviderProtocol:
     """Create the appropriate LLM provider based on config.provider.
 
-    Returns an instance satisfying LLMProviderProtocol.
+    A model slug such as ``zai/glm`` first resolves to its harness and model
+    (see ``mira.llm.slugs``). Returns an instance satisfying LLMProviderProtocol.
     """
+    from mira.llm import slugs
+
+    config = slugs.resolve_config(config, os.environ)
+
+    if config.provider == slugs.Harness.OPENCODE:
+        raise ConfigError("The opencode harness is not implemented yet")
+
     if config.provider == "bedrock":
         from mira.llm.bedrock import BedrockProvider
 

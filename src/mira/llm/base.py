@@ -119,6 +119,36 @@ def _strip_model_prefix(model: str, base_url: str) -> str:
     return model.split("/", 1)[1] if "/" in model else model
 
 
+# Phrases an endpoint uses when the requested model does not exist or is not
+# served to this key (OpenAI, OpenRouter, DeepSeek, Z.ai, vLLM, Ollama).
+_MODEL_MISSING_MARKERS = (
+    "model_not_found",
+    "model not found",
+    "does not exist",
+    "not a valid model",
+    "unknown model",
+    "model not exist",
+    "no such model",
+)
+
+
+def _model_missing(status: int, body: str) -> bool:
+    lowered = body.lower()
+    return (
+        status in (400, 404)
+        and "model" in lowered
+        and any(marker in lowered for marker in _MODEL_MISSING_MARKERS)
+    )
+
+
+def _skips_fallback(exception: BaseException, fallback_model: str | None) -> bool:
+    """A client error goes straight up, except a missing model when there is
+    a fallback model to try."""
+    if not isinstance(exception, NonRetriableLLMError):
+        return False
+    return not fallback_model or exception.code != "model_unavailable"
+
+
 def _retriable(exception: BaseException) -> bool:
     """Return True for transient errors; False for 4xx and semantic failures."""
     if isinstance(exception, (NonRetriableLLMError, StructuredOutputError)):
@@ -434,6 +464,10 @@ class OpenAICompatibleProvider:
     def _handle_error(resp: httpx.Response) -> None:
         """Raise LLMError or NonRetriableLLMError on non-200 responses."""
         if resp.status_code != 200:
+            if _model_missing(resp.status_code, resp.text):
+                raise NonRetriableLLMError(
+                    "model_unavailable", status=resp.status_code, body=resp.text
+                )
             if 400 <= resp.status_code < 500 and resp.status_code != 429:
                 raise NonRetriableLLMError("api_error", status=resp.status_code, body=resp.text)
             raise LLMError("api_error", status=resp.status_code, body=resp.text)
@@ -492,9 +526,9 @@ class OpenAICompatibleProvider:
                 max_tokens=max_tokens,
                 omit_temperature=omit_temperature,
             )
-        except NonRetriableLLMError:
-            raise
         except Exception as primary_err:
+            if _skips_fallback(primary_err, self.config.fallback_model):
+                raise
             if self.config.fallback_model:
                 logger.warning(
                     "Primary model %s failed (%s), trying fallback %s",
@@ -544,9 +578,9 @@ class OpenAICompatibleProvider:
                 temperature=temperature,
                 force_tool=force_tool,
             )
-        except NonRetriableLLMError:
-            raise
         except Exception as primary_err:
+            if _skips_fallback(primary_err, self.config.fallback_model):
+                raise
             if self.config.fallback_model:
                 logger.warning(
                     "Primary model %s failed (%s), trying fallback %s",
@@ -595,9 +629,9 @@ class OpenAICompatibleProvider:
             return await self._call_llm_agentic(
                 self.config.model, messages, tools, temperature=temperature
             )
-        except NonRetriableLLMError:
-            raise
         except Exception as primary_err:
+            if _skips_fallback(primary_err, self.config.fallback_model):
+                raise
             if self.config.fallback_model:
                 logger.warning(
                     "Primary model %s failed (%s), trying fallback %s",

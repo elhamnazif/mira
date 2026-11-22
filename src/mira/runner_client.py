@@ -29,7 +29,7 @@ from mira.config import MiraConfig, _is_local_host, set_global_defaults_data
 from mira.core.engine import ReviewEngine
 from mira.dashboard.models_config import llm_config_for
 from mira.exceptions import ConfigError, MiraError
-from mira.llm import create_llm
+from mira.llm import create_llm, slugs
 from mira.llm import provider_profiles as profiles
 from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
 from mira.providers.github import GitHubProvider
@@ -49,6 +49,7 @@ TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
 API_KEY_ENV = "MIRA_LLM_API_KEY"
 # Providers that are not an OpenAI-compatible endpoint.
 _NON_ENDPOINT_PROVIDERS = CLAUDE_CODE_PROVIDER_NAMES | {
+    slugs.Harness.OPENCODE,
     "codex-cli",
     "codex_cli",
     "codex",
@@ -219,9 +220,10 @@ class RunnerLLM:
     ``providers.json`` profile such as ``zai``, which brings its own URL and
     key env. ``base_url`` points at any OpenAI-compatible endpoint instead,
     with its key in ``MIRA_LLM_API_KEY``, and then ``provider`` is ignored.
+    Unset, ``provider`` is chosen from a model slug, else ``claude-code``.
     """
 
-    provider: str = "claude-code"
+    provider: str | None = None
     model: str | None = None
     base_url: str | None = None
     api_style: str | None = None
@@ -237,12 +239,17 @@ class RunnerLLM:
             if not os.environ.get(key_env) and _is_local_host(host):
                 key_env = ""
             return self._endpoint(self.base_url, key_env)
-        if self.provider in _NON_ENDPOINT_PROVIDERS:
-            return {"provider": self.provider}
-        profile = profiles.get(self.provider)
+        provider = self.provider or "claude-code"
+        if self.model and slugs.get(self.model):
+            choice = slugs.choose_harness(self.model, os.environ, override=self.provider)
+            logger.info("Model %s runs on %s (%s)", self.model, choice.harness, choice.reason)
+            provider = choice.profile or choice.harness.value
+        if provider in _NON_ENDPOINT_PROVIDERS:
+            return {"provider": provider}
+        profile = profiles.get(provider)
         if profile is None:
             raise ConfigError(
-                f"Unknown LLM provider {self.provider!r}: name an agent CLI, bedrock or "
+                f"Unknown LLM provider {provider!r}: name an agent CLI, bedrock or "
                 "a providers.json profile, or set MIRA_RUNNER_LLM_BASE_URL"
             )
         return self._endpoint(profile["base_url"], profile.get("api_key_env") or API_KEY_ENV)
