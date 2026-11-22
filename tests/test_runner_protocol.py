@@ -11,7 +11,7 @@ import pytest
 from mira.config import MiraConfig
 from mira.core.state_store import LocalStateStore, ReviewRecord
 from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord
-from mira.index.store import IndexStore
+from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
 from mira.runner_protocol import (
     PRKey,
@@ -65,6 +65,8 @@ def _snapshot(**overrides) -> StateSnapshot:
         "repo_record": RepoRecord(owner="o", repo="r", conventions="Use cents.", private=True),
         "global_rules": ["Style: no prints"],
         "learned_rules": ["Prefer Decimal"],
+        "review_context": [ReviewContext(id=1, title="Money", content="Amounts are cents.")],
+        "manifest_package_names": ["httpx", "pydantic"],
         "last_reviewed_sha": "sha-0",
         "review_progress": None,
         "fingerprints": [PRFingerprint(pr_number=3, head_sha="s3", title="t", body="")],
@@ -112,6 +114,8 @@ def test_reads_come_from_the_snapshot_for_its_pr_only() -> None:
     assert store.get_repo("o", "r") == snap.repo_record
     assert store.get_global_rules() == ["Style: no prints"]
     assert store.get_learned_rules("o", "r", platform="github") == ["Prefer Decimal"]
+    assert store.list_review_context("o", "r", platform="github") == snap.review_context
+    assert store.list_manifest_package_names("o", "r", platform="github") == ["httpx", "pydantic"]
     assert store.get_last_reviewed_sha("o", "r", 7, platform="github") == "sha-0"
     assert [fp.pr_number for fp in store.list_pr_fingerprints("o", "r", platform="github")] == [3]
     # Anything outside the snapshot reads as unknown, like an empty database.
@@ -120,6 +124,8 @@ def test_reads_come_from_the_snapshot_for_its_pr_only() -> None:
     assert store.get_last_reviewed_sha("o", "r", 7, platform="gitlab") == ""
     assert store.get_learned_rules("o", "other", platform="github") == []
     assert store.list_pr_fingerprints("o", "other", platform="github") == []
+    assert store.list_review_context("o", "other", platform="github") == []
+    assert store.list_manifest_package_names("o", "other", platform="github") == []
 
 
 def test_reads_after_writes_see_the_written_values() -> None:
@@ -225,6 +231,36 @@ def test_applied_writes_equal_direct_local_writes(
 
     assert state_rows() == direct
     assert direct["sha"] == "sha-2" and len(direct["events"]) == 2
+
+
+def test_snapshot_carries_the_dashboards_review_context_and_manifest_packages(
+    local: LocalStateStore,
+) -> None:
+    def pkg(name: str, path: str) -> dict:
+        return {"name": name, "kind": "pypi", "version": "", "file_path": path}
+
+    store = IndexStore.open("o", "r")
+    try:
+        store.upsert_review_context("Money", "Amounts are cents.")
+        store.upsert_review_context("Errors", "Never swallow exceptions.")
+        store.replace_manifest_packages(
+            "pyproject.toml", [pkg("pydantic", "pyproject.toml"), pkg("httpx", "pyproject.toml")]
+        )
+        store.replace_manifest_packages(
+            "tools/pyproject.toml", [pkg("httpx", "tools/pyproject.toml")]
+        )
+    finally:
+        store.close()
+
+    wire = build_snapshot(local, PR).model_dump_json()
+    remote = RemoteStateStore(StateSnapshot.model_validate_json(wire))
+
+    rules = remote.list_review_context("o", "r", platform="github")
+    assert sorted((c.title, c.content) for c in rules) == [
+        ("Errors", "Never swallow exceptions."),
+        ("Money", "Amounts are cents."),
+    ]
+    assert remote.list_manifest_package_names("o", "r", platform="github") == ["httpx", "pydantic"]
 
 
 def test_apply_refuses_a_review_of_another_pr_before_writing(local: LocalStateStore) -> None:

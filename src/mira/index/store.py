@@ -320,6 +320,16 @@ class ReviewContext:
     updated_at: float = 0.0
 
 
+def format_review_context(entries: list[ReviewContext]) -> str:
+    """The dashboard's review-context entries as one prompt section."""
+    if not entries:
+        return ""
+    parts = ["## Repository Documentation Context\n"]
+    for entry in entries:
+        parts.append(f"### {entry.title}\n{entry.content}\n")
+    return "\n".join(parts)
+
+
 @dataclass
 class FeedbackEventRow:
     id: int

@@ -3709,6 +3709,14 @@ class _RecordingStateStore:
         self.calls.append("get_learned_rules")
         return []
 
+    def list_review_context(self, owner, repo, *, platform):
+        self.calls.append("list_review_context")
+        return []
+
+    def list_manifest_package_names(self, owner, repo, *, platform):
+        self.calls.append("list_manifest_package_names")
+        return []
+
     def get_last_reviewed_sha(self, owner, repo, pr_number, *, platform):
         self.calls.append("get_last_reviewed_sha")
         return self.last_sha.get(pr_number, "")
@@ -3777,6 +3785,7 @@ class TestReviewStateStoreCalls:
         assert store.calls == [
             "get_repo",
             "get_learned_rules",
+            "list_review_context",
             "get_global_rules",
             "get_repo",
             "record_review",
@@ -3804,6 +3813,7 @@ class TestReviewStateStoreCalls:
             "get_last_reviewed_sha",
             "get_repo",
             "get_learned_rules",
+            "list_review_context",
             "get_global_rules",
             "get_repo",
             "record_review",
@@ -3816,6 +3826,50 @@ class TestReviewStateStoreCalls:
         assert store.last_sha == {1: "sha-2"}
         assert store.progress[1].chunk_index == 2
         assert len(store.reviews) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_runner_review_uses_the_snapshots_rules_and_packages(
+        self, mock_llm, sample_diff_text, monkeypatch, tmp_path
+    ):
+        from mira.index.store import ReviewContext
+        from mira.runner_protocol import PRKey, RemoteStateStore, StateSnapshot
+
+        # The runner has no index of its own: an empty one in a fresh dir.
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+        seen_packages: list[list[str]] = []
+
+        async def _dependency_pass(llm, files, existing, *args, **kwargs):
+            seen_packages.append(list(existing))
+            return []
+
+        monkeypatch.setattr("mira.core.engine.dependency_review_pass", _dependency_pass)
+        manifest_diff = (
+            "diff --git a/pyproject.toml b/pyproject.toml\n"
+            "--- a/pyproject.toml\n+++ b/pyproject.toml\n"
+            '@@ -1,2 +1,3 @@\n [project]\n dependencies = []\n+requests = "*"\n'
+        )
+        snapshot = StateSnapshot(
+            pr=PRKey(platform="github", owner="test", repo="repo", pr_number=1),
+            repo_record=None,
+            global_rules=[],
+            learned_rules=[],
+            review_context=[ReviewContext(id=1, title="Money", content="Amounts are cents.")],
+            manifest_package_names=["httpx"],
+            last_reviewed_sha="",
+            review_progress=None,
+            fingerprints=[],
+        )
+        provider = self._provider(sample_diff_text + manifest_diff, head_sha="sha-1")
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=provider,
+            state=RemoteStateStore(snapshot),
+        )
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert "Amounts are cents." in str(mock_llm.review.await_args_list)
+        assert seen_packages == [["httpx"]]
 
     @pytest.mark.asyncio
     async def test_overlap_caches_this_prs_fingerprint(

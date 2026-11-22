@@ -43,7 +43,7 @@ from mira.core.workspace import pr_workspace
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
 from mira.index.context import SourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
-from mira.index.store import IndexStore
+from mira.index.store import IndexStore, format_review_context
 from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
@@ -1726,7 +1726,15 @@ class ReviewEngine:
                         token_budget=self.config.review.context_token_budget,
                         source_fetcher=source_fetcher,
                     )
-                    doc_context = store.get_all_review_context_text()
+                    doc_context = (
+                        format_review_context(
+                            self.state.list_review_context(
+                                pr_info.owner, pr_info.repo, platform=pr_info.platform
+                            )
+                        )
+                        if self.state is not None
+                        else ""
+                    )
                     if doc_context:
                         ctx = ctx + "\n\n" + doc_context
 
@@ -1857,18 +1865,14 @@ class ReviewEngine:
         try:
             pr_info = getattr(self, "_pr_info", None)
             if pr_info is not None and self.state is not None:
-                _rules_store = IndexStore.open(
-                    pr_info.owner, pr_info.repo, platform=pr_info.platform
-                )
-
                 learned_rules = self.state.get_learned_rules(
                     pr_info.owner, pr_info.repo, platform=pr_info.platform
                 )
 
-                for ctx in _rules_store.list_review_context():
+                for ctx in self.state.list_review_context(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                ):
                     custom_rules.append({"title": ctx.title, "content": ctx.content})
-
-                _rules_store.close()
 
                 try:
                     for rule_text in self.state.get_global_rules():
@@ -2177,15 +2181,10 @@ class ReviewEngine:
             pr_info = getattr(self, "_pr_info", None)
             if pr_info is not None:
                 try:
-                    _pkg_store = IndexStore.open(
-                        pr_info.owner, pr_info.repo, platform=pr_info.platform
-                    )
-                    try:
-                        existing_packages = sorted(
-                            {p.name for p in _pkg_store.list_manifest_packages()}
+                    if self.state is not None:
+                        existing_packages = self.state.list_manifest_package_names(
+                            pr_info.owner, pr_info.repo, platform=pr_info.platform
                         )
-                    finally:
-                        _pkg_store.close()
                 except Exception as exc:
                     logger.debug("Manifest package lookup failed: %s", exc)
                 if self.provider is not None:

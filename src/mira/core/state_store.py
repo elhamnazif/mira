@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord
-from mira.index.store import IndexStore
+from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,12 @@ class ReviewStateStore(Protocol):
     def get_global_rules(self) -> list[str]: ...
 
     def get_learned_rules(self, owner: str, repo: str, *, platform: str) -> list[str]: ...
+
+    def list_review_context(
+        self, owner: str, repo: str, *, platform: str
+    ) -> list[ReviewContext]: ...
+
+    def list_manifest_package_names(self, owner: str, repo: str, *, platform: str) -> list[str]: ...
 
     def get_last_reviewed_sha(
         self, owner: str, repo: str, pr_number: int, *, platform: str
@@ -108,6 +114,14 @@ class LocalStateStore:
     def get_learned_rules(self, owner: str, repo: str, *, platform: str) -> list[str]:
         with _index(owner, repo, platform) as store:
             return store.get_learned_rules_text()
+
+    def list_review_context(self, owner: str, repo: str, *, platform: str) -> list[ReviewContext]:
+        with _index(owner, repo, platform) as store:
+            return store.list_review_context()
+
+    def list_manifest_package_names(self, owner: str, repo: str, *, platform: str) -> list[str]:
+        with _index(owner, repo, platform) as store:
+            return sorted({p.name for p in store.list_manifest_packages()})
 
     def get_last_reviewed_sha(self, owner: str, repo: str, pr_number: int, *, platform: str) -> str:
         return _app_db().get_last_reviewed_sha(owner, repo, pr_number, platform=platform)

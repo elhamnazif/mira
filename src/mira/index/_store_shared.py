@@ -44,15 +44,6 @@ class _StoreSharedMixin:
             result.extend(self._load_external_refs(path))  # type: ignore[attr-defined]
         return result
 
-    def get_all_review_context_text(self) -> str:
-        entries = self.list_review_context()  # type: ignore[attr-defined]
-        if not entries:
-            return ""
-        parts = ["## Repository Documentation Context\n"]
-        for entry in entries:
-            parts.append(f"### {entry.title}\n{entry.content}\n")
-        return "\n".join(parts)
-
     def get_learned_rules_text(self) -> list[str]:
         rules = self.list_active_learned_rules()  # type: ignore[attr-defined]
         return [r.rule_text for r in rules[:10]]

@@ -542,6 +542,8 @@ def _empty_snapshot():
         repo_record=None,
         global_rules=[],
         learned_rules=[],
+        review_context=[],
+        manifest_package_names=[],
         last_reviewed_sha="",
         review_progress=None,
         fingerprints=[],

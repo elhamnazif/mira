@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, SecretStr
 from mira.config import MiraConfig, _strip_deployment_only_settings
 from mira.core.state_store import ReviewRecord, ReviewStateStore
 from mira.dashboard.db import PRReviewProgress, RepoRecord
+from mira.index.store import ReviewContext
 from mira.models import PRFingerprint
 
 # A secret that serializes to its value on the wire but never shows in a repr
@@ -48,12 +49,17 @@ class StateSnapshot(_Wire):
     ``repo_record`` is the reviewed repo only. Blast radius also looks up the
     dependent repos' visibility, which a runner cannot see, so those read as
     unknown and are hidden from the review, as for an unsynced repo.
+
+    The index's code summaries and symbols are not here: the runner reads
+    code from its checkout of the PR instead.
     """
 
     pr: PRKey
     repo_record: RepoRecord | None
     global_rules: list[str]
     learned_rules: list[str]
+    review_context: list[ReviewContext]
+    manifest_package_names: list[str]
     last_reviewed_sha: str
     review_progress: PRReviewProgress | None
     fingerprints: list[PRFingerprint]
@@ -143,6 +149,8 @@ def build_snapshot(store: ReviewStateStore, pr: PRKey) -> StateSnapshot:
         repo_record=store.get_repo(owner, repo),
         global_rules=store.get_global_rules(),
         learned_rules=store.get_learned_rules(owner, repo, platform=platform),
+        review_context=store.list_review_context(owner, repo, platform=platform),
+        manifest_package_names=store.list_manifest_package_names(owner, repo, platform=platform),
         last_reviewed_sha=store.get_last_reviewed_sha(owner, repo, number, platform=platform),
         review_progress=store.get_pr_review_progress(owner, repo, number, platform=platform),
         fingerprints=store.list_pr_fingerprints(owner, repo, platform=platform),
@@ -188,6 +196,14 @@ class RemoteStateStore:
 
     def get_learned_rules(self, owner: str, repo: str, *, platform: str) -> list[str]:
         return list(self._snapshot.learned_rules) if self._is_repo(owner, repo, platform) else []
+
+    def list_review_context(self, owner: str, repo: str, *, platform: str) -> list[ReviewContext]:
+        return list(self._snapshot.review_context) if self._is_repo(owner, repo, platform) else []
+
+    def list_manifest_package_names(self, owner: str, repo: str, *, platform: str) -> list[str]:
+        if not self._is_repo(owner, repo, platform):
+            return []
+        return list(self._snapshot.manifest_package_names)
 
     def get_last_reviewed_sha(self, owner: str, repo: str, pr_number: int, *, platform: str) -> str:
         return self._last_sha if self._is_pr(owner, repo, pr_number, platform) else ""
