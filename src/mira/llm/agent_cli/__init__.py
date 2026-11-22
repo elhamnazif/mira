@@ -1,9 +1,9 @@
 """Providers that drive a full agent CLI (Claude Code, later Codex) as Mira's model.
 
 Unlike ``mira.llm.codex_cli``, which uses its CLI only to complete text, these
-providers also offer a workspace review mode: the CLI's own agent loop runs
-inside a read-only checkout of the pull request and returns Mira's
-``submit_review`` payload. See ``AgentCLIProvider.run_review_agent``.
+providers also offer a workspace mode: while ``workspace`` is bound to a
+read-only checkout of the pull request, every call runs the CLI's own agent
+loop inside it. See ``AgentCLIProvider``.
 """
 
 from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult

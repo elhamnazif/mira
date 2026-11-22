@@ -1,4 +1,4 @@
-"""The engine hands each chunk to a workspace agent when the review LLM has one."""
+"""The engine binds a PR checkout to its agent-CLI LLMs for the length of a review."""
 
 from __future__ import annotations
 
@@ -57,20 +57,27 @@ class _FakeLLM:
 
     def __init__(self, *, workspace_agent: bool) -> None:
         self.supports_workspace_agent = workspace_agent
+        self.workspace: Path | None = None
         self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        # (workspace path, src/app.py as the agent saw it)
-        self.agent_calls: list[tuple[Path, str]] = []
+        # (call, bound workspace, src/app.py as the call could read it)
+        self.calls: list[tuple[str, Path | None, str | None]] = []
         self.agentic_calls = 0
 
     def count_tokens(self, text: str) -> int:
         return len(text) // 4
 
-    async def run_review_agent(self, messages, workspace: Path) -> str:
-        self.agent_calls.append((workspace, (workspace / "src/app.py").read_text()))
-        return json.dumps(_review("from workspace agent"))
+    def _saw(self, call: str) -> None:
+        ws = self.workspace
+        self.calls.append((call, ws, (ws / "src/app.py").read_text() if ws else None))
+
+    def bound(self, call: str) -> list[Path | None]:
+        return [ws for name, ws, _ in self.calls if name == call]
 
     async def complete_agentic(self, messages, tools):
         self.agentic_calls += 1
+        if self.supports_workspace_agent:
+            # Like AgentCLIProvider: no step protocol, so the loop forces one submission.
+            return {"content": "", "tool_calls": []}
         return {
             "role": "assistant",
             "content": "",
@@ -87,10 +94,17 @@ class _FakeLLM:
         }
 
     async def complete_with_tools(self, messages, tools, temperature=None, force_tool=None):
+        name = force_tool or tools[0]["function"]["name"]
+        self._saw(name)
+        if name == "submit_critique":
+            return json.dumps({"verdicts": [{"index": 0, "evidence": "proven", "reason": "ok"}]})
         return json.dumps(_review("from forced submit"))
 
     async def review(self, messages, temperature=None):
-        return json.dumps(_review("from plain review"))
+        self._saw("review")
+        return json.dumps(
+            _review("from workspace agent" if self.workspace else "from plain review")
+        )
 
     async def complete(self, messages, json_mode=True, temperature=None, max_tokens=None):
         return "{}"
@@ -99,7 +113,7 @@ class _FakeLLM:
         return json.dumps({"summary": "wt", "change_groups": []})
 
 
-def _engine(llm: _FakeLLM) -> ReviewEngine:
+def _engine(llm: _FakeLLM, **llms: _FakeLLM) -> ReviewEngine:
     cfg = MiraConfig()
     cfg.review.agentic_tools = True
     cfg.review.walkthrough = False
@@ -107,7 +121,7 @@ def _engine(llm: _FakeLLM) -> ReviewEngine:
     cfg.review.dependency_overlap = False
     cfg.review.self_critique = False
     cfg.review.second_look = False
-    return ReviewEngine(config=cfg, llm=llm)
+    return ReviewEngine(config=cfg, llm=llm, **llms)
 
 
 def _titles(result) -> list[str]:
@@ -150,8 +164,9 @@ async def test_local_review_runs_agent_in_checkout_root(repo, monkeypatch):
 
     result = await _engine(llm).review_diff(snapshot.diff(), local_snapshot=snapshot)
 
-    assert [path for path, _ in llm.agent_calls] == [repo["work"]]
+    assert llm.bound("review") == [repo["work"]]
     assert llm.agentic_calls == 0
+    assert llm.workspace is None
     assert _titles(result) == ["from workspace agent"]
     assert {"stage": "agent_cli", "chunk": 0} in result.audit
 
@@ -164,7 +179,7 @@ async def test_local_review_without_workspace_agent_uses_agentic_loop(repo, monk
 
     result = await _engine(llm).review_diff(snapshot.diff(), local_snapshot=snapshot)
 
-    assert llm.agent_calls == []
+    assert {ws for _, ws, _ in llm.calls} <= {None}
     assert llm.agentic_calls >= 1
     assert _titles(result) == ["from agentic loop"]
 
@@ -175,7 +190,7 @@ async def test_plain_diff_review_has_no_workspace(repo):
 
     result = await _engine(llm).review_diff(repo["diff"])
 
-    assert llm.agent_calls == []
+    assert llm.bound("review") == [None]
     assert _titles(result) == ["from plain review"]
 
 
@@ -206,13 +221,12 @@ def _provider(repo: dict, source: CheckoutSource | None) -> AsyncMock:
     return provider
 
 
-async def _review_pr(llm: _FakeLLM, provider: AsyncMock, monkeypatch):
+async def _review_pr(engine: ReviewEngine, provider: AsyncMock, monkeypatch):
     db = MagicMock()
     db.get_last_reviewed_sha.return_value = ""
     db.get_repo.return_value = None
     db.get_pr_review_progress.return_value = None
     monkeypatch.setattr("mira.dashboard.api._app_db", db)
-    engine = _engine(llm)
     engine.provider = provider
     engine.dry_run = True
     return await engine.review_pr("https://github.com/test/repo/pull/1")
@@ -223,15 +237,66 @@ async def test_pr_review_runs_agent_in_fresh_checkout_of_head(repo, monkeypatch)
     llm = _FakeLLM(workspace_agent=True)
     provider = _provider(repo, CheckoutSource(repo["url"], repo["head"]))
 
-    result = await _review_pr(llm, provider, monkeypatch)
+    result = await _review_pr(_engine(llm), provider, monkeypatch)
 
-    assert len(llm.agent_calls) == 1
-    workspace, seen = llm.agent_calls[0]
+    ((call, workspace, seen),) = llm.calls
+    assert call == "review"
     assert seen == "VERSION = 2\n"
+    assert workspace is not None
     assert workspace != repo["work"]
     assert not workspace.exists()
+    assert llm.workspace is None
     assert llm.agentic_calls == 0
     assert _titles(result) == ["from workspace agent"]
+
+
+@pytest.mark.asyncio
+async def test_pr_review_binds_checkout_to_critic_and_security_llms(repo, monkeypatch):
+    llm = _FakeLLM(workspace_agent=True)
+    critic = _FakeLLM(workspace_agent=True)
+    security = _FakeLLM(workspace_agent=True)
+    provider = _provider(repo, CheckoutSource(repo["url"], repo["head"]))
+    engine = _engine(llm, indexing_llm=critic, security_llm=security)
+    engine.config.review.self_critique = True
+    engine.config.review.security_pass = True
+
+    result = await _review_pr(engine, provider, monkeypatch)
+
+    (workspace,) = llm.bound("review")
+    assert workspace is not None
+    assert critic.bound("submit_critique") == [workspace]
+    assert security.bound("submit_review") == [workspace]
+    seen = {name: text for fake in (llm, critic, security) for name, _, text in fake.calls}
+    assert seen == {
+        "review": "VERSION = 2\n",
+        "submit_critique": "VERSION = 2\n",
+        "submit_review": "VERSION = 2\n",
+    }
+    assert [fake.workspace for fake in (llm, critic, security)] == [None, None, None]
+    assert "from workspace agent" in _titles(result)
+
+
+@pytest.mark.asyncio
+async def test_pr_review_unbinds_llms_when_review_raises(repo, monkeypatch):
+    llm = _FakeLLM(workspace_agent=True)
+    critic = _FakeLLM(workspace_agent=True)
+    provider = _provider(repo, CheckoutSource(repo["url"], repo["head"]))
+    bound: list[Path | None] = []
+
+    async def failing_diff(pr_info):
+        bound.extend([llm.workspace, critic.workspace])
+        raise RuntimeError("diff fetch failed")
+
+    provider.get_pr_diff.side_effect = failing_diff
+
+    with pytest.raises(RuntimeError, match="diff fetch failed"):
+        await _review_pr(_engine(llm, indexing_llm=critic), provider, monkeypatch)
+
+    assert bound[0] is not None
+    assert bound == [bound[0], bound[0]]
+    assert llm.workspace is None
+    assert critic.workspace is None
+    assert not bound[0].exists()
 
 
 @pytest.mark.asyncio
@@ -239,9 +304,10 @@ async def test_pr_review_falls_back_when_checkout_fails(repo, monkeypatch):
     llm = _FakeLLM(workspace_agent=True)
     provider = _provider(repo, CheckoutSource(repo["url"], "0" * 40))
 
-    result = await _review_pr(llm, provider, monkeypatch)
+    result = await _review_pr(_engine(llm), provider, monkeypatch)
 
-    assert llm.agent_calls == []
+    assert llm.bound("review") == []
+    assert llm.workspace is None
     assert result.comments
     assert "from workspace agent" not in _titles(result)
 
@@ -251,8 +317,9 @@ async def test_pr_review_without_workspace_agent_skips_checkout(repo, monkeypatc
     llm = _FakeLLM(workspace_agent=False)
     provider = _provider(repo, CheckoutSource(repo["url"], repo["head"]))
 
-    result = await _review_pr(llm, provider, monkeypatch)
+    result = await _review_pr(_engine(llm), provider, monkeypatch)
 
     provider.checkout_source.assert_not_awaited()
-    assert llm.agent_calls == []
+    assert {ws for _, ws, _ in llm.calls} <= {None}
+    assert llm.agentic_calls >= 1
     assert result.comments

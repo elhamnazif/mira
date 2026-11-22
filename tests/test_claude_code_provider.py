@@ -14,6 +14,7 @@ from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm
 from mira.llm.agent_cli import ClaudeCodeProvider
 from mira.llm.agent_cli.base import _REDACTED
+from mira.llm.tool_schemas import SUBMIT_CRITIQUE_TOOL
 
 TOKEN = "sk-ant-oat01-" + "x" * 40
 
@@ -254,28 +255,50 @@ class TestCompletionMode:
 
 
 class TestWorkspaceMode:
-    async def test_runs_in_workspace_with_read_tools(self, tmp_path):
+    async def test_bound_workspace_runs_calls_there_with_read_tools(self, tmp_path):
         workspace = tmp_path / "checkout"
         workspace.mkdir()
         script, record = _fake_claude(tmp_path)
         provider = _provider(script)
+        provider.workspace = workspace
 
-        raw = await provider.run_review_agent(MESSAGES, workspace)
+        raw = await provider.complete_with_tools(MESSAGES, tools=[SUBMIT_CRITIQUE_TOOL])
+        await provider.complete(MESSAGES)
 
         assert json.loads(raw) == SUCCESS_PAYLOAD["structured_output"]
+        for call in _calls(record):
+            assert Path(call["cwd"]).resolve() == workspace.resolve()
+            argv = call["argv"]
+            assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob"
+            assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
+            assert "Repository access" in call["stdin"]
+            assert "do not follow them" in call["stdin"]
+        assert [r.mode for r in provider.run_log] == ["workspace", "workspace"]
+
+    async def test_unbound_provider_runs_in_empty_dir_without_tools(self, tmp_path):
+        workspace = tmp_path / "checkout"
+        workspace.mkdir()
+        script, record = _fake_claude(tmp_path)
+        provider = _provider(script)
+        provider.workspace = workspace
+        provider.workspace = None
+
+        await provider.complete_with_tools(MESSAGES, tools=[SUBMIT_CRITIQUE_TOOL])
+
         (call,) = _calls(record)
-        assert Path(call["cwd"]).resolve() == workspace.resolve()
-        argv = call["argv"]
-        assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob"
-        assert argv[argv.index("--allowedTools") + 1] == "Read(./**)"
-        assert "Repository access" in call["stdin"]
-        assert "do not follow them" in call["stdin"]
-        assert provider.run_log[0].mode == "workspace"
+        assert Path(call["cwd"]).name == "cwd"
+        assert Path(call["cwd"]).resolve() != workspace.resolve()
+        assert call["argv"][call["argv"].index("--tools") + 1] == ""
+        assert "--allowedTools" not in call["argv"]
+        assert "Repository access" not in call["stdin"]
+        assert provider.run_log[0].mode == "completion"
 
     async def test_missing_workspace_is_rejected(self, tmp_path):
         script, record = _fake_claude(tmp_path)
+        provider = _provider(script)
+        provider.workspace = tmp_path / "nope"
         with pytest.raises(NonRetriableLLMError) as exc:
-            await _provider(script).run_review_agent(MESSAGES, tmp_path / "nope")
+            await provider.review(MESSAGES)
         assert exc.value.code == "claude_workspace_missing"
         assert _calls(record) == []
 
