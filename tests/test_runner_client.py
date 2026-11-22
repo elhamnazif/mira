@@ -564,6 +564,4 @@ def test_the_cli_reads_the_endpoint_from_env(monkeypatch: pytest.MonkeyPatch) ->
 
     assert result.exit_code == 0, result.output
     # Unset repo variables reach the job as empty strings and mean "default".
-    assert seen == [
-        RunnerLLM(provider="claude-code", model="glm-5.3", base_url="https://api.together.xyz/v1")
-    ]
+    assert seen == [RunnerLLM(model="glm-5.3", base_url="https://api.together.xyz/v1")]

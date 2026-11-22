@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from mira import config as mira_config
+from mira import runner_client
 from mira.config import LLMConfig, MiraConfig
 from mira.dashboard.models_config import llm_config_for
 from mira.exceptions import ConfigError, LLMError, NonRetriableLLMError
@@ -14,6 +18,8 @@ from mira.llm import create_llm, provider_profiles, slugs
 from mira.llm.agent_cli import ClaudeCodeProvider
 from mira.llm.provider import LLMProvider
 from mira.llm.slugs import Harness
+from mira.runner_client import RunnerLLM
+from mira.runner_protocol import JobSpec
 
 _CLAUDE_ENV = (
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -358,3 +364,83 @@ async def test_both_models_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(LLMError, match="Both primary"):
         await _complete(config, lambda model: _response(404, _MISSING))
+
+
+# ── The runner ───────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def runner_env(monkeypatch: pytest.MonkeyPatch, no_claude_env: None) -> None:
+    for key in ("ZAI_API_KEY", "OPENROUTER_API_KEY", "MIRA_LLM_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    # job_config sets the process's global config; put it back afterwards.
+    monkeypatch.setattr(mira_config, "_global_defaults", {})
+
+
+def _runner_llms(llm: RunnerLLM) -> dict[str, object]:
+    spec = cast(JobSpec, SimpleNamespace(config={"llm": {}}))
+    config = runner_client.job_config(spec, llm)
+    return {
+        purpose: create_llm(llm_config_for(purpose, config.llm, use_dashboard=False))
+        for purpose in ("review", "indexing", "security")
+    }
+
+
+def test_the_runner_runs_zai_glm_on_the_api_with_a_zai_key(
+    runner_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", "k" * 20)
+    llms = _runner_llms(RunnerLLM(model="zai/glm"))
+
+    review = llms["review"]
+    assert isinstance(review, LLMProvider)
+    assert review.config.base_url == "https://api.z.ai/api/paas/v4"
+    assert review.config.api_key_env == "ZAI_API_KEY"
+    assert review.config.model == "zai/glm-5.3"
+    review.preflight()
+    # Indexing and security run on the cheap sibling, on the same endpoint.
+    for purpose in ("indexing", "security"):
+        cheap = llms[purpose]
+        assert isinstance(cheap, LLMProvider)
+        assert cheap.config.model == "zai/glm-5.3-flash"
+        assert cheap.config.base_url == "https://api.z.ai/api/paas/v4"
+
+
+def test_the_runner_runs_claude_sonnet_on_claude_code_with_an_oauth_token(
+    runner_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "t" * 20)
+    llms = _runner_llms(RunnerLLM(model="anthropic/claude-sonnet"))
+
+    assert isinstance(llms["review"], ClaudeCodeProvider)
+    assert llms["review"].config.model == "claude-sonnet-4-6"
+    assert isinstance(llms["indexing"], ClaudeCodeProvider)
+    assert llms["indexing"].config.model == "claude-haiku-4-5"
+
+
+def test_the_runner_routes_zai_glm_through_a_claude_code_gateway(
+    runner_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "k" * 20)
+    review = _runner_llms(RunnerLLM(model="zai/glm"))["review"]
+
+    assert isinstance(review, ClaudeCodeProvider)
+    assert review.config.model == "glm-5.3"
+
+
+def test_the_runners_provider_overrides_the_slug(
+    runner_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "t" * 20)
+    review = _runner_llms(RunnerLLM(provider="openrouter", model="anthropic/claude-sonnet"))[
+        "review"
+    ]
+
+    assert isinstance(review, LLMProvider)
+    assert review.config.base_url == "https://openrouter.ai/api/v1"
+    assert review.config.model == "anthropic/claude-sonnet-4-6"
+
+
+def test_the_runner_defaults_to_claude_code_for_a_plain_id(runner_env: None) -> None:
+    assert RunnerLLM(model="sonnet").settings() == {"provider": "claude-code"}

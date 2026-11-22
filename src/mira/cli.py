@@ -289,15 +289,16 @@ def review(
 @click.option(
     "--llm-provider",
     envvar="MIRA_RUNNER_LLM_PROVIDER",
-    default="claude-code",
-    show_default=True,
-    help="An agent CLI (claude-code, codex-cli), bedrock, or a providers.json profile (zai)",
+    default=None,
+    help="An agent CLI (claude-code, codex-cli), bedrock, or a providers.json profile (zai). "
+    "Default: chosen from a model slug such as zai/glm, else claude-code",
 )
 @click.option(
     "--model",
     envvar="MIRA_RUNNER_MODEL",
     default=None,
-    help="Model for every review pass. Default: the models in the job's config",
+    help="Model or model slug (anthropic/claude-sonnet, zai/glm) for every review pass. "
+    "Default: the models in the job's config",
 )
 @click.option(
     "--llm-base-url",
@@ -318,7 +319,7 @@ def runner(
     job_id: str,
     server_url: str,
     audience: str,
-    llm_provider: str,
+    llm_provider: str | None,
     model: str | None,
     llm_base_url: str | None,
     llm_api_style: str | None,
@@ -353,7 +354,7 @@ def runner(
                 server_url=server_url,
                 audience=audience,
                 llm=RunnerLLM(
-                    provider=llm_provider,
+                    provider=llm_provider or None,
                     model=model or None,
                     base_url=llm_base_url or None,
                     api_style=llm_api_style,
