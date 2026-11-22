@@ -53,8 +53,40 @@ Mira checks these rules in order and takes the first that applies:
    in that provider's variable, such as `ZAI_API_KEY` or `DEEPSEEK_API_KEY`.
    An explicit `llm.base_url` keeps its endpoint and gets the resolved model.
 
-An `opencode` harness is reserved and not implemented yet. Asking for it
-fails with a configuration error.
+`opencode` is never chosen on its own. Set it as the provider to run a slug,
+or any `<provider>/<model>` id, on [OpenCode](https://opencode.ai).
+
+## OpenCode
+
+`llm.provider: opencode` (`MIRA_RUNNER_LLM_PROVIDER=opencode` on Actions)
+runs the model through the OpenCode CLI, so any provider OpenCode supports
+works, including subscription plans. The model is `<provider>/<model>`: a
+slug such as `zai/glm`, or a plain id such as `openrouter/qwen/qwen3-coder`.
+
+The credential is one of these, checked in order:
+
+- `OPENCODE_AUTH_CONTENT`: the contents of an OpenCode `auth.json`, for a
+  subscription such as a ChatGPT plan. Only the model's provider's entry
+  reaches the CLI.
+- The provider's API key: the key variable of the `providers.json` profile
+  with that name (`ZAI_API_KEY` for `zai`, `OPENAI_API_KEY` for `openai`),
+  else `<PROVIDER>_API_KEY` (`ANTHROPIC_API_KEY`).
+- For `openai-compatible/<model>`: `OPENAI_COMPATIBLE_BASE_URL`,
+  `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_CONTEXT` and
+  `OPENAI_COMPATIBLE_MAX_OUTPUT`. The two token limits are required.
+
+`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GEMINI_BASE_URL`, `XAI_BASE_URL`,
+`DEEPSEEK_BASE_URL`, `MOONSHOT_BASE_URL` and `KIMI_BASE_URL` point that
+provider at a gateway instead. A subscription is never sent to a gateway.
+
+The effort level becomes OpenCode's `--variant`. OpenCode has no fallback
+model, so `fallback_model` does not apply.
+
+OpenCode loads plugins from the `.opencode` directory of its working
+directory, so Mira never runs it inside the pull request's checkout. It runs
+in an empty directory, with only read, grep, glob and list allowed, and only
+inside the checkout. `opencode_command` and `opencode_timeout_seconds` are
+deployment settings.
 
 ## Effort, cheap siblings and fallback
 

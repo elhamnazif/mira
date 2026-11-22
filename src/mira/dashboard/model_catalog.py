@@ -18,7 +18,7 @@ import httpx
 
 from mira.config import LLMConfig
 from mira.llm import provider_profiles as profiles
-from mira.llm import registry
+from mira.llm import registry, slugs
 from mira.llm.base import _get_api_key
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,8 @@ def active_backend(config: LLMConfig) -> str:
         return "codex-cli"
     if config.provider in {"claude-code", "claude_code", "claude-cli"}:
         return "claude-code"
+    if config.provider == "opencode":
+        return "opencode"
     profile = profiles.resolve(config.base_url)
     return "openrouter" if profile.get("name") == "openrouter" else "openai-compatible"
 
@@ -103,7 +105,7 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     backend = active_backend(config)
     if backend == "bedrock":
         cache_key = f"bedrock:{config.region}:{config.aws_profile or ''}"
-    elif backend in {"codex-cli", "claude-code"}:
+    elif backend in {"codex-cli", "claude-code", "opencode"}:
         return None
     else:
         cache_key = config.base_url
@@ -142,6 +144,12 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
     purposes. On a generic endpoint only its own list is trustworthy — registry
     ids are OpenRouter-style — so the registry is used there only as fallback.
     """
+    if backend == "opencode":
+        # OpenCode serves any provider, so the model slugs are the catalog.
+        return [
+            {"value": slug, "label": slug, "recommended": False}
+            for slug in sorted(slugs.all_slugs())
+        ]
     if backend == "openai-compatible" and dynamic is not None:
         options = [{**d, "recommended": False} for d in dynamic]
         options.sort(key=lambda m: m["label"].lower())

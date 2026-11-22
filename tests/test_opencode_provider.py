@@ -18,7 +18,9 @@ from pathlib import Path
 import pytest
 
 from mira.config import LLMConfig, _strip_deployment_only_settings
+from mira.dashboard.model_catalog import active_backend, build_options
 from mira.exceptions import LLMError, NonRetriableLLMError
+from mira.llm import create_llm
 from mira.llm.agent_cli import OpenCodeProvider
 from mira.llm.agent_cli.base import _REDACTED
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL
@@ -126,6 +128,17 @@ def _env(monkeypatch):
 
 
 class TestFactoryAndConfig:
+    def test_factory_builds_opencode_for_a_slug(self):
+        provider = create_llm(LLMConfig(provider="opencode", model="zai/glm"))
+        assert isinstance(provider, OpenCodeProvider)
+        # OpenCode takes the provider-prefixed id.
+        assert provider.config.model == "zai/glm-5.3"
+
+    def test_factory_builds_opencode_for_a_plain_model_id(self):
+        provider = create_llm(LLMConfig(provider="opencode", model="openrouter/qwen/qwen3-coder"))
+        assert isinstance(provider, OpenCodeProvider)
+        assert provider.config.model == "openrouter/qwen/qwen3-coder"
+
     def test_repo_overlay_cannot_set_cli_settings(self):
         overlay = {
             "llm": {"opencode_command": "/tmp/evil", "opencode_timeout_seconds": 1, "model": "x"}
@@ -136,6 +149,13 @@ class TestFactoryAndConfig:
         assert LLMConfig().opencode_timeout_seconds == 2700
         with pytest.raises(ValueError):
             LLMConfig(opencode_timeout_seconds=0)
+
+    def test_model_catalog_backend_offers_slugs(self):
+        assert active_backend(LLMConfig(provider="opencode")) == "opencode"
+        values = [m["value"] for m in build_options("opencode", None, "review")]
+        assert "zai/glm" in values and "openai/gpt" in values
+        assert "claude-code-default" not in values
+        assert "zai/glm" not in [m["value"] for m in build_options("openrouter", None, "review")]
 
     def test_engine_capability_flags(self):
         assert OpenCodeProvider.supports_workspace_agent is True

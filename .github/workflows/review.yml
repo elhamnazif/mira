@@ -118,6 +118,15 @@ jobs:
           mira --version
           claude --version
 
+      # Only for MIRA_RUNNER_LLM_PROVIDER=opencode. npm 11+ skips install
+      # scripts unless allowed, and opencode-ai's fetches its binary.
+      - name: Install OpenCode
+        if: vars.MIRA_RUNNER_LLM_PROVIDER == 'opencode'
+        run: |
+          set -euo pipefail
+          npm install -g --allow-scripts=opencode-ai opencode-ai@1.18.29
+          opencode --version
+
       - name: Review
         working-directory: ${{ runner.temp }}/mira/work
         env:
