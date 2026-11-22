@@ -1,0 +1,119 @@
+# Mira's review runner. A repo's .github/workflows/mira.yml calls this
+# workflow when the Mira server dispatches a review (see docs/runner/).
+#
+# It installs Mira at this workflow's own commit, so the code that reviews
+# is the code the server pinned in review.runner_workflow_refs, then claims
+# the job and reviews. It never checks out the PR: Mira makes its own
+# read-only checkout of the PR head.
+#
+# Safe on a self-hosted runner: no sudo, and everything it writes lives in
+# $RUNNER_TEMP, which the runner empties after each job, or the tool cache.
+name: Mira review
+
+on:
+  workflow_call:
+    inputs:
+      job_id:
+        description: The review job's id, from the Mira server
+        type: string
+        required: true
+      runs_on:
+        description: 'The runs-on labels as a JSON list, e.g. ["self-hosted", "sora"]'
+        type: string
+        required: true
+      server_url:
+        description: The Mira server's URL
+        type: string
+        required: true
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Claude Code token (`claude setup-token`)
+        required: true
+
+permissions: {}
+
+jobs:
+  review:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    # Under the server's review.runner_claim_timeout_minutes (default 120),
+    # so a stuck run ends before the server gives up on it.
+    timeout-minutes: 90
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Keep every write in RUNNER_TEMP
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/mira"
+          mkdir -p "$root"/{tmp,uv-tools,uv-bin,uv-python,npm,npm-cache,index,work}
+          {
+            echo "TMPDIR=$root/tmp"
+            echo "UV_TOOL_DIR=$root/uv-tools"
+            echo "UV_TOOL_BIN_DIR=$root/uv-bin"
+            echo "UV_PYTHON_INSTALL_DIR=$root/uv-python"
+            echo "NPM_CONFIG_PREFIX=$root/npm"
+            echo "npm_config_cache=$root/npm-cache"
+            echo "MIRA_INDEX_DIR=$root/index"
+          } >> "$GITHUB_ENV"
+          {
+            echo "$root/uv-bin"
+            echo "$root/npm/bin"
+          } >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+          cache-local-path: ${{ runner.temp }}/mira/uv-cache
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # The github context names the caller's workflow, not this one. The
+      # OIDC token's job_workflow_ref and job_workflow_sha claims name this
+      # reusable workflow and the exact commit it runs at. The token's
+      # audience is one the Mira server refuses, and it never leaves the step.
+      - name: Find this workflow's commit
+        id: self
+        run: |
+          uv run --no-project python - <<'EOF'
+          import base64, json, os, re, urllib.request
+
+          request = urllib.request.Request(
+              os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=mira-workflow-sha",
+              headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          with urllib.request.urlopen(request, timeout=30) as resp:
+              token = json.load(resp)["value"]
+          payload = token.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          ref, sha = claims["job_workflow_ref"], claims["job_workflow_sha"]
+          repo = "/".join(ref.split("/")[:2])
+          if not re.fullmatch(r"[0-9a-f]{40}", sha) or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+              raise SystemExit(f"unexpected workflow claims: {ref!r} {sha!r}")
+          print(f"Mira runner workflow: {ref} at {sha}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"repo={repo}\nsha={sha}\n")
+          EOF
+
+      - name: Install Mira and Claude Code
+        env:
+          MIRA_REPO: ${{ steps.self.outputs.repo }}
+          MIRA_SHA: ${{ steps.self.outputs.sha }}
+        run: |
+          set -euo pipefail
+          uv tool install "mira-reviewer @ git+https://github.com/${MIRA_REPO}@${MIRA_SHA}"
+          npm install -g @anthropic-ai/claude-code@2.1.330
+          mira --version
+          claude --version
+
+      - name: Review
+        working-directory: ${{ runner.temp }}/mira/work
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Optional: a model for every review pass, instead of the server's.
+          MIRA_RUNNER_MODEL: ${{ vars.MIRA_RUNNER_MODEL }}
+          JOB_ID: ${{ inputs.job_id }}
+          SERVER_URL: ${{ inputs.server_url }}
+        run: mira runner --job "$JOB_ID" --server "$SERVER_URL"

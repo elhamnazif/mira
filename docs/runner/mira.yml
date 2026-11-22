@@ -1,0 +1,35 @@
+# Copy to .github/workflows/mira.yml in each repo Mira reviews on GitHub
+# Actions. The Mira server dispatches it with these three inputs; it only
+# hands them to Mira's reusable workflow. See docs/runner/README.md.
+name: Mira
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Set by the Mira server
+        type: string
+        required: true
+      runs_on:
+        description: Set by the Mira server
+        type: string
+        required: true
+      server_url:
+        description: Set by the Mira server
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  review:
+    permissions:
+      id-token: write
+      contents: read
+    uses: elhamnazif/mira/.github/workflows/review.yml@main
+    with:
+      job_id: ${{ inputs.job_id }}
+      runs_on: ${{ inputs.runs_on }}
+      server_url: ${{ inputs.server_url }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
