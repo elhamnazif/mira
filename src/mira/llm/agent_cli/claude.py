@@ -24,6 +24,9 @@ Security posture of every invocation (checked against Claude Code 2.1.330):
 * Completion mode passes ``--tools ""``, so no tools exist. Workspace mode
   passes ``--tools Read,Grep,Glob`` and pre-approves ``Read(./**)``. That
   rule also bounds Grep and Glob, so reads outside the checkout are denied.
+* Managed settings, such as ``/etc/claude-code/managed-settings.json``,
+  still apply: ``--setting-sources`` does not cover them. Mira logs a
+  warning when one exists.
 * ``--bare`` is deliberately not used: in bare mode the CLI never reads
   OAuth credentials, which would break subscription auth.
 * The child process gets a scrubbed environment and a throwaway ``HOME``
@@ -32,12 +35,18 @@ Security posture of every invocation (checked against Claude Code 2.1.330):
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
+from pathlib import Path
 from typing import Any
 
+from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult
+
+logger = logging.getLogger(__name__)
 
 # Credentials Claude Code accepts, in the order they are preferred.
 _AUTH_ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
@@ -64,13 +73,37 @@ _DEFAULT_MODEL_IDS = frozenset({"", "default", "claude-code-default"})
 _WORKSPACE_TOOLS = "Read,Grep,Glob"
 _WORKSPACE_ALLOW_RULE = "Read(./**)"
 
+# Claude Code applies managed settings even with --setting-sources "". Other
+# tools write them on shared self-hosted runners: Pullfrog writes the Linux
+# one (agents/claude.ts, MIT).
+MANAGED_SETTINGS_PATHS = (
+    Path("/etc/claude-code/managed-settings.json"),
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+)
+
 _RATE_LIMIT_MARKERS = ("usage limit", "rate limit", "limit reached", "rate_limit")
 _AUTH_MARKERS = ("not logged in", "invalid api key", "oauth token", "authentication")
+
+
+@functools.cache
+def warn_about_managed_settings() -> None:
+    """Warn once per process for each managed settings file on this machine."""
+    for path in MANAGED_SETTINGS_PATHS:
+        if path.exists():
+            logger.warning(
+                '%s exists. Claude Code applies it even with --setting-sources "", so its '
+                "hooks, permissions and other settings apply to Mira's reviews here too",
+                path,
+            )
 
 
 class ClaudeCodeProvider(AgentCLIProvider):
     harness = "claude-code"
     error_prefix = "claude"
+
+    def __init__(self, config: LLMConfig) -> None:
+        super().__init__(config)
+        warn_about_managed_settings()
 
     @property
     def _executable(self) -> str:

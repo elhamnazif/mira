@@ -13,6 +13,7 @@ from mira.dashboard.model_catalog import active_backend, build_options
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm
 from mira.llm.agent_cli import ClaudeCodeProvider
+from mira.llm.agent_cli import claude as claude_module
 from mira.llm.agent_cli.base import _REDACTED
 from mira.llm.tool_schemas import SUBMIT_CRITIQUE_TOOL
 
@@ -516,3 +517,34 @@ class TestRedaction:
         assert "sk-ant-" not in raw
         assert raw.count(_REDACTED) == 2
         assert TOKEN not in provider.run_log[0].text
+
+
+class TestManagedSettings:
+    @pytest.fixture(autouse=True)
+    def _fresh_warning(self):
+        claude_module.warn_about_managed_settings.cache_clear()
+        yield
+        claude_module.warn_about_managed_settings.cache_clear()
+
+    def test_a_managed_settings_file_is_warned_about_once(self, tmp_path, monkeypatch, caplog):
+        managed = tmp_path / "managed-settings.json"
+        managed.write_text("{}")
+        monkeypatch.setattr(
+            claude_module, "MANAGED_SETTINGS_PATHS", (tmp_path / "absent.json", managed)
+        )
+        script, _ = _fake_claude(tmp_path)
+
+        _provider(script)
+        _provider(script, model="opus")
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(managed) in warnings[0]
+
+    def test_no_managed_settings_no_warning(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(claude_module, "MANAGED_SETTINGS_PATHS", (tmp_path / "absent.json",))
+        script, _ = _fake_claude(tmp_path)
+
+        _provider(script)
+
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
