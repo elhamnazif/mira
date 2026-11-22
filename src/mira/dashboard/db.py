@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     -- as the base for an incremental diff so unchanged files aren't
     -- re-flagged after a new push.
     last_reviewed_sha TEXT NOT NULL DEFAULT '',
+    -- The PR's base-branch tip at that review. Round 2+ diffs the old
+    -- version against it to tell the PR's own changes from a rebase's.
+    last_reviewed_base_sha TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
@@ -314,6 +317,7 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     skipped_paths TEXT NOT NULL DEFAULT '[]',
     chunk_index INTEGER NOT NULL DEFAULT 0,
     last_reviewed_sha TEXT NOT NULL DEFAULT '',
+    last_reviewed_base_sha TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (platform, owner, repo, pr_number)
 );
@@ -441,6 +445,18 @@ class GlobalRule:
     enabled: bool = True
     created_at: float = 0.0
     updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class ReviewedVersion:
+    """The PR version the last review saw: its head and its base-branch tip.
+
+    Empty strings mean no review has been recorded, or one recorded before
+    base SHAs were.
+    """
+
+    head_sha: str = ""
+    base_sha: str = ""
 
 
 @dataclass
@@ -626,6 +642,11 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE pr_review_progress ADD COLUMN last_reviewed_sha TEXT NOT NULL DEFAULT ''"
             )
+        if "last_reviewed_base_sha" not in progress_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE pr_review_progress "
+                "ADD COLUMN last_reviewed_base_sha TEXT NOT NULL DEFAULT ''"
+            )
         # bare_approval (rubber-stamp flag) added to pr_reviewers post-launch.
         reviewer_cols = {
             r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(pr_reviewers)").fetchall()
@@ -660,9 +681,11 @@ class AppDatabase:
         if progress_needs_platform:
             self._sqlite_conn.execute(
                 "INSERT INTO pr_review_progress (platform, owner, repo, pr_number, total_paths, "
-                "reviewed_paths, skipped_paths, chunk_index, last_reviewed_sha, updated_at) "
+                "reviewed_paths, skipped_paths, chunk_index, last_reviewed_sha, "
+                "last_reviewed_base_sha, updated_at) "
                 "SELECT 'github', owner, repo, pr_number, total_paths, reviewed_paths, "
-                "skipped_paths, chunk_index, last_reviewed_sha, updated_at FROM pr_review_progress_old"
+                "skipped_paths, chunk_index, last_reviewed_sha, last_reviewed_base_sha, "
+                "updated_at FROM pr_review_progress_old"
             )
             self._sqlite_conn.execute("DROP TABLE pr_review_progress_old")
         self._sqlite_conn.commit()
@@ -699,6 +722,10 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
                     "last_reviewed_sha TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
+                    "last_reviewed_base_sha TEXT NOT NULL DEFAULT ''"
                 )
                 cur.execute("ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS usage TEXT")
                 cur.execute(
@@ -1392,7 +1419,7 @@ class AppDatabase:
                     "UPDATE repos SET private=%s WHERE platform=%s AND owner=%s AND repo=%s",
                     (private, platform, owner, repo),
                 )
-            # Explicit commit mirrors set_last_reviewed_sha — the connection is
+            # Explicit commit mirrors set_last_reviewed — the connection is
             # autocommit today, but this keeps the write safe if that changes.
             self._pg_commit()
 
@@ -1734,72 +1761,70 @@ class AppDatabase:
             updated_at=float(row[4] or 0),
         )
 
-    def get_last_reviewed_sha(
+    def get_last_reviewed(
         self,
         owner: str,
         repo: str,
         pr_number: int,
         platform: str = "github",
-    ) -> str:
-        """Return the head SHA at the time of the last review on this PR.
-
-        Empty string if there is no prior review (first round, or progress
-        row never written) — callers should treat empty as "no previous SHA,
-        do a full review."
-        """
+    ) -> ReviewedVersion:
+        """The PR version the last review saw. Round 2+ diffs against it; an
+        empty head means no prior review, so do a full one."""
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             row = self._sqlite_conn.execute(
-                "SELECT last_reviewed_sha FROM pr_review_progress "
+                "SELECT last_reviewed_sha, last_reviewed_base_sha FROM pr_review_progress "
                 "WHERE platform=? AND owner=? AND repo=? AND pr_number=?",
                 (platform, owner, repo, pr_number),
             ).fetchone()
         else:
             with self._pg_cursor() as cur:
                 cur.execute(
-                    "SELECT last_reviewed_sha FROM pr_review_progress "
+                    "SELECT last_reviewed_sha, last_reviewed_base_sha FROM pr_review_progress "
                     "WHERE platform=%s AND owner=%s AND repo=%s AND pr_number=%s",
                     (platform, owner, repo, pr_number),
                 )
                 row = cur.fetchone()
-        return str(row[0]) if row and row[0] else ""
+        if not row:
+            return ReviewedVersion()
+        return ReviewedVersion(head_sha=str(row[0] or ""), base_sha=str(row[1] or ""))
 
-    def set_last_reviewed_sha(
+    def set_last_reviewed(
         self,
         owner: str,
         repo: str,
         pr_number: int,
-        sha: str,
+        version: ReviewedVersion,
         platform: str = "github",
     ) -> None:
-        """Record the head SHA we just reviewed against. Round 2+ uses this
-        as the base for the incremental diff.
-        """
-        if not sha:
+        """Record the PR version we just reviewed."""
+        if not version.head_sha:
             return
-        now = time.time()
+        args = (platform, owner, repo, pr_number, version.head_sha, version.base_sha)
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
             self._sqlite_conn.execute(
-                "INSERT INTO pr_review_progress "
-                "(platform, owner, repo, pr_number, last_reviewed_sha, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "INSERT INTO pr_review_progress (platform, owner, repo, pr_number, "
+                "last_reviewed_sha, last_reviewed_base_sha, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(platform, owner, repo, pr_number) DO UPDATE SET "
                 "last_reviewed_sha=excluded.last_reviewed_sha, "
+                "last_reviewed_base_sha=excluded.last_reviewed_base_sha, "
                 "updated_at=excluded.updated_at",
-                (platform, owner, repo, pr_number, sha, now),
+                (*args, time.time()),
             )
             self._sqlite_conn.commit()
         else:
             with self._pg_cursor() as cur:
                 cur.execute(
-                    "INSERT INTO pr_review_progress "
-                    "(platform, owner, repo, pr_number, last_reviewed_sha, updated_at) "
-                    "VALUES (%s, %s, %s, %s, %s, NOW()) "
+                    "INSERT INTO pr_review_progress (platform, owner, repo, pr_number, "
+                    "last_reviewed_sha, last_reviewed_base_sha, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, NOW()) "
                     "ON CONFLICT (platform, owner, repo, pr_number) DO UPDATE SET "
                     "last_reviewed_sha=EXCLUDED.last_reviewed_sha, "
+                    "last_reviewed_base_sha=EXCLUDED.last_reviewed_base_sha, "
                     "updated_at=NOW()",
-                    (platform, owner, repo, pr_number, sha),
+                    args,
                 )
             self._pg_commit()
 

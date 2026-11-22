@@ -14,6 +14,7 @@ from mira.core.engine import ReviewEngine
 from mira.core.git_snapshot import GitSnapshot
 from mira.core.state_store import LocalStateStore
 from mira.core.workspace import CheckoutSource
+from mira.dashboard.db import ReviewedVersion
 from mira.models import PRInfo
 
 
@@ -224,7 +225,7 @@ def _provider(repo: dict, source: CheckoutSource | None) -> AsyncMock:
 
 async def _review_pr(engine: ReviewEngine, provider: AsyncMock, monkeypatch):
     db = MagicMock()
-    db.get_last_reviewed_sha.return_value = ""
+    db.get_last_reviewed.return_value = ReviewedVersion()
     db.get_repo.return_value = None
     db.get_pr_review_progress.return_value = None
     monkeypatch.setattr("mira.dashboard.api._app_db", db)

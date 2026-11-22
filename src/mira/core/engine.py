@@ -38,6 +38,7 @@ from mira.core.passes import (
     self_critique,
 )
 from mira.core.priority import rank_files
+from mira.core.range_diff import incremental_diff
 from mira.core.state_store import ReviewRecord, ReviewStateStore
 from mira.core.threads import (
     resolve_verified_threads,
@@ -46,6 +47,7 @@ from mira.core.threads import (
     thread_title,
 )
 from mira.core.workspace import pr_workspace
+from mira.dashboard.db import ReviewedVersion
 from mira.exceptions import MiraError, ResponseParseError, StructuredOutputError
 from mira.index.context import SourceFetcher, build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
@@ -1084,22 +1086,21 @@ class ReviewEngine:
         full_diff_text = diff_text
         if review_round >= 2 and pr_info.head_sha:
             try:
-                last_sha = state.get_last_reviewed_sha(
+                last = state.get_last_reviewed(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
                     platform=pr_info.platform,
                 )
+                last_sha = last.head_sha
                 if last_sha and last_sha != pr_info.head_sha:
-                    incremental = await self.provider.get_compare_diff(
-                        pr_info,
-                        last_sha,
-                        pr_info.head_sha,
+                    incremental = await incremental_diff(
+                        self.provider, pr_info, last, full_diff_text
                     )
                     if incremental.strip():
-                        # A merge commit's compare diff includes everything the
-                        # base branch brought in — not this PR's code. Review
-                        # only the files the PR itself changes.
+                        # A compare diff (the fallback) over a merge commit
+                        # includes everything the base branch brought in — not
+                        # this PR's code. Review only the files the PR changes.
                         pr_paths = {f.path for f in parse_diff(full_diff_text).files}
                         pr_file_count = len(pr_paths)
                         restricted = _restrict_diff_to_paths(incremental, pr_paths)
@@ -1125,7 +1126,7 @@ class ReviewEngine:
                         incremental_since = last_sha
                     else:
                         logger.info(
-                            "Round %d: no new commits since %s on PR %s, skipping review",
+                            "Round %d: nothing changed since %s on PR %s, skipping review",
                             review_round,
                             last_sha[:8],
                             pr_info.url,
@@ -1522,11 +1523,11 @@ class ReviewEngine:
         # the next push would skip the changes it never saw.
         if pr_info.head_sha and not result.all_chunks_failed:
             try:
-                state.set_last_reviewed_sha(
+                state.set_last_reviewed(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
-                    pr_info.head_sha,
+                    ReviewedVersion(head_sha=pr_info.head_sha, base_sha=pr_info.base_sha),
                     platform=pr_info.platform,
                 )
             except Exception as exc:

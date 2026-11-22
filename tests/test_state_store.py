@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mira.core.state_store import LocalStateStore, ReviewRecord
-from mira.dashboard.db import AppDatabase, PRReviewProgress
+from mira.dashboard.db import AppDatabase, PRReviewProgress, ReviewedVersion
 from mira.index.store import IndexStore
 from mira.models import PRFingerprint
 
@@ -66,10 +66,11 @@ def test_record_review_writes_event_and_comment_rows(local: LocalStateStore) -> 
 
 
 def test_review_state_round_trips_through_app_db(local: LocalStateStore) -> None:
-    assert local.get_last_reviewed_sha("o", "r", 7, platform="github") == ""
-    local.set_last_reviewed_sha("o", "r", 7, "abc123", platform="github")
-    assert local.get_last_reviewed_sha("o", "r", 7, platform="github") == "abc123"
-    assert local.get_last_reviewed_sha("o", "r", 7, platform="gitlab") == ""
+    assert local.get_last_reviewed("o", "r", 7, platform="github") == ReviewedVersion()
+    version = ReviewedVersion(head_sha="abc123", base_sha="base9")
+    local.set_last_reviewed("o", "r", 7, version, platform="github")
+    assert local.get_last_reviewed("o", "r", 7, platform="github") == version
+    assert local.get_last_reviewed("o", "r", 7, platform="gitlab") == ReviewedVersion()
 
     progress = PRReviewProgress(
         owner="o",

@@ -12,6 +12,7 @@ from mira.core import engine as engine_mod
 from mira.core.engine import ReviewEngine, _response_excerpt
 from mira.core.passes import AgenticLoopResult, agentic_review_loop
 from mira.core.state_store import LocalStateStore
+from mira.dashboard.db import ReviewedVersion
 from mira.exceptions import StructuredOutputError
 from mira.llm.base import _retriable
 from mira.llm.provider import LLMProvider
@@ -377,7 +378,7 @@ async def test_failed_paths_are_retryable_through_review_rest(monkeypatch, tmp_p
     progress_updates: list = []
 
     mock_db = MagicMock()
-    mock_db.get_last_reviewed_sha.return_value = ""
+    mock_db.get_last_reviewed.return_value = ReviewedVersion()
     mock_db.get_repo.return_value = None
     mock_db.get_pr_review_progress.return_value = None
     mock_db.upsert_pr_review_progress.side_effect = lambda progress, platform="github": (

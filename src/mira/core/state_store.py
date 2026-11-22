@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord
+from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
 
@@ -57,12 +57,12 @@ class ReviewStateStore(Protocol):
 
     def list_manifest_package_names(self, owner: str, repo: str, *, platform: str) -> list[str]: ...
 
-    def get_last_reviewed_sha(
+    def get_last_reviewed(
         self, owner: str, repo: str, pr_number: int, *, platform: str
-    ) -> str: ...
+    ) -> ReviewedVersion: ...
 
-    def set_last_reviewed_sha(
-        self, owner: str, repo: str, pr_number: int, sha: str, *, platform: str
+    def set_last_reviewed(
+        self, owner: str, repo: str, pr_number: int, version: ReviewedVersion, *, platform: str
     ) -> None: ...
 
     def get_pr_review_progress(
@@ -123,13 +123,15 @@ class LocalStateStore:
         with _index(owner, repo, platform) as store:
             return sorted({p.name for p in store.list_manifest_packages()})
 
-    def get_last_reviewed_sha(self, owner: str, repo: str, pr_number: int, *, platform: str) -> str:
-        return _app_db().get_last_reviewed_sha(owner, repo, pr_number, platform=platform)
+    def get_last_reviewed(
+        self, owner: str, repo: str, pr_number: int, *, platform: str
+    ) -> ReviewedVersion:
+        return _app_db().get_last_reviewed(owner, repo, pr_number, platform=platform)
 
-    def set_last_reviewed_sha(
-        self, owner: str, repo: str, pr_number: int, sha: str, *, platform: str
+    def set_last_reviewed(
+        self, owner: str, repo: str, pr_number: int, version: ReviewedVersion, *, platform: str
     ) -> None:
-        _app_db().set_last_reviewed_sha(owner, repo, pr_number, sha, platform=platform)
+        _app_db().set_last_reviewed(owner, repo, pr_number, version, platform=platform)
 
     def get_pr_review_progress(
         self, owner: str, repo: str, pr_number: int, *, platform: str
