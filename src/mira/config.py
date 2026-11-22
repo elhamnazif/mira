@@ -39,6 +39,16 @@ def _is_local_host(host: str) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
+def check_runner_server_url(url: str) -> str:
+    """The URL without a trailing slash. A runner sends its OIDC token there,
+    so it must be https, or http to a local host."""
+    parsed = urlparse(url)
+    local = parsed.scheme == "http" and _is_local_host(parsed.hostname or "")
+    if not parsed.hostname or not (parsed.scheme == "https" or local):
+        raise ValueError(f"runner server URL must be https (http only for a local host): {url!r}")
+    return url.rstrip("/")
+
+
 class LLMConfig(BaseModel):
     model: str = "anthropic/claude-sonnet-4-6"
     fallback_model: str | None = None
@@ -423,16 +433,7 @@ class ReviewConfig(BaseModel):
     @field_validator("runner_server_url")
     @classmethod
     def _validate_runner_server_url(cls, v: str) -> str:
-        if not v:
-            return v
-        parsed = urlparse(v)
-        local = parsed.scheme == "http" and _is_local_host(parsed.hostname or "")
-        if not parsed.hostname or not (parsed.scheme == "https" or local):
-            raise ValueError(
-                "review.runner_server_url must be an https URL (http only for a local host), "
-                f"got {v!r}"
-            )
-        return v.rstrip("/")
+        return check_runner_server_url(v) if v else v
 
     @field_validator("runner_workflow_refs")
     @classmethod
@@ -558,12 +559,17 @@ def set_global_defaults(config_path: Path | str) -> MiraConfig:
     Subsequent `load_config()` calls deep-merge per-repo `.mira.yaml` (and
     env-var fallbacks) over these defaults.
     """
-    global _global_defaults
     path = Path(config_path)
     if not path.is_file():
         raise ConfigError(f"Config file not found: {path}")
-    _global_defaults = _load_yaml(path)
     # Validate eagerly so a malformed file fails server boot, not first review.
+    return set_global_defaults_data(_load_yaml(path))
+
+
+def set_global_defaults_data(data: dict[str, Any]) -> MiraConfig:
+    """:func:`set_global_defaults` from plain data, such as a runner's job spec."""
+    global _global_defaults
+    _global_defaults = data
     return load_config()
 
 

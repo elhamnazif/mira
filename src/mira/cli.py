@@ -275,6 +275,75 @@ def review(
 
 
 @main.command()
+@click.option("--job", "job_id", required=True, help="The job_id input of the dispatched run")
+@click.option(
+    "--server", "server_url", required=True, help="The Mira server's URL (server_url input)"
+)
+@click.option(
+    "--audience",
+    envvar="MIRA_RUNNER_OIDC_AUDIENCE",
+    default="mira",
+    show_default=True,
+    help="Audience of the OIDC token, the server's review.runner_oidc_audience",
+)
+@click.option(
+    "--llm-provider",
+    envvar="MIRA_RUNNER_LLM_PROVIDER",
+    default="claude-code",
+    show_default=True,
+    help="LLM provider to review with on this machine",
+)
+@click.option(
+    "--model",
+    envvar="MIRA_RUNNER_MODEL",
+    default=None,
+    help="Model for every review pass. Default: the models in the job's config",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+def runner(
+    job_id: str,
+    server_url: str,
+    audience: str,
+    llm_provider: str,
+    model: str | None,
+    verbose: bool,
+) -> None:
+    """Review a dispatched job inside its GitHub Actions run."""
+    import os
+    import tempfile
+
+    import httpx
+
+    from mira.config import check_runner_server_url
+    from mira.runner_client import run_job
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(name)s %(levelname)s: %(message)s",
+        stream=sys.stdout,
+    )
+    try:
+        server_url = check_runner_server_url(server_url)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    # The runner keeps no index. An empty one, in a directory of its own.
+    os.environ.setdefault("MIRA_INDEX_DIR", tempfile.mkdtemp(prefix="mira-index-"))
+
+    async def _run() -> int:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15)) as http:
+            return await run_job(
+                http,
+                job_id=job_id,
+                server_url=server_url,
+                audience=audience,
+                llm_provider=llm_provider,
+                model=model or None,
+            )
+
+    sys.exit(asyncio.run(_run()))
+
+
+@main.command()
 @click.option("--host", default="0.0.0.0", help="Host to bind to")
 @click.option("--port", envvar="PORT", default=8000, type=int, help="Port to bind to")
 @click.option(
