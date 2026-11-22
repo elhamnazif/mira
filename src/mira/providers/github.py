@@ -9,15 +9,16 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.core.workspace import CheckoutSource
-from mira.exceptions import ProviderError
+from mira.exceptions import ProviderError, WorkflowDispatchError
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -70,6 +71,12 @@ _GITHUB_WEB_URL = (
     if _GITHUB_API_URL == "https://api.github.com"
     else _GITHUB_API_URL.removesuffix("/api/v3")
 )
+
+
+@dataclass(frozen=True)
+class WorkflowRun:
+    id: int
+    html_url: str
 
 
 def _normalize_login(login: str) -> str:
@@ -661,8 +668,10 @@ class GitHubProvider(BaseProvider):
         title: str = "",
         summary: str = "",
         details_url: str = "",
+        status: Literal["queued", "in_progress"] = "in_progress",
     ) -> int | None:
-        """Create an in-progress check run for the PR head commit.
+        """Create a check run for the PR head commit, in progress or, for a
+        review handed to an Actions runner, queued.
 
         Uses the Checks API: the run shows the bot avatar, a title/summary,
         and a details link (clickable from the PR checks section). No retry on
@@ -676,14 +685,15 @@ class GitHubProvider(BaseProvider):
         payload: dict[str, Any] = {
             "name": CHECK_RUN_NAME,
             "head_sha": pr_info.head_sha,
-            "status": "in_progress",
-            "started_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "status": status,
             "output": {
                 "title": title or CHECK_RUN_NAME,
                 "summary": summary,
                 "text": "",
             },
         }
+        if status == "in_progress":
+            payload["started_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         if details_url:
             payload["details_url"] = details_url
         try:
@@ -750,6 +760,44 @@ class GitHubProvider(BaseProvider):
             raise ProviderError(f"GitHub PATCH {url} failed: {e}") from e
         if resp.status_code != 200:
             raise ProviderError(f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}")
+
+    async def dispatch_workflow(
+        self, owner: str, repo: str, workflow: str, *, ref: str, inputs: dict[str, str]
+    ) -> WorkflowRun:
+        """Start a ``workflow_dispatch`` run and return it.
+
+        Needs the App permission ``actions: write``. ``return_run_details``
+        makes GitHub answer 200 with the new run's id instead of 204. No
+        retry: a second POST after a lost response would start a second run.
+        """
+        token = await self._resolve_token()
+        url = f"{_GITHUB_API_URL}/repos/{owner}/{repo}/actions/workflows/{workflow}/dispatches"
+        payload = {"ref": ref, "inputs": inputs, "return_run_details": True}
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, json=payload, headers=self._check_run_headers(token))
+        except (ConnectionError, TimeoutError, httpx.TransportError) as e:
+            raise WorkflowDispatchError(f"GitHub POST {url} failed: {e}", None) from e
+        if resp.status_code != 200:
+            raise WorkflowDispatchError(
+                f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}", resp.status_code
+            )
+        data = resp.json()
+        return WorkflowRun(id=int(data["workflow_run_id"]), html_url=data.get("html_url", ""))
+
+    async def cancel_workflow_run(self, owner: str, repo: str, run_id: int) -> None:
+        """Ask GitHub to cancel a workflow run. A run that already finished
+        answers 409, which this reports as a ``ProviderError`` like any other
+        refusal."""
+        token = await self._resolve_token()
+        url = f"{_GITHUB_API_URL}/repos/{owner}/{repo}/actions/runs/{run_id}/cancel"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, headers=self._check_run_headers(token))
+        except (ConnectionError, TimeoutError, httpx.TransportError) as e:
+            raise ProviderError(f"GitHub POST {url} failed: {e}") from e
+        if resp.status_code != 202:
+            raise ProviderError(f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}")
 
     async def find_bot_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         token = await self._resolve_token()

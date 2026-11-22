@@ -20,6 +20,14 @@ from dataclasses import dataclass
 from datetime import UTC
 from typing import Any
 
+from mira.runner import (
+    ACTIVE_JOB_STATUSES,
+    JobStatus,
+    ReviewJob,
+    check_transition,
+    parse_runner_override,
+)
+
 logger = logging.getLogger(__name__)
 
 _SQLITE_SCHEMA = """
@@ -72,6 +80,9 @@ CREATE TABLE IF NOT EXISTS repos (
     -- "branches": [...]} (replace it) or {"mode": "disable"} (no auto-review).
     -- '' = never set, treated as inherit.
     base_branch_policy TEXT NOT NULL DEFAULT '',
+    -- Per-repo review runner: '' (inherit the deployment default), 'local',
+    -- or 'actions:<label>[,<label>...]'. Parsed by mira.runner.
+    runner TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (platform, owner, repo)
 );
 
@@ -204,6 +215,28 @@ CREATE TABLE IF NOT EXISTS pr_reviewers (
     bare_approval INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (owner, repo, pr_number, reviewer)
 );
+
+-- One row per review dispatched to a GitHub Actions runner (mira.runner).
+-- id is the random job id passed as the workflow input. status follows
+-- mira.runner.JobStatus; run_id and run_url name the workflow run.
+CREATE TABLE IF NOT EXISTS review_jobs (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    installation_id INTEGER NOT NULL DEFAULT 0,
+    runs_on TEXT NOT NULL DEFAULT '[]',  -- JSON array of runs-on labels
+    status TEXT NOT NULL,
+    check_run_id INTEGER,
+    run_id INTEGER,
+    run_url TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    claimed_at REAL NOT NULL DEFAULT 0,
+    finished_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
 """
 
 _PG_SCHEMA = """
@@ -245,6 +278,8 @@ CREATE TABLE IF NOT EXISTS repos (
     private BOOLEAN,
     -- Per-repo auto-review destination-branch policy; see the SQLite schema.
     base_branch_policy TEXT NOT NULL DEFAULT '',
+    -- Per-repo review runner; see the SQLite schema.
+    runner TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (platform, owner, repo)
 );
 
@@ -357,6 +392,28 @@ CREATE TABLE IF NOT EXISTS pr_reviewers (
     state TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (owner, repo, pr_number, reviewer)
 );
+
+-- One row per review dispatched to a GitHub Actions runner (mira.runner).
+-- id is the random job id passed as the workflow input. status follows
+-- mira.runner.JobStatus; run_id and run_url name the workflow run.
+CREATE TABLE IF NOT EXISTS review_jobs (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    installation_id BIGINT NOT NULL DEFAULT 0,
+    runs_on TEXT NOT NULL DEFAULT '[]',  -- JSON array of runs-on labels
+    status TEXT NOT NULL,
+    check_run_id BIGINT,
+    run_id BIGINT,
+    run_url TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    claimed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    finished_at DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -426,6 +483,7 @@ class RepoRecord:
     conventions: str = ""
     private: bool | None = None  # None = visibility not yet known
     base_branch_policy: str = ""  # '' = inherit the deployment default
+    runner: str = ""  # '' = inherit; see mira.runner.parse_runner_override
 
 
 @dataclass
@@ -549,6 +607,10 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE repos ADD COLUMN base_branch_policy TEXT NOT NULL DEFAULT ''"
             )
+        if "runner" not in cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE repos ADD COLUMN runner TEXT NOT NULL DEFAULT ''"
+            )
         progress_cols = {
             r[1]
             for r in self._sqlite_conn.execute("PRAGMA table_info(pr_review_progress)").fetchall()
@@ -623,6 +685,9 @@ class AppDatabase:
                 cur.execute(
                     "ALTER TABLE repos ADD COLUMN IF NOT EXISTS "
                     "base_branch_policy TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE repos ADD COLUMN IF NOT EXISTS runner TEXT NOT NULL DEFAULT ''"
                 )
                 cur.execute(
                     "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
@@ -1179,6 +1244,7 @@ class AppDatabase:
             private=(None if row[12] is None else bool(row[12])),
             base_branch_policy=row[13] or "",
             platform=row[14],
+            runner=row[15] or "",
         )
 
     @staticmethod
@@ -1204,6 +1270,7 @@ class AppDatabase:
             private=(None if row[12] is None else bool(row[12])),
             base_branch_policy=row[13] or "",
             platform=row[14],
+            runner=row[15] or "",
         )
 
     def list_repos(self) -> list[RepoRecord]:
@@ -1212,14 +1279,14 @@ class AppDatabase:
             rows = self._sqlite_conn.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform FROM repos ORDER BY owner, repo"
+                "base_branch_policy, platform, runner FROM repos ORDER BY owner, repo"
             ).fetchall()
             return [self._sqlite_row_to_repo(r) for r in rows]
         with self._pg_cursor() as cur:
             cur.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform FROM repos ORDER BY owner, repo"
+                "base_branch_policy, platform, runner FROM repos ORDER BY owner, repo"
             )
             return [self._pg_row_to_repo(r) for r in cur.fetchall()]
 
@@ -1229,7 +1296,7 @@ class AppDatabase:
             row = self._sqlite_conn.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform FROM repos WHERE platform=? AND owner=? AND repo=?",
+                "base_branch_policy, platform, runner FROM repos WHERE platform=? AND owner=? AND repo=?",
                 (platform, owner, repo),
             ).fetchone()
             if row:
@@ -1239,7 +1306,7 @@ class AppDatabase:
             cur.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform FROM repos WHERE platform=%s AND owner=%s AND repo=%s",
+                "base_branch_policy, platform, runner FROM repos WHERE platform=%s AND owner=%s AND repo=%s",
                 (platform, owner, repo),
             )
             row = cur.fetchone()
@@ -1267,7 +1334,7 @@ class AppDatabase:
             rows = self._sqlite_conn.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform FROM repos WHERE owner=? AND repo=?",
+                "base_branch_policy, platform, runner FROM repos WHERE owner=? AND repo=?",
                 (owner, repo),
             ).fetchall()
             return [self._sqlite_row_to_repo(r) for r in rows]
@@ -1275,7 +1342,7 @@ class AppDatabase:
             cur.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform FROM repos WHERE owner=%s AND repo=%s",
+                "base_branch_policy, platform, runner FROM repos WHERE owner=%s AND repo=%s",
                 (owner, repo),
             )
             return [self._pg_row_to_repo(r) for r in cur.fetchall()]
@@ -1347,6 +1414,16 @@ class AppDatabase:
                     (policy_json, platform, owner, repo),
                 )
                 self._pg_commit()
+
+    def set_repo_runner(self, owner: str, repo: str, runner: str, platform: str = "github") -> None:
+        """Store the per-repo runner override ('' inherits). Rejects a value
+        ``parse_runner_override`` cannot read, so a bad write never reaches
+        the review path. Like the branch policy, it never creates a row."""
+        parse_runner_override(runner)
+        self._exec(
+            "UPDATE repos SET runner=? WHERE platform=? AND owner=? AND repo=?",
+            (runner, platform, owner, repo),
+        )
 
     def get_setting(self, key: str) -> str | None:
         if self._backend == "sqlite":
@@ -1753,18 +1830,113 @@ class AppDatabase:
             cur.execute(sql.replace("?", "%s"), params)
             return cur.fetchall()
 
-    def _exec(self, sql: str, params: tuple = ()) -> None:
+    def _exec(self, sql: str, params: tuple = ()) -> int:
         """Run a write written with ``?`` placeholders + lowercase ``excluded``
-        (both work on either backend) against the active backend."""
+        (both work on either backend) against the active backend. Returns
+        the number of rows it changed."""
         if self._backend == "sqlite":
             assert self._sqlite_conn is not None
-            self._sqlite_conn.execute(sql, params)
+            rowcount = self._sqlite_conn.execute(sql, params).rowcount
             self._sqlite_conn.commit()
-            return
+            return rowcount
         assert self._pg_conn is not None
         with self._pg_conn.cursor() as cur:
             cur.execute(sql.replace("?", "%s"), params)
+            rowcount = cur.rowcount
         self._pg_conn.commit()
+        return rowcount
+
+    # ── Review jobs ──
+
+    _REVIEW_JOB_COLUMNS = (
+        "id, owner, repo, pr_number, head_sha, installation_id, runs_on, status, "
+        "check_run_id, run_id, run_url, error, created_at, claimed_at, finished_at"
+    )
+
+    @staticmethod
+    def _row_to_review_job(row: tuple) -> ReviewJob:
+        return ReviewJob(
+            id=row[0],
+            owner=row[1],
+            repo=row[2],
+            pr_number=row[3],
+            head_sha=row[4],
+            installation_id=row[5],
+            runs_on=tuple(json.loads(row[6])),
+            status=JobStatus(row[7]),
+            check_run_id=row[8],
+            run_id=row[9],
+            run_url=row[10],
+            error=row[11],
+            created_at=row[12],
+            claimed_at=row[13],
+            finished_at=row[14],
+        )
+
+    def create_review_job(self, job: ReviewJob) -> None:
+        self._exec(
+            f"INSERT INTO review_jobs ({self._REVIEW_JOB_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job.id,
+                job.owner,
+                job.repo,
+                job.pr_number,
+                job.head_sha,
+                job.installation_id,
+                json.dumps(list(job.runs_on)),
+                job.status.value,
+                job.check_run_id,
+                job.run_id,
+                job.run_url,
+                job.error,
+                job.created_at,
+                job.claimed_at,
+                job.finished_at,
+            ),
+        )
+
+    def get_review_job(self, job_id: str) -> ReviewJob | None:
+        rows = self._rows(
+            f"SELECT {self._REVIEW_JOB_COLUMNS} FROM review_jobs WHERE id=?", (job_id,)
+        )
+        return self._row_to_review_job(rows[0]) if rows else None
+
+    def list_active_review_jobs(self, owner: str, repo: str, pr_number: int) -> list[ReviewJob]:
+        """Jobs on this PR that are dispatched or claimed, oldest first."""
+        rows = self._rows(
+            f"SELECT {self._REVIEW_JOB_COLUMNS} FROM review_jobs "
+            "WHERE owner=? AND repo=? AND pr_number=? AND status IN (?, ?) "
+            "ORDER BY created_at",
+            (owner, repo, pr_number, *(s.value for s in ACTIVE_JOB_STATUSES)),
+        )
+        return [self._row_to_review_job(r) for r in rows]
+
+    def transition_review_job(
+        self, job_id: str, old: JobStatus, new: JobStatus, *, error: str = ""
+    ) -> bool:
+        """Move a job from ``old`` to ``new``. Raises ``IllegalJobTransition``
+        for a move the state machine forbids. Returns False when the job is no
+        longer in ``old`` (another actor moved it first), so concurrent claim,
+        supersede and result writes cannot overwrite each other."""
+        check_transition(old, new)
+        now = time.time()
+        stamp = "claimed_at" if new is JobStatus.CLAIMED else "finished_at"
+        return (
+            self._exec(
+                f"UPDATE review_jobs SET status=?, error=?, {stamp}=? WHERE id=? AND status=?",
+                (new.value, error, now, job_id, old.value),
+            )
+            > 0
+        )
+
+    def set_review_job_check_run(self, job_id: str, check_run_id: int | None) -> None:
+        self._exec("UPDATE review_jobs SET check_run_id=? WHERE id=?", (check_run_id, job_id))
+
+    def set_review_job_run(self, job_id: str, run_id: int, run_url: str) -> None:
+        self._exec(
+            "UPDATE review_jobs SET run_id=?, run_url=? WHERE id=?", (run_id, run_url, job_id)
+        )
 
     def upsert_contributor(
         self,

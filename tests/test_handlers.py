@@ -160,7 +160,7 @@ async def _run_pr_handler(result: ReviewResult | Exception, mock_engine_cls, moc
         patch("mira.dashboard.api._app_db") as mock_db,
         patch("mira.outbound_webhooks.dispatch_event", new_callable=AsyncMock) as mock_dispatch,
     ):
-        mock_db.get_repo.return_value = MagicMock(status="ready")  # indexed → skip note
+        mock_db.get_repo.return_value = MagicMock(status="ready", runner="")  # indexed, local
         await handle_pull_request(_make_pr_payload(), mock_app_auth, "mira-bot")
     return mock_dispatch
 

@@ -22,6 +22,7 @@ from mira.platforms.base_branch_policy import base_branch_is_filtered_for_repo
 from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.github.auth import GitHubAppAuth
+from mira.platforms.github.dispatch import dispatch_review
 from mira.platforms.handlers import (
     _PAUSE_KEYWORDS,
     _REJECT_KEYWORDS,
@@ -42,6 +43,8 @@ from mira.platforms.mentions import (
     strip_mentions,
 )
 from mira.providers import create_provider
+from mira.providers.github import GitHubProvider
+from mira.runner import RunnerKind, resolve_runner_target
 
 logger = logging.getLogger(__name__)
 
@@ -613,7 +616,8 @@ async def handle_pull_request(
     app_auth: GitHubAppAuth,
     bot_name: str,
 ) -> None:
-    """Handle a pull_request event by running a full review."""
+    """Handle a pull_request event: review in process, or hand the review to
+    an Actions runner when the repo's runner target says so."""
     installation_id: int = payload.get("installation", {}).get("id", 0)
     pr_url = ""
     repo_full = ""
@@ -633,6 +637,32 @@ async def handle_pull_request(
         # Record the authoring contribution before review so it lands even if
         # the review itself fails. Idempotent on every synchronize re-fire.
         _record_pr_contribution(payload, "pr_opened")
+
+        db = _get_app_db()
+        record = db.get_repo(owner, repo)
+        target = resolve_runner_target(record.runner if record else "", load_config().review)
+        if target.kind is RunnerKind.ACTIONS:
+            assert isinstance(provider, GitHubProvider)
+            pr_info = PRInfo(
+                title=pr.get("title", ""),
+                description="",
+                base_branch=pr["base"]["ref"],
+                head_branch=pr["head"]["ref"],
+                url=pr_url,
+                number=number,
+                owner=owner,
+                repo=repo,
+                head_sha=pr["head"]["sha"],
+            )
+            await dispatch_review(
+                provider,
+                db,
+                pr_info,
+                default_branch=payload["repository"]["default_branch"],
+                installation_id=installation_id,
+                runs_on=target.runs_on,
+            )
+            return
 
         await run_pr_review(
             provider,
