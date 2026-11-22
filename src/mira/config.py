@@ -113,7 +113,15 @@ class LLMConfig(BaseModel):
     # ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in Mira's environment, plus the
     # ANTHROPIC_BASE_URL gateway settings; nothing else is passed to the CLI.
     claude_command: str = "claude"
-    claude_timeout_seconds: int = Field(default=900, gt=0)
+    # Hard ceiling on one Claude Code call. The stall watchdog below ends a
+    # hung call long before this.
+    claude_timeout_seconds: int = Field(default=2700, gt=0)
+    # Stall watchdog for the agent-CLI providers (claude-code, opencode). A
+    # call is killed when the model produces nothing for
+    # first_event_timeout_seconds after it starts, or goes silent for
+    # idle_timeout_seconds after that.
+    first_event_timeout_seconds: int = Field(default=120, gt=0)
+    idle_timeout_seconds: int = Field(default=600, gt=0)
 
     @field_validator("base_url")
     @classmethod
@@ -521,6 +529,8 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
         "codex_timeout_seconds",
         "claude_command",
         "claude_timeout_seconds",
+        "first_event_timeout_seconds",
+        "idle_timeout_seconds",
     }
 )
 

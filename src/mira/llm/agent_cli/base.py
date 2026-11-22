@@ -3,8 +3,14 @@
 A subclass describes one CLI: how to build its argv, which credentials it
 needs in the child environment, and how to parse its output. This base class
 owns everything else: the isolated subprocess (scrubbed environment,
-throwaway ``HOME``, process-group kill on timeout), prompt rendering, JSON
-extraction, secret redaction and usage accounting.
+throwaway ``HOME``, process-group kill), the stall watchdog, prompt
+rendering, JSON extraction, secret redaction and usage accounting.
+
+The stall watchdog reads the CLI's streamed output as it arrives. A call is
+killed when the model produces nothing for ``first_event_timeout_seconds``,
+when it then goes silent for ``idle_timeout_seconds``, or when it reaches the
+harness's hard ceiling. Adapted from Pullfrog's activity watchdog
+(``utils/activity.ts``), MIT License, Copyright (c) 2026 Pullfrog, Inc.
 
 There are two ways to call a provider:
 
@@ -76,6 +82,7 @@ _CREDENTIAL_PATTERNS = (
 _REDACTED = "[redacted credential]"
 
 _MAX_STDERR_DETAIL = 2000
+_READ_CHUNK = 64 * 1024
 
 
 @dataclass
@@ -159,6 +166,14 @@ class AgentCLIProvider(ABC):
     def _extra_env(self) -> dict[str, str]:
         """Non-secret tuning variables for the child (subclass hook)."""
         return {}
+
+    def _is_progress(self, line: bytes) -> bool:
+        """Whether a stdout line shows the model working, which resets the stall watchdog."""
+        return bool(line.strip())
+
+    def _keeps_line(self, line: bytes) -> bool:
+        """Whether ``_parse_output`` needs this stdout line. Dropping chatty lines bounds memory."""
+        return True
 
     # ── Usage accounting (LLMProviderProtocol) ─────────────────────────
 
@@ -308,22 +323,18 @@ class AgentCLIProvider(ABC):
                 ) from exc
 
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(prompt.encode("utf-8")),
-                    timeout=self._timeout_seconds,
-                )
-            except TimeoutError as exc:
+                stdout, stderr = await self._communicate(proc, prompt.encode("utf-8"))
+            except LLMError as exc:
+                logger.warning("%s: killing the CLI: %s", self.harness, exc)
                 await self._terminate_process_tree(proc)
-                raise LLMError(
-                    f"{self.error_prefix}_timeout", seconds=self._timeout_seconds
-                ) from exc
+                raise
             except BaseException:
                 await self._terminate_process_tree(proc)
                 raise
 
             result = self._parse_output(
-                stdout.decode("utf-8", errors="replace"),
-                stderr.decode("utf-8", errors="replace"),
+                stdout,
+                stderr,
                 proc.returncode if proc.returncode is not None else -1,
             )
         result.mode = "workspace" if workspace is not None else "completion"
@@ -336,6 +347,90 @@ class AgentCLIProvider(ABC):
         result = self._redact(result)
         self._record(result)
         return result
+
+    async def _communicate(
+        self, proc: asyncio.subprocess.Process, prompt: bytes
+    ) -> tuple[str, str]:
+        """Send ``prompt`` on stdin and collect (stdout, stderr) under the stall watchdog.
+
+        Raises ``LLMError`` when a budget runs out. The caller kills the process tree.
+        """
+        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+        stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        last_progress: float | None = None
+        # The first progress swaps the first-event budget for the idle one, which
+        # can end sooner, so it wakes the watch loop. Later progress only pushes
+        # the deadline back, which the loop picks up when it next wakes.
+        progressed = asyncio.Event()
+        kept: list[bytes] = []
+
+        def take(line: bytes) -> None:
+            nonlocal last_progress
+            if self._is_progress(line):
+                last_progress = loop.time()
+                progressed.set()
+            if self._keeps_line(line):
+                kept.append(line)
+
+        async def feed() -> None:
+            with suppress(BrokenPipeError, ConnectionResetError):
+                stdin.write(prompt)
+                await stdin.drain()
+            stdin.close()
+
+        async def read_lines() -> None:
+            pending = b""
+            while chunk := await stdout.read(_READ_CHUNK):
+                *lines, pending = (pending + chunk).split(b"\n")
+                for line in lines:
+                    take(line)
+            if pending:
+                take(pending)
+
+        tasks = [
+            asyncio.ensure_future(feed()),
+            reader := asyncio.ensure_future(read_lines()),
+            errors := asyncio.ensure_future(stderr.read()),
+            first_progress := asyncio.ensure_future(progressed.wait()),
+        ]
+        try:
+            while not reader.done():
+                deadline, code, seconds = self._watchdog_deadline(started, last_progress)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise LLMError(f"{self.error_prefix}_{code}", seconds=seconds)
+                wake = {reader} if first_progress.done() else {reader, first_progress}
+                await asyncio.wait(wake, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            reader.result()
+            # stdout is closed; the process gets what is left of the hard ceiling to exit.
+            ceiling = started + self._timeout_seconds - loop.time()
+            try:
+                err = await asyncio.wait_for(errors, timeout=max(ceiling, 0))
+                await asyncio.wait_for(proc.wait(), timeout=max(ceiling, 0))
+            except TimeoutError as exc:
+                raise LLMError(
+                    f"{self.error_prefix}_timeout", seconds=self._timeout_seconds
+                ) from exc
+        finally:
+            for task in tasks:
+                task.cancel()
+        text = b"\n".join(kept).decode("utf-8", errors="replace")
+        return text, err.decode("utf-8", errors="replace")
+
+    def _watchdog_deadline(
+        self, started: float, last_progress: float | None
+    ) -> tuple[float, str, int]:
+        """The earliest budget still running, as (deadline, error code suffix, budget seconds)."""
+        hard = (started + self._timeout_seconds, "timeout", self._timeout_seconds)
+        if last_progress is None:
+            first = self.config.first_event_timeout_seconds
+            watch = (started + first, "no_first_event", first)
+        else:
+            idle = self.config.idle_timeout_seconds
+            watch = (last_progress + idle, "stalled", idle)
+        return min(hard, watch)
 
     # ── Output hygiene ─────────────────────────────────────────────────
 

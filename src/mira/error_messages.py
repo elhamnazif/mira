@@ -162,6 +162,14 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Claude Code CLI timed out after {seconds}s",
         safe="Claude Code CLI timed out",
     ),
+    "claude_no_first_event": ErrorMessage(
+        full="Claude Code CLI produced no output in its first {seconds}s",
+        safe="Claude Code CLI produced no output",
+    ),
+    "claude_stalled": ErrorMessage(
+        full="Claude Code CLI went silent for {seconds}s",
+        safe="Claude Code CLI stalled",
+    ),
     "claude_exit_failed": ErrorMessage(
         full="Claude Code CLI failed with exit {exit_code}: {detail}",
         safe="Claude Code CLI failed",
