@@ -48,6 +48,7 @@ from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
 )
+from mira.llm.provider_errors import classify_provider_error
 from mira.llm.response_parser import (
     convert_to_review_comments,
     convert_to_walkthrough_result,
@@ -2118,11 +2119,12 @@ class ReviewEngine:
                         len(chunks),
                         exc,
                     )
+                    cause = classify_provider_error(exc) or type(exc).__name__
                     return _ChunkOutcome(
                         failure=_chunk_failure(
                             idx,
                             chunk,
-                            f"review failed ({type(exc).__name__})",
+                            f"review failed ({cause})",
                             hops=hops,
                             excerpt=raw_response or str(exc),
                         )

@@ -32,6 +32,7 @@ from mira.exceptions import ConfigError, MiraError
 from mira.llm import create_llm
 from mira.llm import provider_profiles as profiles
 from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
+from mira.llm.provider_errors import classify_provider_error
 from mira.providers.github import GitHubProvider
 from mira.runner_protocol import JobSpec, RemoteStateStore, ResultBundle, TokenGrant, UsageReport
 
@@ -308,9 +309,12 @@ def usage_report(llms: Iterable[Any]) -> UsageReport:
 
 def _safe_error(exc: BaseException) -> str:
     """A short error for the job record and the PR's check, without the
-    exception's own text unless Mira wrote it to be shown."""
+    exception's own text unless Mira wrote it to be shown. A model
+    provider's refusal leads with its cause."""
     message = exc.safe_message if isinstance(exc, MiraError) else ""
-    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    kind = classify_provider_error(exc)
+    return f"Review failed: {kind} ({error})" if kind else error
 
 
 async def run_job(
