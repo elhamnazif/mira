@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
+import inspect
 import itertools
 import logging
 import os
@@ -209,6 +211,57 @@ def _async_constant(value: str) -> Callable[[], Awaitable[str]]:
     return _const
 
 
+def _is_unauthorized(exc: BaseException) -> bool:
+    """Whether GitHub answered 401 to the token, in ``exc`` or a cause of it."""
+    seen: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in seen:
+        seen.append(current)
+        status: int | None
+        if isinstance(current, GithubException):
+            status = current.status
+        elif isinstance(current, httpx.HTTPStatusError):
+            status = current.response.status_code
+        else:
+            status = getattr(current, "status_code", None)
+        if status == 401:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _retry_on_401(method: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Rerun ``method`` once after a 401, with a token from ``on_unauthorized``.
+
+    GitHub can revoke an installation token before it expires. A 401 means
+    GitHub applied nothing, so the rerun cannot double a write. Adapted from
+    Pullfrog's utils/github.ts (MIT, Copyright (c) 2026 Pullfrog, Inc.).
+    """
+
+    @functools.wraps(method)
+    async def call(self: GitHubProvider, *args: Any, **kwargs: Any) -> Any:
+        if self._on_unauthorized is None:
+            return await method(self, *args, **kwargs)
+        stale = await self._resolve_token()
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as exc:
+            if not _is_unauthorized(exc):
+                raise
+        logger.warning("GitHub refused the token in %s; retrying with a fresh one", method.__name__)
+        await self._on_unauthorized(stale)
+        return await method(self, *args, **kwargs)
+
+    return call
+
+
+def _refresh_token_on_401(cls: type[GitHubProvider]) -> type[GitHubProvider]:
+    for name, attr in list(vars(cls).items()):
+        if not name.startswith("_") and inspect.iscoroutinefunction(attr):
+            setattr(cls, name, _retry_on_401(attr))
+    return cls
+
+
 _WRITE_PERMISSIONS = frozenset({"admin", "maintain", "push", "write"})
 _READ_PERMISSIONS = frozenset({"pull", "read", "triage"})
 
@@ -224,13 +277,26 @@ def _normalize_permission(permission: str | None) -> str | None:
     return None
 
 
+@_refresh_token_on_401
 class GitHubProvider(BaseProvider):
-    """GitHub code hosting provider."""
+    """GitHub code hosting provider.
 
-    def __init__(self, token: str | Callable[[], Awaitable[str]]) -> None:
+    With ``on_unauthorized``, a call GitHub answers with 401 passes it the
+    token GitHub refused and runs once more with the supplier's next token.
+    """
+
+    _on_unauthorized: Callable[[str], Awaitable[None]] | None = None
+
+    def __init__(
+        self,
+        token: str | Callable[[], Awaitable[str]],
+        *,
+        on_unauthorized: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         if not token:
             raise ProviderError("GitHub token is required")
         self._token_supplier = _async_constant(token) if isinstance(token, str) else token
+        self._on_unauthorized = on_unauthorized
 
     async def _resolve_token(self) -> str:
         return await self._token_supplier()
@@ -717,7 +783,9 @@ class GitHubProvider(BaseProvider):
             )
             return None
         if resp.status_code != 201:
-            raise ProviderError(f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}")
+            raise ProviderError(
+                f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}", resp.status_code
+            )
         return int(resp.json()["id"])
 
     async def start_queued_check_run(
@@ -744,7 +812,9 @@ class GitHubProvider(BaseProvider):
         except (ConnectionError, TimeoutError, httpx.TransportError) as e:
             raise ProviderError(f"GitHub PATCH {url} failed: {e}") from e
         if resp.status_code != 200:
-            raise ProviderError(f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}")
+            raise ProviderError(
+                f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}", resp.status_code
+            )
 
     async def finish_check_run(
         self,
@@ -786,7 +856,9 @@ class GitHubProvider(BaseProvider):
         except (ConnectionError, TimeoutError, httpx.TransportError) as e:
             raise ProviderError(f"GitHub PATCH {url} failed: {e}") from e
         if resp.status_code != 200:
-            raise ProviderError(f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}")
+            raise ProviderError(
+                f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}", resp.status_code
+            )
 
     async def dispatch_workflow(
         self, owner: str, repo: str, workflow: str, *, ref: str, inputs: dict[str, str]
@@ -824,7 +896,9 @@ class GitHubProvider(BaseProvider):
         except (ConnectionError, TimeoutError, httpx.TransportError) as e:
             raise ProviderError(f"GitHub POST {url} failed: {e}") from e
         if resp.status_code != 202:
-            raise ProviderError(f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}")
+            raise ProviderError(
+                f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}", resp.status_code
+            )
 
     async def find_bot_comment(self, pr_info: PRInfo, marker: str) -> int | None:
         token = await self._resolve_token()

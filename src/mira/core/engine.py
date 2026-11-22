@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from mira.core.git_snapshot import GitSnapshot
     from mira.llm.base import LLMProviderProtocol
 
+from mira.actions_log import in_log_group
 from mira.analysis.severity import classify_severity
 from mira.config import MiraConfig
 from mira.core.chunker import chunk_files
@@ -52,6 +54,7 @@ from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
 )
+from mira.llm.provider_errors import classify_provider_error
 from mira.llm.response_parser import (
     convert_to_review_comments,
     convert_to_walkthrough_result,
@@ -924,8 +927,11 @@ class ReviewEngine:
         try:
             async with self._pr_workspace(pr_info):
                 result = await self._review_pr(pr_info, state)
-        except BaseException:
-            await self._finish_check(pr_info, run_id, "failure", None)
+        except BaseException as exc:
+            # A dispatched job's check is the server's. On a cancel it closes
+            # it from the job's result, and leaves a superseded job's alone.
+            if not (isinstance(exc, asyncio.CancelledError) and self.check_run_id is not None):
+                await self._finish_check(pr_info, run_id, "failure", None)
             raise
         await self._finish_check(pr_info, run_id, self._check_status_key(result), result)
         return result
@@ -984,8 +990,11 @@ class ReviewEngine:
                 return 0, 0, [], []
             try:
                 assert self.provider is not None
-                return await resolve_verified_threads(
-                    self.provider, self.llm, pr_info, self.bot_name, self.dry_run
+                return await in_log_group(
+                    "thread verification",
+                    resolve_verified_threads(
+                        self.provider, self.llm, pr_info, self.bot_name, self.dry_run
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Thread resolution failed, continuing: %s", exc)
@@ -1806,7 +1815,9 @@ class ReviewEngine:
             return ""
 
         # Fire walkthrough early so review_pr can post it before chunk review finishes.
-        walkthrough_task = _asyncio.create_task(_generate_walkthrough())
+        walkthrough_task = _asyncio.create_task(
+            in_log_group("walkthrough", _generate_walkthrough())
+        )
 
         # `_walkthrough_notify_task` exposed on self so review_pr can await it
         # before its own final write — otherwise the in-progress update can land
@@ -2122,17 +2133,23 @@ class ReviewEngine:
                         len(chunks),
                         exc,
                     )
+                    cause = classify_provider_error(exc) or type(exc).__name__
                     return _ChunkOutcome(
                         failure=_chunk_failure(
                             idx,
                             chunk,
-                            f"review failed ({type(exc).__name__})",
+                            f"review failed ({cause})",
                             hops=hops,
                             excerpt=raw_response or str(exc),
                         )
                     )
 
-        review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        review_task = _asyncio.gather(
+            *[
+                in_log_group(f"chunk {i + 1}/{len(chunks)}", _review_chunk(i, c))
+                for i, c in enumerate(chunks)
+            ]
+        )
         # Per-chunk executors (fresh per call) so each chunk gets its own
         # 50KB tool-output budget; one shared executor would let an early
         # chunk exhaust the budget and wedge later chunks.
@@ -2152,14 +2169,17 @@ class ReviewEngine:
                 )
 
         security_task = _asyncio.create_task(
-            security_review_pass(
-                self.llm,
-                filtered,
-                _security_relevant_files(filtered),
-                pr_title,
-                security_llm=self.security_llm,
-                agentic_executor_factory=_security_executor_factory,
-                max_hops=self.config.review.agentic_max_hops,
+            in_log_group(
+                "security pass",
+                security_review_pass(
+                    self.llm,
+                    filtered,
+                    _security_relevant_files(filtered),
+                    pr_title,
+                    security_llm=self.security_llm,
+                    agentic_executor_factory=_security_executor_factory,
+                    max_hops=self.config.review.agentic_max_hops,
+                ),
             )
             if self.config.review.security_pass
             else _asyncio.sleep(0, result=[])

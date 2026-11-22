@@ -15,15 +15,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from mira.config import MiraConfig, _is_local_host, set_global_defaults_data
 from mira.core.engine import ReviewEngine
@@ -32,6 +34,9 @@ from mira.exceptions import ConfigError, MiraError
 from mira.llm import create_llm, slugs
 from mira.llm import provider_profiles as profiles
 from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
+from mira.llm.provider_errors import classify_provider_error
+from mira.models import ReviewResult
+from mira.providers.github import _GITHUB_API_URL as GITHUB_API_URL
 from mira.providers.github import GitHubProvider
 from mira.runner_protocol import JobSpec, RemoteStateStore, ResultBundle, TokenGrant, UsageReport
 
@@ -186,13 +191,16 @@ def _status(resp: httpx.Response) -> str:
 
 class TokenSupplier:
     """The job's GitHub token, refreshed through the server shortly before it
-    expires. GitHubProvider awaits it before every call."""
+    expires or once GitHub refuses it. GitHubProvider awaits it before every
+    call. It keeps every token it received, so the run can revoke them all
+    when it ends."""
 
     def __init__(self, api: RunnerAPI, spec: JobSpec) -> None:
         self._api = api
         self._token = spec.github_token
         self._expires_at = spec.token_expires_at
         self._lock = asyncio.Lock()
+        self.received = [spec.github_token]
 
     async def __call__(self) -> str:
         async with self._lock:
@@ -200,16 +208,52 @@ class TokenSupplier:
                 await self._refresh()
             return self._token.get_secret_value()
 
-    async def _refresh(self) -> None:
+    async def invalidate(self, stale: str) -> None:
+        """GitHub refused ``stale``. Concurrent callers that saw the same
+        token fail share one refresh: the lock serializes them, and a token
+        already replaced is not refreshed again."""
+        async with self._lock:
+            if self._token.get_secret_value() == stale:
+                logger.warning("GitHub refused the job's token before it expired; refreshing")
+                await self._refresh(refused=True)
+
+    async def _refresh(self, *, refused: bool = False) -> None:
         try:
             grant = await self._api.refresh_token()
         except (RunnerError, ValidationError) as exc:
-            if datetime.now(UTC) >= self._expires_at:
+            if refused or datetime.now(UTC) >= self._expires_at:
                 raise
             logger.warning("GitHub token refresh failed, using the current one: %s", exc)
             return
         self._token, self._expires_at = grant.github_token, grant.token_expires_at
+        self.received.append(grant.github_token)
         logger.info("Refreshed the GitHub token, now valid until %s", self._expires_at)
+
+    async def revoke(self, http: httpx.AsyncClient) -> None:
+        """Revoke every token received, best effort, so none outlives the run.
+        Adapted from Pullfrog's utils/token.ts (MIT, Copyright (c) 2026
+        Pullfrog, Inc.)."""
+        await asyncio.gather(*(_revoke(http, token) for token in self.received))
+
+
+async def _revoke(http: httpx.AsyncClient, token: SecretStr) -> None:
+    try:
+        resp = await http.request(
+            "DELETE",
+            f"{GITHUB_API_URL}/installation/token",
+            headers={
+                "Authorization": f"token {token.get_secret_value()}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=10,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("Could not revoke a GitHub token: %s", type(exc).__name__)
+        return
+    # 401: the token had already expired or been revoked.
+    if resp.status_code not in (204, 401):
+        logger.warning("Revoking a GitHub token answered HTTP %s", resp.status_code)
 
 
 @dataclass(frozen=True)
@@ -315,9 +359,25 @@ def usage_report(llms: Iterable[Any]) -> UsageReport:
 
 def _safe_error(exc: BaseException) -> str:
     """A short error for the job record and the PR's check, without the
-    exception's own text unless Mira wrote it to be shown."""
+    exception's own text unless Mira wrote it to be shown. A model
+    provider's refusal leads with its cause."""
     message = exc.safe_message if isinstance(exc, MiraError) else ""
-    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    kind = classify_provider_error(exc)
+    return f"Review failed: {kind} ({error})" if kind else error
+
+
+# Actions stops a cancelled run with SIGINT, then SIGTERM 7.5 s later, and
+# kills it 2.5 s after that. Reporting and revoking must fit in between.
+_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+_REPORT_AFTER_STOP_S = 6.0
+_REVOKE_AFTER_STOP_S = 2.0
+
+# What report-failure tells the server, by why the review step ended.
+REPORTED_FAILURES = {
+    "cancelled": "Review stopped: the Actions run was cancelled before the review reported",
+    "failed": "Review failed: the review step ended before it reported a result",
+}
 
 
 async def run_job(
@@ -327,8 +387,13 @@ async def run_job(
     server_url: str,
     audience: str,
     llm: RunnerLLM,
+    timeout: timedelta | None = None,
 ) -> int:
-    """Claim, review and report one job. Returns the process exit code."""
+    """Claim, review and report one job. Returns the process exit code.
+
+    The first SIGINT or SIGTERM, which is how Actions cancels a run, or the
+    end of ``timeout`` stops the review, and the job is reported failed with
+    the reason. The run revokes its GitHub tokens before it returns."""
     api = RunnerAPI(http, server_url, job_id, audience)
     try:
         spec = await api.claim()
@@ -339,50 +404,115 @@ async def run_job(
         return 0
     logger.info("Claimed job %s: %s at %s", job_id, spec.pr_url, spec.head_sha[:12])
 
+    tokens = TokenSupplier(api, spec)
     store = RemoteStateStore(spec.snapshot)
+    # Filled as the LLMs are made, so a failed review still reports their usage.
     llms: list[Any] = []
-    try:
-        config = job_config(spec, llm)
-        llms = [
-            create_llm(llm_config_for(purpose, config.llm, use_dashboard=False))
-            for purpose in ("review", "indexing", "security")
-        ]
-        # A missing secret fails the job here, not after a review of failed calls.
-        for each in {id(each): each for each in llms}.values():
-            each.preflight()
-        engine = ReviewEngine(
-            config=config,
-            llm=llms[0],
-            provider=GitHubProvider(TokenSupplier(api, spec)),
-            bot_name=spec.bot_name,
-            indexing_llm=llms[1],
-            security_llm=llms[2],
-            state=store,
-            check_run_id=spec.check_run_id,
-        )
-        result = await engine.review_pr(spec.pr_url)
-    except Exception as exc:
-        logger.exception("Review of %s failed", spec.pr_url)
-        bundle = store.bundle(job_id, "failed", error=_safe_error(exc), usage=usage_report(llms))
+    review = asyncio.create_task(_review(spec, llm, tokens, store, llms))
+    with _cancel_on_signal(review) as signals:
         try:
-            await api.post_result(bundle)
-        except RunnerError as post_exc:
-            logger.error("Could not report the failure: %s", post_exc)
-        return 1
+            error = await _review_error(review, signals, timeout, spec.pr_url)
+            outcome: Literal["succeeded", "failed"] = "failed" if error else "succeeded"
+            bundle = store.bundle(job_id, outcome, error=error, usage=usage_report(llms))
+            try:
+                async with asyncio.timeout(_REPORT_AFTER_STOP_S if signals else None):
+                    await api.post_result(bundle)
+            except (RunnerError, TimeoutError) as exc:
+                logger.error("Could not post the result of job %s: %r", job_id, exc)
+                return 1
+            return 1 if error else 0
+        finally:
+            with suppress(TimeoutError):
+                async with asyncio.timeout(_REVOKE_AFTER_STOP_S if signals else None):
+                    await tokens.revoke(http)
 
-    error = ""
+
+async def _review(
+    spec: JobSpec, llm: RunnerLLM, tokens: TokenSupplier, store: RemoteStateStore, llms: list[Any]
+) -> ReviewResult:
+    config = job_config(spec, llm)
+    llms += [
+        create_llm(llm_config_for(purpose, config.llm, use_dashboard=False))
+        for purpose in ("review", "indexing", "security")
+    ]
+    # A missing secret fails the job here, not after a review of failed calls.
+    for each in {id(each): each for each in llms}.values():
+        each.preflight()
+    engine = ReviewEngine(
+        config=config,
+        llm=llms[0],
+        provider=GitHubProvider(tokens, on_unauthorized=tokens.invalidate),
+        bot_name=spec.bot_name,
+        indexing_llm=llms[1],
+        security_llm=llms[2],
+        state=store,
+        check_run_id=spec.check_run_id,
+    )
+    return await engine.review_pr(spec.pr_url)
+
+
+async def _review_error(
+    review: asyncio.Task[ReviewResult], signals: list[str], timeout: timedelta | None, pr_url: str
+) -> str:
+    """Wait for the review. Returns why the job failed, or "" if it did not."""
+    try:
+        result = await asyncio.wait_for(review, timeout.total_seconds() if timeout else None)
+    except asyncio.CancelledError:
+        if not signals:
+            raise
+        logger.error("Review of %s stopped by %s", pr_url, signals[0])
+        return "Review stopped: the Actions run was cancelled before the review finished"
+    except Exception as exc:
+        if isinstance(exc, TimeoutError) and review.cancelled() and timeout:
+            logger.error("Review of %s did not finish within %s", pr_url, timeout)
+            return f"Review timed out after {int(timeout.total_seconds() // 60)} minutes"
+        logger.exception("Review of %s failed", pr_url)
+        return _safe_error(exc)
     if result.all_chunks_failed:
         # Nothing was reviewed. A partial failure still succeeds: the engine
         # records the failed paths as retryable. The reasons are Mira's own text.
         reasons = "; ".join(sorted({f.reason for f in result.failed_chunks if f.reason}))
         error = f"Review failed: all {result.total_chunks} review chunk(s) failed ({reasons})"
         logger.error("%s", error)
-    else:
-        logger.info("Reviewed %s: %d comments", spec.pr_url, len(result.comments))
-    outcome: Literal["succeeded", "failed"] = "failed" if error else "succeeded"
+        return error
+    logger.info("Reviewed %s: %d comments", pr_url, len(result.comments))
+    return ""
+
+
+@contextmanager
+def _cancel_on_signal(task: asyncio.Task[Any]) -> Iterator[list[str]]:
+    """Cancel ``task`` on the first SIGINT or SIGTERM. Later ones are
+    ignored, so the run can still report. Yields the signals received."""
+    loop = asyncio.get_running_loop()
+    received: list[str] = []
+
+    def stop(sig: signal.Signals) -> None:
+        received.append(sig.name)
+        if len(received) == 1:
+            logger.warning("Got %s: stopping the review and reporting it", sig.name)
+            task.cancel()
+
+    for sig in _STOP_SIGNALS:
+        loop.add_signal_handler(sig, stop, sig)
     try:
-        await api.post_result(store.bundle(job_id, outcome, error=error, usage=usage_report(llms)))
+        yield received
+    finally:
+        for sig in _STOP_SIGNALS:
+            loop.remove_signal_handler(sig)
+
+
+async def report_failure(
+    http: httpx.AsyncClient, *, job_id: str, server_url: str, audience: str, reason: str
+) -> int:
+    """Post a failed result for a job whose review step ended without
+    reporting, for the workflow's last step. The server applies only a
+    job's first result and leaves a superseded job's check alone, so a run
+    that did report keeps its result."""
+    api = RunnerAPI(http, server_url, job_id, audience)
+    bundle = ResultBundle(job_id=job_id, outcome="failed", error=REPORTED_FAILURES[reason])
+    try:
+        await api.post_result(bundle)
     except RunnerError as exc:
-        logger.error("Could not post the result of job %s: %s", job_id, exc)
+        logger.error("Could not report job %s as failed: %s", job_id, exc)
         return 1
-    return 1 if error else 0
+    return 0

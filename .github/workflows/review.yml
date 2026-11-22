@@ -39,6 +39,9 @@ on:
       MIRA_LLM_API_KEY:
         description: Key for the endpoint in the MIRA_RUNNER_LLM_BASE_URL variable
         required: false
+      ANTHROPIC_CUSTOM_HEADERS:
+        description: 'Extra headers for the ANTHROPIC_BASE_URL gateway, one "Name: value" per line'
+        required: false
 
 permissions: {}
 
@@ -119,12 +122,14 @@ jobs:
           claude --version
 
       - name: Review
+        id: review
         working-directory: ${{ runner.temp }}/mira/work
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
+          ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}
           # In a reusable workflow, vars are the calling repo's variables.
           # Each is optional; an unset one is empty and means the default.
           MIRA_RUNNER_LLM_PROVIDER: ${{ vars.MIRA_RUNNER_LLM_PROVIDER }}
@@ -138,4 +143,18 @@ jobs:
           API_TIMEOUT_MS: ${{ vars.API_TIMEOUT_MS }}
           JOB_ID: ${{ inputs.job_id }}
           SERVER_URL: ${{ inputs.server_url }}
-        run: mira runner --job "$JOB_ID" --server "$SERVER_URL"
+        # Under the job's timeout-minutes, so the review stops and reports
+        # "timed out" itself. On a cancel it reports from its signal handler.
+        run: mira runner --job "$JOB_ID" --server "$SERVER_URL" --timeout-minutes 80
+
+      # For a review step that died before it could report, such as one
+      # killed at the end of the cancel grace period. A job that already has
+      # a result, or was superseded, keeps it.
+      - name: Report a review that ended without a result
+        if: (cancelled() || failure()) && (steps.review.outcome == 'cancelled' || steps.review.outcome == 'failure')
+        timeout-minutes: 2
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          SERVER_URL: ${{ inputs.server_url }}
+          REASON: ${{ steps.review.outcome == 'cancelled' && 'cancelled' || 'failed' }}
+        run: mira runner report-failure --job "$JOB_ID" --server "$SERVER_URL" --reason "$REASON"

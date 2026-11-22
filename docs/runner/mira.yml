@@ -38,3 +38,4 @@ jobs:
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
       MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
+      ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}

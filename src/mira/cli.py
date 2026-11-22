@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import UTC
+from collections.abc import Callable
+from datetime import UTC, timedelta
+from typing import Any
 
 import click
 
@@ -274,18 +276,47 @@ def review(
         sys.exit(1)
 
 
-@main.command()
-@click.option("--job", "job_id", required=True, help="The job_id input of the dispatched run")
-@click.option(
-    "--server", "server_url", required=True, help="The Mira server's URL (server_url input)"
-)
-@click.option(
-    "--audience",
-    envvar="MIRA_RUNNER_OIDC_AUDIENCE",
-    default="mira",
-    show_default=True,
-    help="Audience of the OIDC token, the server's review.runner_oidc_audience",
-)
+def _runner_job_options(required: bool) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """The options naming the job and the server, for ``runner`` and its commands."""
+
+    def decorate(command: Callable[..., Any]) -> Callable[..., Any]:
+        command = click.option(
+            "--audience",
+            envvar="MIRA_RUNNER_OIDC_AUDIENCE",
+            default="mira",
+            show_default=True,
+            help="Audience of the OIDC token, the server's review.runner_oidc_audience",
+        )(command)
+        command = click.option(
+            "--server",
+            "server_url",
+            required=required,
+            help="The Mira server's URL (server_url input)",
+        )(command)
+        return click.option(
+            "--job", "job_id", required=required, help="The job_id input of the dispatched run"
+        )(command)
+
+    return decorate
+
+
+def _runner_server_url(server_url: str) -> str:
+    from mira.config import check_runner_server_url
+
+    try:
+        return check_runner_server_url(server_url)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _runner_http() -> Any:
+    import httpx
+
+    return httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15))
+
+
+@main.group(invoke_without_command=True)
+@_runner_job_options(required=False)
 @click.option(
     "--llm-provider",
     envvar="MIRA_RUNNER_LLM_PROVIDER",
@@ -314,40 +345,49 @@ def review(
     default=None,
     help="Protocol of the endpoint. Default: chat",
 )
-@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--timeout-minutes",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Stop the review after this long and report it timed out. Keep it under the "
+    "job's timeout-minutes",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose logging. On by itself when RUNNER_DEBUG=1 or ACTIONS_STEP_DEBUG=true",
+)
+@click.pass_context
 def runner(
-    job_id: str,
-    server_url: str,
+    ctx: click.Context,
+    job_id: str | None,
+    server_url: str | None,
     audience: str,
     llm_provider: str | None,
     model: str | None,
     llm_base_url: str | None,
     llm_api_style: str | None,
+    timeout_minutes: int | None,
     verbose: bool,
 ) -> None:
     """Review a dispatched job inside its GitHub Actions run."""
+    if ctx.invoked_subcommand is not None:
+        return
     import os
     import tempfile
 
-    import httpx
-
-    from mira.config import check_runner_server_url
+    from mira.actions_log import setup_runner_logging
     from mira.runner_client import RunnerLLM, run_job
 
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(name)s %(levelname)s: %(message)s",
-        stream=sys.stdout,
-    )
-    try:
-        server_url = check_runner_server_url(server_url)
-    except ValueError as exc:
-        raise click.UsageError(str(exc)) from exc
+    if not job_id or not server_url:
+        raise click.UsageError("Missing option '--job' or '--server'.")
+    setup_runner_logging(verbose)
+    server_url = _runner_server_url(server_url)
     # The runner keeps no index. An empty one, in a directory of its own.
     os.environ.setdefault("MIRA_INDEX_DIR", tempfile.mkdtemp(prefix="mira-index-"))
 
     async def _run() -> int:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60, connect=15)) as http:
+        async with _runner_http() as http:
             return await run_job(
                 http,
                 job_id=job_id,
@@ -359,6 +399,36 @@ def runner(
                     base_url=llm_base_url or None,
                     api_style=llm_api_style,
                 ),
+                timeout=timedelta(minutes=timeout_minutes) if timeout_minutes else None,
+            )
+
+    sys.exit(asyncio.run(_run()))
+
+
+@runner.command("report-failure")
+@_runner_job_options(required=True)
+@click.option(
+    "--reason",
+    type=click.Choice(["cancelled", "failed"]),
+    default="failed",
+    show_default=True,
+    help="Why the review step ended without a result",
+)
+def runner_report_failure(job_id: str, server_url: str, audience: str, reason: str) -> None:
+    """Report a job failed when its review step ended without reporting.
+
+    For the review workflow's last step. A job that already has a result,
+    or was superseded, keeps it."""
+    from mira.actions_log import setup_runner_logging
+    from mira.runner_client import report_failure
+
+    setup_runner_logging(verbose=False)
+    server_url = _runner_server_url(server_url)
+
+    async def _run() -> int:
+        async with _runner_http() as http:
+            return await report_failure(
+                http, job_id=job_id, server_url=server_url, audience=audience, reason=reason
             )
 
     sys.exit(asyncio.run(_run()))

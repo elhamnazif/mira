@@ -8,8 +8,9 @@ With ``ANTHROPIC_BASE_URL`` set, the CLI talks to an Anthropic-compatible
 gateway instead, such as Z.ai's GLM Coding Plan. The gateway's key comes from
 ``ANTHROPIC_AUTH_TOKEN`` (or ``ANTHROPIC_API_KEY``), and the
 ``ANTHROPIC_DEFAULT_*_MODEL`` variables map ``--model sonnet`` and the other
-aliases to the gateway's models. A subscription token is never sent to a
-gateway.
+aliases to the gateway's models. ``ANTHROPIC_CUSTOM_HEADERS`` adds request
+headers for the gateway and is redacted from output like the key. A
+subscription token is never sent to a gateway.
 
 Security posture of every invocation (checked against Claude Code 2.1.330):
 
@@ -23,6 +24,9 @@ Security posture of every invocation (checked against Claude Code 2.1.330):
 * Completion mode passes ``--tools ""``, so no tools exist. Workspace mode
   passes ``--tools Read,Grep,Glob`` and pre-approves ``Read(./**)``. That
   rule also bounds Grep and Glob, so reads outside the checkout are denied.
+* Managed settings, such as ``/etc/claude-code/managed-settings.json``,
+  still apply: ``--setting-sources`` does not cover them. Mira logs a
+  warning when one exists.
 * ``--bare`` is deliberately not used: in bare mode the CLI never reads
   OAuth credentials, which would break subscription auth.
 * The child process gets a scrubbed environment and a throwaway ``HOME``
@@ -31,17 +35,26 @@ Security posture of every invocation (checked against Claude Code 2.1.330):
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
+from pathlib import Path
 from typing import Any
 
+from mira.config import LLMConfig
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult
+
+logger = logging.getLogger(__name__)
 
 # Credentials Claude Code accepts, in the order they are preferred.
 _AUTH_ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # With ANTHROPIC_BASE_URL set, only a key meant for that gateway is sent.
 _GATEWAY_AUTH_ENV_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+# Extra request headers for the gateway, one "Name: value" per line. They
+# often carry auth, so they are handled like the key.
+_GATEWAY_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS"
 # Gateway settings the CLI reads. None of them is a secret.
 _GATEWAY_ENV_KEYS = (
     "ANTHROPIC_BASE_URL",
@@ -60,13 +73,37 @@ _DEFAULT_MODEL_IDS = frozenset({"", "default", "claude-code-default"})
 _WORKSPACE_TOOLS = "Read,Grep,Glob"
 _WORKSPACE_ALLOW_RULE = "Read(./**)"
 
+# Claude Code applies managed settings even with --setting-sources "". Other
+# tools write them on shared self-hosted runners: Pullfrog writes the Linux
+# one (agents/claude.ts, MIT).
+MANAGED_SETTINGS_PATHS = (
+    Path("/etc/claude-code/managed-settings.json"),
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+)
+
 _RATE_LIMIT_MARKERS = ("usage limit", "rate limit", "limit reached", "rate_limit")
 _AUTH_MARKERS = ("not logged in", "invalid api key", "oauth token", "authentication")
+
+
+@functools.cache
+def warn_about_managed_settings() -> None:
+    """Warn once per process for each managed settings file on this machine."""
+    for path in MANAGED_SETTINGS_PATHS:
+        if path.exists():
+            logger.warning(
+                '%s exists. Claude Code applies it even with --setting-sources "", so its '
+                "hooks, permissions and other settings apply to Mira's reviews here too",
+                path,
+            )
 
 
 class ClaudeCodeProvider(AgentCLIProvider):
     harness = "claude-code"
     error_prefix = "claude"
+
+    def __init__(self, config: LLMConfig) -> None:
+        super().__init__(config)
+        warn_about_managed_settings()
 
     @property
     def _executable(self) -> str:
@@ -79,12 +116,28 @@ class ClaudeCodeProvider(AgentCLIProvider):
         return self.config.claude_timeout_seconds
 
     def _auth_env(self) -> dict[str, str]:
-        keys = _GATEWAY_AUTH_ENV_KEYS if os.environ.get("ANTHROPIC_BASE_URL") else _AUTH_ENV_KEYS
+        gateway = bool(os.environ.get("ANTHROPIC_BASE_URL"))
+        keys = _GATEWAY_AUTH_ENV_KEYS if gateway else _AUTH_ENV_KEYS
         for key in keys:
             value = os.environ.get(key)
             if value:
-                return {key: value}
+                headers = os.environ.get(_GATEWAY_HEADERS_ENV_KEY) if gateway else None
+                return {key: value, **({_GATEWAY_HEADERS_ENV_KEY: headers} if headers else {})}
         raise NonRetriableLLMError("claude_auth_missing", keys=", ".join(keys))
+
+    def _secret_values(self) -> list[str]:
+        """The credentials, plus each gateway header's value on its own, since
+        output can quote one header without the others."""
+        values = super()._secret_values()
+        try:
+            headers = self._auth_env().get(_GATEWAY_HEADERS_ENV_KEY, "")
+        except LLMError:
+            headers = ""
+        for line in headers.splitlines():
+            value = line.partition(":")[2].strip()
+            if len(value) >= 8:
+                values.append(value)
+        return values
 
     def _extra_env(self) -> dict[str, str]:
         return {
