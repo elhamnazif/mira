@@ -6,6 +6,7 @@ from mira.config import MiraConfig
 from mira.llm.prompts.review import (
     build_dependency_review_prompt,
     build_review_prompt,
+    build_security_review_prompt,
 )
 from mira.models import FileChangeType, FileDiff, HunkInfo
 
@@ -50,6 +51,22 @@ class TestBuildReviewPrompt:
         assert "Mira" in system
         assert "submit_review" in system
         assert "blocker" in system
+
+    def test_severity_measures_impact_not_certainty(self):
+        files = [FileDiff(path="test.py", change_type=FileChangeType.MODIFIED)]
+        system = _system_text(build_review_prompt(files, MiraConfig()))
+        assert "Severity measures the impact if the finding is real, not how sure you are" in system
+        assert "put doubt in `confidence`" in system
+        assert (
+            "A `bug`, `security`, `race-condition` or `resource-leak` finding is at least"
+            " `warning`." in system
+        )
+
+    def test_security_prompt_keeps_security_findings_at_warning(self):
+        files = [FileDiff(path="test.py", change_type=FileChangeType.MODIFIED)]
+        system = _system_text(build_security_review_prompt(files))
+        assert "A `security` finding is never below `warning`." in system
+        assert "`suggestion` for hardening" not in system
 
     def test_includes_file_paths(self):
         files = [

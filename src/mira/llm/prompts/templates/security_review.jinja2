@@ -50,7 +50,7 @@ Reading the diff this closely, you will sometimes spot a plain bug that is not a
 
 - **Only flag what's in the diff** — don't speculate about code you can't see.
 - **One comment per issue.** Cite file + line range. Be specific about why it's a vulnerability and what the attack vector is.
-- **Severity:** `blocker` for exploitable-in-prod issues (authn/authz bypass, RCE, SQLi, XSS in user-facing surface). `warning` for issues that need a specific config or attacker capability. `suggestion` for hardening / defense-in-depth.
+- **Severity:** `blocker` for exploitable-in-prod issues (authn/authz bypass, RCE, SQLi, XSS in user-facing surface). `warning` for issues that need a specific config or attacker capability, and for hardening / defense-in-depth. A `security` finding is never below `warning`.
 - **Confidence:** be honest. Use 0.8+ only when the diff alone proves the vulnerability. Pattern-matching on a name (e.g. "this looks like an auth function") is 0.6, not 0.9.
 - **No nitpicks.** If the only argument is "could be more defensive," skip it.
 - **Set every security finding's `category` to `security`** so they're recognised downstream; only the non-security defects described above use another category.
