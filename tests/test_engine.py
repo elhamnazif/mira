@@ -1184,6 +1184,32 @@ class TestCheckRunLifecycle:
         assert finish.kwargs["details"] == ""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("start_fails", [False, True])
+    async def test_review_pr_reuses_a_queued_check_run(
+        self, mock_llm: LLMProvider, mock_provider: AsyncMock, start_fails: bool
+    ):
+        pr_info = await mock_provider.get_pr_info("https://github.com/test/repo/pull/1")
+        mock_provider.get_pr_info.return_value = replace(pr_info, head_sha="deadbeef")
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=[])
+        if start_fails:
+            mock_provider.start_queued_check_run.side_effect = RuntimeError("502")
+
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            state=LocalStateStore(),
+            check_run_id=77,
+        )
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        mock_provider.start_check_run.assert_not_awaited()
+        start = mock_provider.start_queued_check_run.await_args
+        assert start.args[1] == 77 and "In Progress" in start.kwargs["title"]
+        finish = mock_provider.finish_check_run.await_args
+        assert finish.args[1:3] == (77, "success")
+
+    @pytest.mark.asyncio
     async def test_review_pr_dry_run_skips_check_runs(
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):

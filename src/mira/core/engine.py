@@ -609,13 +609,18 @@ class ReviewEngine:
         indexing_llm: LLMProviderProtocol | None = None,
         security_llm: LLMProviderProtocol | None = None,
         state: ReviewStateStore | None = None,
+        check_run_id: int | None = None,
     ) -> None:
+        """``check_run_id`` names a check run already queued for this PR's head,
+        as the server does for an Actions runner. The review starts and
+        completes that run instead of creating its own."""
         self.config = config
         self.llm = llm
         self.indexing_llm = indexing_llm or llm
         self.security_llm = security_llm or llm
         self.provider = provider
         self.state = state
+        self.check_run_id = check_run_id
         self.bot_name = bot_name
         self.dry_run = dry_run
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
@@ -717,18 +722,28 @@ class ReviewEngine:
 
     async def _start_check(self, pr_info: PRInfo) -> int | None:
         """Best-effort: start a check run for the head commit; never fails a review."""
-        if self.dry_run or self.provider is None or not pr_info.head_sha:
+        if self.dry_run or self.provider is None:
             return None
+        title, summary = "Code Review In Progress", "Mira is analyzing your code changes…"
         try:
+            if self.check_run_id is not None:
+                await self.provider.start_queued_check_run(
+                    pr_info,
+                    self.check_run_id,
+                    title=title,
+                    summary=summary,
+                    details_url=pr_info.url,
+                )
+                return self.check_run_id
+            if not pr_info.head_sha:
+                return None
             return await self.provider.start_check_run(
-                pr_info,
-                title="Code Review In Progress",
-                summary="Mira is analyzing your code changes…",
-                details_url=pr_info.url,
+                pr_info, title=title, summary=summary, details_url=pr_info.url
             )
         except Exception as exc:
             logger.warning("Failed to start check run for %s: %s", pr_info.url, exc)
-            return None
+            # A queued run still gets its conclusion.
+            return self.check_run_id
 
     @staticmethod
     def _check_details(result: ReviewResult | None) -> str:

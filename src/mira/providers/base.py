@@ -113,6 +113,19 @@ class BaseProvider(abc.ABC):
         """
         return None
 
+    async def start_queued_check_run(
+        self,
+        pr_info: PRInfo,
+        run_id: int,
+        *,
+        title: str = "",
+        summary: str = "",
+        details_url: str = "",
+    ) -> None:
+        """Move a check run someone else queued, such as the server for an
+        Actions runner, to in progress. No-op default."""
+        return
+
     async def finish_check_run(
         self,
         pr_info: PRInfo,

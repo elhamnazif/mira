@@ -719,6 +719,32 @@ class GitHubProvider(BaseProvider):
             raise ProviderError(f"GitHub POST {url} → {resp.status_code}: {resp.text[:300]}")
         return int(resp.json()["id"])
 
+    async def start_queued_check_run(
+        self,
+        pr_info: PRInfo,
+        run_id: int,
+        *,
+        title: str = "",
+        summary: str = "",
+        details_url: str = "",
+    ) -> None:
+        token = await self._resolve_token()
+        url = f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/check-runs/{run_id}"
+        payload: dict[str, Any] = {
+            "status": "in_progress",
+            "started_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "output": {"title": title or CHECK_RUN_NAME, "summary": summary, "text": ""},
+        }
+        if details_url:
+            payload["details_url"] = details_url
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.patch(url, json=payload, headers=self._check_run_headers(token))
+        except (ConnectionError, TimeoutError, httpx.TransportError) as e:
+            raise ProviderError(f"GitHub PATCH {url} failed: {e}") from e
+        if resp.status_code != 200:
+            raise ProviderError(f"GitHub PATCH {url} → {resp.status_code}: {resp.text[:300]}")
+
     async def finish_check_run(
         self,
         pr_info: PRInfo,
