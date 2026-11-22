@@ -116,6 +116,12 @@ class LLMConfig(BaseModel):
     # Hard ceiling on one Claude Code call. The stall watchdog below ends a
     # hung call long before this.
     claude_timeout_seconds: int = Field(default=2700, gt=0)
+    # OpenCode CLI provider settings (provider: opencode). The model is
+    # ``<provider>/<model>`` and the credential is that provider's key, or its
+    # entry in OPENCODE_AUTH_CONTENT for a subscription (see OpenCodeProvider).
+    opencode_command: str = "opencode"
+    # Hard ceiling on one OpenCode call, like claude_timeout_seconds.
+    opencode_timeout_seconds: int = Field(default=2700, gt=0)
     # Stall watchdog for the agent-CLI providers (claude-code, opencode). A
     # call is killed when the model produces nothing for
     # first_event_timeout_seconds after it starts, or goes silent for
@@ -529,6 +535,8 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
         "codex_timeout_seconds",
         "claude_command",
         "claude_timeout_seconds",
+        "opencode_command",
+        "opencode_timeout_seconds",
         "first_event_timeout_seconds",
         "idle_timeout_seconds",
     }

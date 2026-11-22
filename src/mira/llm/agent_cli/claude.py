@@ -41,7 +41,7 @@ import os
 from typing import Any
 
 from mira.exceptions import LLMError, NonRetriableLLMError
-from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult
+from mira.llm.agent_cli.base import AgentCLIProvider, CLICall, CLIRunResult
 
 # Credentials Claude Code accepts, in the order they are preferred.
 _AUTH_ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
@@ -91,7 +91,7 @@ class ClaudeCodeProvider(AgentCLIProvider):
                 return {key: value}
         raise NonRetriableLLMError("claude_auth_missing", keys=", ".join(keys))
 
-    def _extra_env(self) -> dict[str, str]:
+    def _extra_env(self, call: CLICall) -> dict[str, str]:
         return {
             # A long-running server must not self-update its pinned CLI.
             "DISABLE_AUTOUPDATER": "1",

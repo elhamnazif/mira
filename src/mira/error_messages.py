@@ -190,6 +190,67 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Claude Code workspace review was given a missing directory: {path}",
         safe="Claude Code workspace review was given a missing directory",
     ),
+    # OpenCode CLI provider errors
+    "opencode_command_not_found": ErrorMessage(
+        full="OpenCode CLI command not found: {command!r}. Install opencode-ai or set llm.opencode_command.",
+        safe="OpenCode CLI command not found — install opencode-ai or set llm.opencode_command",
+    ),
+    "opencode_model_invalid": ErrorMessage(
+        full="OpenCode needs a model as <provider>/<model>, got {model!r}",
+        safe="OpenCode needs a model as <provider>/<model>",
+    ),
+    "opencode_auth_missing": ErrorMessage(
+        full="OpenCode provider {provider!r} needs {keys}",
+        safe="OpenCode credentials are not set: set {keys}",
+    ),
+    "opencode_auth_content_invalid": ErrorMessage(
+        full="OPENCODE_AUTH_CONTENT is not a JSON object of OpenCode credentials",
+        safe="OPENCODE_AUTH_CONTENT is not a JSON object of OpenCode credentials",
+    ),
+    "opencode_endpoint_invalid": ErrorMessage(
+        full="The openai-compatible endpoint needs {problem}",
+        safe="The openai-compatible endpoint needs {problem}",
+    ),
+    "opencode_auth_failed": ErrorMessage(
+        full="OpenCode's provider rejected its credentials: {detail}",
+        safe="OpenCode's provider rejected its credentials",
+    ),
+    "opencode_rate_limited": ErrorMessage(
+        full="OpenCode's provider hit a usage or rate limit: {detail}",
+        safe="OpenCode's provider hit a usage or rate limit",
+    ),
+    "opencode_timeout": ErrorMessage(
+        full="OpenCode CLI timed out after {seconds}s",
+        safe="OpenCode CLI timed out",
+    ),
+    "opencode_no_first_event": ErrorMessage(
+        full="OpenCode CLI produced no output in its first {seconds}s",
+        safe="OpenCode CLI produced no output",
+    ),
+    "opencode_stalled": ErrorMessage(
+        full="OpenCode CLI went silent for {seconds}s",
+        safe="OpenCode CLI stalled",
+    ),
+    "opencode_exit_failed": ErrorMessage(
+        full="OpenCode CLI failed with exit {exit_code}: {detail}",
+        safe="OpenCode CLI failed",
+    ),
+    "opencode_reported_error": ErrorMessage(
+        full="OpenCode CLI reported an error (exit {exit_code}): {detail}",
+        safe="OpenCode CLI reported an error",
+    ),
+    "opencode_empty_response": ErrorMessage(
+        full="OpenCode CLI returned an empty response",
+        safe="OpenCode CLI returned an empty response",
+    ),
+    "opencode_no_json_object": ErrorMessage(
+        full="OpenCode CLI response did not contain a JSON object: {excerpt}",
+        safe="OpenCode CLI response did not contain a JSON object",
+    ),
+    "opencode_workspace_missing": ErrorMessage(
+        full="OpenCode workspace review was given a missing directory: {path}",
+        safe="OpenCode workspace review was given a missing directory",
+    ),
 }
 
 
