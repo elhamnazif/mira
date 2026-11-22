@@ -1,10 +1,12 @@
 # ── Stage 1: build the React UI ───────────────────────────────────
 FROM node:20-slim AS ui-builder
 ARG CODEX_VERSION=0.145.0
+ARG CLAUDE_CODE_VERSION=2.1.330
 WORKDIR /ui
 COPY ui/mira/package.json ui/mira/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 RUN npm install --global --no-audit --no-fund "@openai/codex@${CODEX_VERSION}"
+RUN npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 COPY ui/mira/ ./
 RUN npm run build
 
@@ -13,6 +15,10 @@ FROM python:3.12-slim
 LABEL org.opencontainers.image.source="https://github.com/miracodeai/mira"
 LABEL org.opencontainers.image.description="Self-hostable AI code reviewer"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY . /app
@@ -23,6 +29,11 @@ RUN pip install --no-cache-dir "/app[serve,bedrock]"
 COPY --from=ui-builder /usr/local/bin/node /usr/local/bin/node
 COPY --from=ui-builder /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@openai/codex
 RUN ln -s /usr/local/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
+
+# Claude Code CLI is bundled for the claude-code backend, pinned above for the
+# same reason. Its postinstall puts a self-contained native binary at the
+# package's bin path, so copy that one file and leave node_modules behind.
+COPY --from=ui-builder /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude
 
 # Pull the built UI in from stage 1. webhooks.create_app() picks this up
 # automatically and serves it at / with SPA fallback.
