@@ -33,6 +33,8 @@ async def pr_workspace(source: CheckoutSource) -> AsyncIterator[Path]:
     # A short root: small models mangle long absolute paths.
     root = Path(tempfile.gettempdir()) / "mira-ws"
     root.mkdir(mode=0o700, exist_ok=True)
+    if os.name == "posix" and (root.is_symlink() or root.stat().st_uid != os.getuid()):
+        raise WorkspaceError(f"{root} is not a directory owned by this user")
     workspace = Path(tempfile.mkdtemp(prefix="", dir=root))
     try:
         await _checkout(workspace, source)
@@ -46,6 +48,9 @@ async def _checkout(workspace: Path, source: CheckoutSource) -> None:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_LFS_SKIP_SMUDGE"] = "1"
+    # Host git config could add hooks, URL rewrites or credential helpers.
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     fetch_env = dict(env)
     if source.auth_header:
         # Through the environment only, so the header never reaches argv or .git/config.

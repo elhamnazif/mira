@@ -106,3 +106,23 @@ async def test_fetched_commit_must_match_requested_sha(remote):
 
 def test_auth_header_not_in_repr():
     assert _HEADER not in repr(CheckoutSource("https://example.invalid/r.git", "a" * 40, _HEADER))
+
+
+@pytest.mark.asyncio
+async def test_host_git_config_cannot_run_hooks(remote, tmp_path, monkeypatch):
+    url, _, head = remote
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    marker = tmp_path / "hook-ran"
+    hook = hooks / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(f"[core]\n\thooksPath = {hooks}\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+
+    async with pr_workspace(CheckoutSource(url, head)) as ws:
+        assert (ws / "app.py").read_text() == "VERSION = 2\n"
+    assert not marker.exists()
