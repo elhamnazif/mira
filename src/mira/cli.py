@@ -14,6 +14,7 @@ from mira import __version__
 from mira.config import load_config
 from mira.core.engine import ReviewEngine
 from mira.core.git_snapshot import GitSnapshot
+from mira.core.state_store import LocalStateStore
 from mira.exceptions import MiraError
 from mira.llm import create_llm
 from mira.models import ReviewResult, Severity
@@ -249,6 +250,7 @@ def review(
         dry_run=dry_run,
         indexing_llm=indexing_llm,
         security_llm=security_llm,
+        state=LocalStateStore(),
     )
 
     try:

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from mira.config import FilterConfig, LLMConfig, MiraConfig, ReviewConfig, load_config
 from mira.core.engine import ReviewEngine
+from mira.core.state_store import LocalStateStore
 from mira.llm.provider import LLMProvider
 from mira.providers.github import GitHubProvider
 
@@ -89,7 +90,9 @@ async def _run_one(
     async with semaphore:
         llm = LLMProvider(config.llm)
         provider = GitHubProvider(token=os.environ["GITHUB_TOKEN"])
-        engine = ReviewEngine(config=config, llm=llm, provider=provider, dry_run=True)
+        engine = ReviewEngine(
+            config=config, llm=llm, provider=provider, dry_run=True, state=LocalStateStore()
+        )
 
         start = time.monotonic()
         error: str | None = None

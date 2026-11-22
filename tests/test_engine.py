@@ -21,6 +21,7 @@ from mira.core.engine import (
     _restrict_diff_to_paths,
     _security_relevant_files,
 )
+from mira.core.state_store import LocalStateStore
 from mira.core.threads import _extract_sections
 from mira.exceptions import ProviderError
 from mira.llm.provider import LLMProvider
@@ -173,7 +174,9 @@ class TestReviewEngine:
 
     @pytest.mark.asyncio
     async def test_review_pr(self, mock_llm: LLMProvider, mock_provider: AsyncMock):
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         mock_provider.get_pr_info.assert_called_once()
@@ -197,7 +200,9 @@ class TestReviewEngine:
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         mock_provider.post_review.assert_not_called()
@@ -432,7 +437,9 @@ class TestReviewEngine:
         config.review.include_summary = False
         config.review.code_context = False
         config.review.overlap.enabled = False
-        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
 
         result = (
             await engine.review_diff(sample_diff_text)
@@ -498,7 +505,9 @@ class TestReviewEngine:
     ):
         mock_llm.walkthrough.return_value = "{}"
         mock_provider.find_bot_comment.return_value = 42
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
 
         result = await engine.review_pr("https://github.com/owner/repo/pull/42")
 
@@ -554,7 +563,9 @@ class TestReviewEngine:
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         """Walkthrough placeholder + update happen before inline review posts."""
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Placeholder post + final walkthrough post (find_bot_comment mocked to None)
@@ -741,7 +752,9 @@ class TestReviewEngine:
         # subsequent lookups return the newly-created placeholder ID.
         mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 7, 7, 7, 7])
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # 1. One placeholder post.
@@ -777,7 +790,9 @@ class TestReviewEngine:
         placeholder and the final walkthrough — no new comment created."""
         mock_provider.find_bot_comment = AsyncMock(return_value=42)
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Placeholder update + final walkthrough update = 2 edits on comment 42
@@ -796,7 +811,9 @@ class TestReviewEngine:
         # lookup (after placeholder post) finds the newly-created comment by ID.
         mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 99, 99])
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Exactly one new comment (the placeholder); rest are updates.
@@ -820,7 +837,9 @@ class TestReviewEngine:
 
         mock_provider.update_comment = AsyncMock(side_effect=update)
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert any("PR walkthrough summary" in b for b in bodies), "final walkthrough was tried"
@@ -847,7 +866,9 @@ class TestReviewEngine:
         )
         mock_provider.find_bot_comment = AsyncMock(side_effect=[None, 7])
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert result.walkthrough is None
@@ -862,7 +883,9 @@ class TestReviewEngine:
         """If find_bot_comment raises, the review still completes."""
         mock_provider.find_bot_comment = AsyncMock(side_effect=RuntimeError("API error"))
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Review still completed
@@ -874,7 +897,9 @@ class TestReviewEngine:
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         """Final walkthrough markdown contains the summary."""
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Collect every comment body sent to GitHub, across posts and updates.
@@ -901,7 +926,9 @@ class TestReviewEngine:
         llm.count_tokens = MagicMock(return_value=100)
         llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         # Walkthrough was posted (placeholder + final) but without review stats
@@ -915,7 +942,9 @@ class TestReviewEngine:
         self, mock_llm: LLMProvider, mock_provider: AsyncMock
     ):
         """Outdated threads are NOT blindly resolved — only LLM-verified ones are."""
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         mock_provider.resolve_outdated_review_threads.assert_not_called()
@@ -1005,7 +1034,9 @@ class TestReviewEngine:
         mock_provider.get_pr_info.return_value = pr_info
         mock_provider.get_pr_diff.return_value = sample_diff_text
 
-        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=llm, provider=mock_provider, state=LocalStateStore()
+        )
 
         # Patch _review_diff_internal to raise directly — bypasses all internal
         # exception swallowing, tests the outer handler in review_pr.
@@ -1054,7 +1085,9 @@ class TestReviewEngine:
         mock_provider.get_pr_info.return_value = pr_info
         mock_provider.get_pr_diff.return_value = sample_diff_text
 
-        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=llm, provider=mock_provider, state=LocalStateStore()
+        )
 
         async def _raise_after_walkthrough(*args, **kwargs):
             cb = kwargs.get("on_walkthrough_ready")
@@ -1095,6 +1128,7 @@ class TestCheckRunLifecycle:
             llm=mock_llm,
             provider=mock_provider,
             dry_run=dry_run,
+            state=LocalStateStore(),
         )
 
     @pytest.mark.asyncio
@@ -1191,7 +1225,9 @@ class TestCheckRunLifecycle:
 
         config = MiraConfig()
         config.review.walkthrough = False
-        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert result is not None
@@ -1204,7 +1240,9 @@ class TestCheckRunLifecycle:
         config = MiraConfig()
         config.review.agentic_tools = False
         config.review.code_context = False
-        return ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+        return ReviewEngine(
+            config=config, llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
 
     @pytest.mark.asyncio
     async def test_review_pr_fetches_source_at_the_head_commit(
@@ -1222,7 +1260,9 @@ class TestCheckRunLifecycle:
 
         config = MiraConfig()
         config.review.agentic_tools = False
-        engine = ReviewEngine(config=config, llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         mock_provider.get_repo_tree.assert_awaited()
@@ -1311,7 +1351,11 @@ class TestCheckRunLifecycle:
         config.review.agentic_tools = False
         config.review.code_context = False
         engine = ReviewEngine(
-            config=config, llm=mock_llm, provider=mock_provider, bot_name="review-bot[bot]"
+            config=config,
+            llm=mock_llm,
+            provider=mock_provider,
+            bot_name="review-bot[bot]",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1477,7 +1521,12 @@ class TestDryRun:
         llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
-            config=MiraConfig(), llm=llm, provider=provider, bot_name="mira", dry_run=True
+            config=MiraConfig(),
+            llm=llm,
+            provider=provider,
+            bot_name="mira",
+            dry_run=True,
+            state=LocalStateStore(),
         )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1593,7 +1642,11 @@ class TestThreadResolution:
         llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
-            config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
+            config=MiraConfig(),
+            llm=llm,
+            provider=provider_with_threads,
+            bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1624,7 +1677,11 @@ class TestThreadResolution:
         config = MiraConfig()
         config.review.auto_resolve_conversations = False
         engine = ReviewEngine(
-            config=config, llm=llm, provider=provider_with_threads, bot_name="mira"
+            config=config,
+            llm=llm,
+            provider=provider_with_threads,
+            bot_name="mira",
+            state=LocalStateStore(),
         )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1658,7 +1715,11 @@ class TestThreadResolution:
         llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
-            config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
+            config=MiraConfig(),
+            llm=llm,
+            provider=provider_with_threads,
+            bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1694,7 +1755,11 @@ class TestThreadResolution:
         llm.complete_agentic = AsyncMock(return_value={"content": "", "tool_calls": []})
 
         engine = ReviewEngine(
-            config=MiraConfig(), llm=llm, provider=provider_with_threads, bot_name="mira"
+            config=MiraConfig(),
+            llm=llm,
+            provider=provider_with_threads,
+            bot_name="mira",
+            state=LocalStateStore(),
         )
 
         with patch(
@@ -1722,7 +1787,11 @@ class TestThreadResolution:
         mock_provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
 
         engine = ReviewEngine(
-            config=MiraConfig(), llm=mock_llm, provider=mock_provider, bot_name="mira"
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1739,7 +1808,11 @@ class TestThreadResolution:
         )
 
         engine = ReviewEngine(
-            config=MiraConfig(), llm=mock_llm, provider=mock_provider, bot_name="mira"
+            config=MiraConfig(),
+            llm=mock_llm,
+            provider=mock_provider,
+            bot_name="mira",
+            state=LocalStateStore(),
         )
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -1844,6 +1917,7 @@ class TestRoundDetectionWiring:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
@@ -1905,6 +1979,7 @@ class TestRoundDetectionWiring:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         engine._review_only_paths = {"src/skipped.py"}
         await engine.review_pr("https://github.com/o/r/pull/1")
@@ -1957,6 +2032,7 @@ class TestRoundDetectionWiring:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
@@ -2033,6 +2109,7 @@ class TestIncrementalDiff:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
@@ -2074,6 +2151,7 @@ class TestIncrementalDiff:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
@@ -2105,6 +2183,7 @@ class TestIncrementalDiff:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
@@ -2136,6 +2215,7 @@ class TestIncrementalDiff:
             llm=AsyncMock(),
             provider=mock_provider,
             bot_name="mira",
+            state=LocalStateStore(),
         )
         await engine.review_pr("https://github.com/o/r/pull/1")
 
@@ -2546,7 +2626,9 @@ class TestManifestFileSelection:
         # tiny source file survives (so we don't hit the no-files early return).
         config.review.max_file_size = 200
 
-        engine = ReviewEngine(config=config, llm=AsyncMock(), provider=None)
+        engine = ReviewEngine(
+            config=config, llm=AsyncMock(), provider=None, state=LocalStateStore()
+        )
         result = await engine._review_diff_internal(diff)
 
         assert result.reviewed_paths == ["src/app.py"], "manifest should be culled"
@@ -2744,7 +2826,9 @@ class TestGlobalRules:
         mock_db.get_repo.return_value = None
         monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         with self._capture_build() as mock_build:
             await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -2761,7 +2845,9 @@ class TestGlobalRules:
         monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
         monkeypatch.setattr("mira.dashboard.api._app_db", None)
 
-        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=mock_provider)
+        engine = ReviewEngine(
+            config=MiraConfig(), llm=mock_llm, provider=mock_provider, state=LocalStateStore()
+        )
         with self._capture_build() as mock_build:
             await engine.review_pr("https://github.com/test/repo/pull/1")
 
@@ -2918,7 +3004,9 @@ class TestAgenticToolsOnIndexedRepos:
         mock_llm.count_tokens = MagicMock(return_value=100)
         mock_llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        engine = ReviewEngine(config=config, llm=mock_llm, provider=self._make_provider())
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=self._make_provider(), state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert engine._agentic_source_fetcher is not None
@@ -2952,7 +3040,9 @@ class TestAgenticToolsOnIndexedRepos:
         mock_llm.count_tokens = MagicMock(return_value=100)
         mock_llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        engine = ReviewEngine(config=config, llm=mock_llm, provider=self._make_provider())
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=self._make_provider(), state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert engine._agentic_source_fetcher is None
@@ -3019,7 +3109,9 @@ class TestAgenticSecurityPass(TestAgenticToolsOnIndexedRepos):
         mock_llm.count_tokens = MagicMock(return_value=100)
         mock_llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        engine = ReviewEngine(config=config, llm=mock_llm, provider=self._make_provider())
+        engine = ReviewEngine(
+            config=config, llm=mock_llm, provider=self._make_provider(), state=LocalStateStore()
+        )
         await engine.review_pr("https://github.com/test/repo/pull/1")
         return engine
 
@@ -3260,7 +3352,13 @@ class TestIncrementalWalkthroughScope:
         monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
         config = MiraConfig()
         config.review.overlap.enabled = False
-        return ReviewEngine(config=config, llm=AsyncMock(), provider=provider, bot_name="mira")
+        return ReviewEngine(
+            config=config,
+            llm=AsyncMock(),
+            provider=provider,
+            bot_name="mira",
+            state=LocalStateStore(),
+        )
 
     @pytest.mark.asyncio
     async def test_round_2_reviews_push_but_describes_whole_pr(self, monkeypatch):

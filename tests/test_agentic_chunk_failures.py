@@ -11,6 +11,7 @@ from mira.config import MiraConfig
 from mira.core import engine as engine_mod
 from mira.core.engine import ReviewEngine, _response_excerpt
 from mira.core.passes import AgenticLoopResult, agentic_review_loop
+from mira.core.state_store import LocalStateStore
 from mira.exceptions import StructuredOutputError
 from mira.llm.base import _retriable
 from mira.llm.provider import LLMProvider
@@ -302,7 +303,7 @@ def _engine(
         cfg.review.dependency_overlap = False
         cfg.review.self_critique = False
         cfg.review.include_summary = True
-    return ReviewEngine(config=cfg, llm=llm, security_llm=security_llm)
+    return ReviewEngine(config=cfg, llm=llm, security_llm=security_llm, state=LocalStateStore())
 
 
 def _force_one_chunk_per_file(monkeypatch) -> None:

@@ -12,6 +12,7 @@ import pytest
 from mira.config import MiraConfig
 from mira.core.engine import ReviewEngine
 from mira.core.git_snapshot import GitSnapshot
+from mira.core.state_store import LocalStateStore
 from mira.core.workspace import CheckoutSource
 from mira.models import PRInfo
 
@@ -121,7 +122,7 @@ def _engine(llm: _FakeLLM, **llms: _FakeLLM) -> ReviewEngine:
     cfg.review.dependency_overlap = False
     cfg.review.self_critique = False
     cfg.review.second_look = False
-    return ReviewEngine(config=cfg, llm=llm, **llms)
+    return ReviewEngine(config=cfg, llm=llm, **llms, state=LocalStateStore())
 
 
 def _titles(result) -> list[str]:

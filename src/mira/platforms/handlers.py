@@ -15,6 +15,7 @@ from jinja2 import Environment, FileSystemLoader
 from mira.config import load_config
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
+from mira.core.state_store import LocalStateStore
 from mira.dashboard.models_config import llm_config_for
 from mira.index.store import IndexStore
 from mira.llm import create_llm
@@ -134,6 +135,7 @@ async def run_pr_review(
         bot_name=bot_name,
         indexing_llm=indexing_llm,
         security_llm=security_llm,
+        state=LocalStateStore(),
     )
 
     from mira.dashboard.api import _app_db
@@ -238,10 +240,9 @@ async def run_pr_command(
         logger.info("Help requested on %s by @%s", pr_url, actor)
         return
 
+    state = LocalStateStore()
     if is_review_rest:
-        from mira.dashboard.api import _app_db
-
-        progress = _app_db.get_pr_review_progress(owner, repo, number, platform=platform)
+        progress = state.get_pr_review_progress(owner, repo, number, platform=platform)
         if not progress or not progress.skipped_paths:
             pr_info_for_reply = await provider.get_pr_info(pr_url)
             await provider.post_comment(
@@ -257,6 +258,7 @@ async def run_pr_command(
             bot_name=bot_name,
             indexing_llm=indexing_llm,
             security_llm=security_llm,
+            state=state,
         )
         engine._review_only_paths = set(progress.skipped_paths)  # type: ignore[attr-defined]
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
@@ -279,6 +281,7 @@ async def run_pr_command(
             bot_name=bot_name,
             indexing_llm=indexing_llm,
             security_llm=security_llm,
+            state=state,
         )
         if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
             logger.info("Review already in progress for %s, skipping", pr_url)

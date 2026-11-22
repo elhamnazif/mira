@@ -32,6 +32,7 @@ from mira.core.passes import (
     self_critique,
 )
 from mira.core.priority import rank_files
+from mira.core.state_store import ReviewRecord, ReviewStateStore
 from mira.core.threads import (
     resolve_verified_threads,
     short_thread_description,
@@ -607,12 +608,14 @@ class ReviewEngine:
         dry_run: bool = False,
         indexing_llm: LLMProviderProtocol | None = None,
         security_llm: LLMProviderProtocol | None = None,
+        state: ReviewStateStore | None = None,
     ) -> None:
         self.config = config
         self.llm = llm
         self.indexing_llm = indexing_llm or llm
         self.security_llm = security_llm or llm
         self.provider = provider
+        self.state = state
         self.bot_name = bot_name
         self.dry_run = dry_run
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
@@ -811,6 +814,7 @@ class ReviewEngine:
         self,
         pr_info: PRInfo,
         diff_text: str,
+        state: ReviewStateStore,
     ) -> list[OverlapFinding]:
         """Detect other open PRs stepping on this one. Best-effort; never raises.
 
@@ -832,55 +836,57 @@ class ReviewEngine:
             if not current_paths:
                 return []
 
-            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
+            owner, repo, platform = pr_info.owner, pr_info.repo, pr_info.platform
+            store = IndexStore.open(owner, repo, platform=platform)
             try:
                 symbols: set[str] = set()
                 for path in current_paths:
                     summary = store.get_summary(path)
                     if summary:
                         symbols.update(s.name for s in summary.symbols)
-                current_fp = PRFingerprint(
-                    pr_number=pr_info.number,
-                    head_sha=pr_info.head_sha,
-                    title=pr_info.title,
-                    body=pr_info.description,
-                    paths=current_paths,
-                    symbols=sorted(symbols),
-                )
-                store.upsert_pr_fingerprint(current_fp)
-                cached = {
-                    fp.pr_number: fp
-                    for fp in store.list_pr_fingerprints()
-                    if fp.pr_number != pr_info.number
-                }
-
-                cfg = self.config.review.overlap
-                candidates = await provider.list_open_prs(
-                    pr_info.owner, pr_info.repo, limit=cfg.max_candidates
-                )
-                bot = (self.bot_name or "").removesuffix("[bot]").lower()
-                candidates = [
-                    c
-                    for c in candidates
-                    if c.number != pr_info.number
-                    and not c.draft
-                    and c.author.removesuffix("[bot]").lower() != bot
-                ]
-                if not candidates:
-                    return []
-
-                return await detect_overlaps(
-                    provider=provider,
-                    llm=self.llm,
-                    config=self.config,
-                    pr_info=pr_info,
-                    current=current_fp,
-                    cached=cached,
-                    candidates=candidates,
-                    save_fp=store.upsert_pr_fingerprint,
-                )
             finally:
                 store.close()
+            current_fp = PRFingerprint(
+                pr_number=pr_info.number,
+                head_sha=pr_info.head_sha,
+                title=pr_info.title,
+                body=pr_info.description,
+                paths=current_paths,
+                symbols=sorted(symbols),
+            )
+            state.upsert_pr_fingerprint(owner, repo, current_fp, platform=platform)
+            cached = {
+                fp.pr_number: fp
+                for fp in state.list_pr_fingerprints(owner, repo, platform=platform)
+                if fp.pr_number != pr_info.number
+            }
+
+            cfg = self.config.review.overlap
+            candidates = await provider.list_open_prs(owner, repo, limit=cfg.max_candidates)
+            bot = (self.bot_name or "").removesuffix("[bot]").lower()
+            candidates = [
+                c
+                for c in candidates
+                if c.number != pr_info.number
+                and not c.draft
+                and c.author.removesuffix("[bot]").lower() != bot
+            ]
+            if not candidates:
+                return []
+
+            def save_fp(fp: PRFingerprint) -> None:
+                state.upsert_pr_fingerprint(owner, repo, fp, platform=platform)
+
+            return await detect_overlaps(
+                provider=provider,
+                llm=self.llm,
+                config=self.config,
+                pr_info=pr_info,
+                current=current_fp,
+                cached=cached,
+                candidates=candidates,
+                save_fp=save_fp,
+            )
         except Exception as exc:
             logger.warning("Overlap detection failed, continuing: %s", exc)
             return []
@@ -889,6 +895,9 @@ class ReviewEngine:
         """Fetch PR metadata, publish a check run, and run the review pipeline."""
         if not self.provider:
             raise RuntimeError("A provider is required for PR review")
+        if self.state is None:
+            raise RuntimeError("A state store is required for PR review")
+        state = self.state
 
         pr_info = await self.provider.get_pr_info(pr_url)
         self._pr_info = pr_info
@@ -896,7 +905,7 @@ class ReviewEngine:
         run_id = await self._start_check(pr_info)
         try:
             async with self._pr_workspace(pr_info):
-                result = await self._review_pr(pr_info)
+                result = await self._review_pr(pr_info, state)
         except BaseException:
             await self._finish_check(pr_info, run_id, "failure", None)
             raise
@@ -935,7 +944,7 @@ class ReviewEngine:
                     logger.warning("PR checkout failed, reviewing without a workspace: %s", exc)
             yield
 
-    async def _review_pr(self, pr_info: PRInfo) -> ReviewResult:
+    async def _review_pr(self, pr_info: PRInfo, state: ReviewStateStore) -> ReviewResult:
         """Core review pipeline: review the fetched PR and post results.
 
         Runs thread resolution and diff fetching in parallel to reduce latency.
@@ -1048,9 +1057,7 @@ class ReviewEngine:
         full_diff_text = diff_text
         if review_round >= 2 and pr_info.head_sha:
             try:
-                from mira.dashboard.api import _app_db
-
-                last_sha = _app_db.get_last_reviewed_sha(
+                last_sha = state.get_last_reviewed_sha(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
@@ -1105,9 +1112,7 @@ class ReviewEngine:
 
         team_conventions = ""
         try:
-            from mira.dashboard.api import _app_db
-
-            repo_record = _app_db.get_repo(pr_info.owner, pr_info.repo)
+            repo_record = state.get_repo(pr_info.owner, pr_info.repo)
             if repo_record and repo_record.conventions:
                 team_conventions = repo_record.conventions
         except Exception:
@@ -1119,7 +1124,9 @@ class ReviewEngine:
         # surface in the walkthrough, which won't be posted.
         overlap_task = None
         if diff_text.strip():
-            overlap_task = _asyncio.create_task(self._detect_overlaps_safe(pr_info, full_diff_text))
+            overlap_task = _asyncio.create_task(
+                self._detect_overlaps_safe(pr_info, full_diff_text, state)
+            )
 
         try:
             result = await self._review_diff_internal(
@@ -1256,14 +1263,12 @@ class ReviewEngine:
                             # private; keep only dependents known public. Unknown
                             # visibility (NULL) is treated as private — safe until
                             # a sync records the real value.
-                            from mira.dashboard.api import _app_db
-
                             def _dep_private(name: str) -> bool | None:
                                 parts = name.split("/", 1)
-                                rec = _app_db.get_repo(*parts) if len(parts) == 2 else None
+                                rec = state.get_repo(*parts) if len(parts) == 2 else None
                                 return rec.private if rec else None
 
-                            reviewed = _app_db.get_repo(pr_info.owner, pr_info.repo)
+                            reviewed = state.get_repo(pr_info.owner, pr_info.repo)
                             kept = filter_blast_radius_for_visibility(
                                 dependents,
                                 reviewed.private if reviewed else None,
@@ -1412,11 +1417,8 @@ class ReviewEngine:
         result.thread_decisions = thread_decisions
 
         try:
-            import json as _json
-
             from mira.models import Severity
 
-            store = IndexStore.open(pr_info.owner, pr_info.repo, platform=pr_info.platform)
             blocker_count = sum(1 for c in result.comments if c.severity == Severity.BLOCKER)
             warning_count = sum(1 for c in result.comments if c.severity == Severity.WARNING)
             suggestion_count = sum(
@@ -1424,11 +1426,12 @@ class ReviewEngine:
             )
             categories = ",".join(sorted({c.category for c in result.comments if c.category}))
             duration = int((_time.monotonic() - _review_start) * 1000)
-            reviewed_paths_json = _json.dumps(result.reviewed_paths or [])
-            review_event = store.record_review(
+            review = ReviewRecord(
                 pr_number=pr_info.number,
                 pr_title=pr_info.title,
                 pr_url=pr_info.url,
+                author=pr_info.author,
+                author_avatar_url=pr_info.author_avatar_url,
                 comments_posted=len(result.comments),
                 blockers=blocker_count,
                 warnings=warning_count,
@@ -1438,17 +1441,10 @@ class ReviewEngine:
                 tokens_used=result.token_usage.get("total_tokens", 0),
                 duration_ms=duration,
                 categories=categories,
-                author=pr_info.author,
-                author_avatar_url=pr_info.author_avatar_url,
-                reviewed_paths=reviewed_paths_json,
-            )
-            # Persist each comment Mira posted so the dashboard can show the
-            # actual review conversation, not just aggregate counts.
-            store.add_review_comments(
-                review_event.id,
-                pr_info.number,
-                pr_info.url,
-                [
+                reviewed_paths=result.reviewed_paths or [],
+                # Each comment Mira posted, so the dashboard can show the
+                # actual review conversation, not just aggregate counts.
+                comments=[
                     {
                         "path": c.path,
                         "line": c.line,
@@ -1465,21 +1461,14 @@ class ReviewEngine:
                     for i, c in enumerate(result.comments)
                 ],
             )
-            try:
-                from mira.analysis.feedback import synthesize_rules
-
-                synthesize_rules(store)
-            except Exception as synth_err:
-                logger.debug("Feedback synthesis failed: %s", synth_err)
-            store.close()
+            state.record_review(pr_info.owner, pr_info.repo, review, platform=pr_info.platform)
 
             # Merge with any prior progress for this PR so @miracodeai review-rest
             # can target only the still-unreviewed paths.
             try:
-                from mira.dashboard.api import _app_db
                 from mira.dashboard.db import PRReviewProgress
 
-                prior = _app_db.get_pr_review_progress(
+                prior = state.get_pr_review_progress(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
@@ -1493,7 +1482,7 @@ class ReviewEngine:
                 new_skipped = (
                     prior_skipped | set(result.skipped_paths) | failed_paths
                 ) - new_reviewed
-                _app_db.upsert_pr_review_progress(
+                state.upsert_pr_review_progress(
                     PRReviewProgress(
                         owner=pr_info.owner,
                         repo=pr_info.repo,
@@ -1514,9 +1503,7 @@ class ReviewEngine:
         # nothing to compare against and falls back to a full review.
         if pr_info.head_sha:
             try:
-                from mira.dashboard.api import _app_db
-
-                _app_db.set_last_reviewed_sha(
+                state.set_last_reviewed_sha(
                     pr_info.owner,
                     pr_info.repo,
                     pr_info.number,
@@ -1854,12 +1841,14 @@ class ReviewEngine:
         custom_rules: list[dict[str, str]] = []
         try:
             pr_info = getattr(self, "_pr_info", None)
-            if pr_info is not None:
+            if pr_info is not None and self.state is not None:
                 _rules_store = IndexStore.open(
                     pr_info.owner, pr_info.repo, platform=pr_info.platform
                 )
 
-                learned_rules = _rules_store.get_learned_rules_text()
+                learned_rules = self.state.get_learned_rules(
+                    pr_info.owner, pr_info.repo, platform=pr_info.platform
+                )
 
                 for ctx in _rules_store.list_review_context():
                     custom_rules.append({"title": ctx.title, "content": ctx.content})
@@ -1867,14 +1856,11 @@ class ReviewEngine:
                 _rules_store.close()
 
                 try:
-                    from mira.dashboard.api import _app_db
-
-                    if _app_db is not None:
-                        for rule_text in _app_db.get_global_rules_text():
-                            parts = rule_text.split(": ", 1)
-                            title = parts[0] if len(parts) > 1 else "Global Rule"
-                            content = parts[1] if len(parts) > 1 else rule_text
-                            custom_rules.insert(0, {"title": title, "content": content})
+                    for rule_text in self.state.get_global_rules():
+                        parts = rule_text.split(": ", 1)
+                        title = parts[0] if len(parts) > 1 else "Global Rule"
+                        content = parts[1] if len(parts) > 1 else rule_text
+                        custom_rules.insert(0, {"title": title, "content": content})
                 except Exception:
                     pass
         except Exception:

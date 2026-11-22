@@ -10,6 +10,7 @@ import pytest
 from mira.config import MiraConfig
 from mira.core.engine import ReviewEngine, compose_pr_description
 from mira.core.passes import generate_pr_summary
+from mira.core.state_store import LocalStateStore
 from mira.llm.provider import LLMProvider
 from mira.models import (
     PR_SUMMARY_END,
@@ -265,6 +266,7 @@ def _make_engine(
         bot_name="mira",
         dry_run=dry_run,
         indexing_llm=indexing_llm or _indexing_llm(),
+        state=LocalStateStore(),
     ), llm
 
 
