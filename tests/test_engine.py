@@ -21,15 +21,18 @@ from mira.core.engine import (
     _restrict_diff_to_paths,
     _security_relevant_files,
 )
-from mira.core.state_store import LocalStateStore
+from mira.core.state_store import LocalStateStore, ReviewRecord
 from mira.core.threads import _extract_sections
+from mira.dashboard.db import PRReviewProgress
 from mira.exceptions import ProviderError
 from mira.llm.provider import LLMProvider
 from mira.models import (
     WALKTHROUGH_MARKER,
+    BotThreadRecord,
     FileChangeType,
     FileDiff,
     KeyIssue,
+    PRFingerprint,
     PRInfo,
     ReviewChunk,
     ReviewComment,
@@ -3657,3 +3660,150 @@ class TestOpenThreadKeyIssues:
             is_outdated=True,
         )
         assert _with_open_thread_issues([], [outdated]) == []
+
+
+class _RecordingStateStore:
+    """An in-memory ReviewStateStore that logs each call's name in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.last_sha: dict[int, str] = {}
+        self.progress: dict[int, PRReviewProgress] = {}
+        self.reviews: list[ReviewRecord] = []
+
+    def get_repo(self, owner, repo):
+        self.calls.append("get_repo")
+        return
+
+    def get_global_rules(self):
+        self.calls.append("get_global_rules")
+        return []
+
+    def get_learned_rules(self, owner, repo, *, platform):
+        self.calls.append("get_learned_rules")
+        return []
+
+    def get_last_reviewed_sha(self, owner, repo, pr_number, *, platform):
+        self.calls.append("get_last_reviewed_sha")
+        return self.last_sha.get(pr_number, "")
+
+    def set_last_reviewed_sha(self, owner, repo, pr_number, sha, *, platform):
+        self.calls.append("set_last_reviewed_sha")
+        self.last_sha[pr_number] = sha
+
+    def get_pr_review_progress(self, owner, repo, pr_number, *, platform):
+        self.calls.append("get_pr_review_progress")
+        return self.progress.get(pr_number)
+
+    def upsert_pr_review_progress(self, progress, *, platform):
+        self.calls.append("upsert_pr_review_progress")
+        self.progress[progress.pr_number] = progress
+
+    def record_review(self, owner, repo, review, *, platform):
+        self.calls.append("record_review")
+        self.reviews.append(review)
+
+    def list_pr_fingerprints(self, owner, repo, *, platform):
+        self.calls.append("list_pr_fingerprints")
+        return []
+
+    def upsert_pr_fingerprint(self, owner, repo, fingerprint, *, platform):
+        self.calls.append("upsert_pr_fingerprint")
+
+
+class TestReviewStateStoreCalls:
+    """review_pr reads and writes persistent state only through its store."""
+
+    def _provider(self, sample_diff_text: str, head_sha: str) -> AsyncMock:
+        provider = AsyncMock()
+        provider.get_pr_info.return_value = PRInfo(
+            title="Test PR",
+            description="",
+            base_branch="main",
+            head_branch="feature",
+            url="https://github.com/test/repo/pull/1",
+            number=1,
+            owner="test",
+            repo="repo",
+            head_sha=head_sha,
+        )
+        provider.get_pr_diff.return_value = sample_diff_text
+        provider.get_compare_diff.return_value = sample_diff_text
+        provider.get_all_bot_threads.return_value = []
+        provider.get_unresolved_bot_threads.return_value = []
+        provider.find_bot_comment.return_value = None
+        provider.list_open_prs.return_value = []
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_first_review_then_incremental_round(
+        self, mock_llm, sample_diff_text, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+        config = MiraConfig()
+        config.review.overlap.enabled = False
+        store = _RecordingStateStore()
+
+        first = self._provider(sample_diff_text, head_sha="sha-1")
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=first, state=store)
+        result = await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert store.calls == [
+            "get_repo",
+            "get_learned_rules",
+            "get_global_rules",
+            "get_repo",
+            "record_review",
+            "get_pr_review_progress",
+            "upsert_pr_review_progress",
+            "set_last_reviewed_sha",
+        ]
+        assert store.last_sha == {1: "sha-1"}
+        assert store.reviews[0].comments_posted == len(result.comments) > 0
+        assert store.progress[1].chunk_index == 1
+        first.get_compare_diff.assert_not_called()
+
+        # Round 2: an open bot thread from round 1 and a new head commit.
+        store.calls.clear()
+        second = self._provider(sample_diff_text, head_sha="sha-2")
+        second.get_all_bot_threads.return_value = [
+            BotThreadRecord(
+                thread_id="t1", path="src/utils.py", line=12, body="x", is_resolved=False
+            )
+        ]
+        engine = ReviewEngine(config=config, llm=mock_llm, provider=second, state=store)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert store.calls == [
+            "get_last_reviewed_sha",
+            "get_repo",
+            "get_learned_rules",
+            "get_global_rules",
+            "get_repo",
+            "record_review",
+            "get_pr_review_progress",
+            "upsert_pr_review_progress",
+            "set_last_reviewed_sha",
+        ]
+        args = second.get_compare_diff.call_args.args
+        assert (args[1], args[2]) == ("sha-1", "sha-2")
+        assert store.last_sha == {1: "sha-2"}
+        assert store.progress[1].chunk_index == 2
+        assert len(store.reviews) == 2
+
+    @pytest.mark.asyncio
+    async def test_overlap_caches_this_prs_fingerprint(
+        self, mock_llm, sample_diff_text, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+        store = _RecordingStateStore()
+        saved: list[PRFingerprint] = []
+        store.upsert_pr_fingerprint = lambda owner, repo, fp, *, platform: saved.append(fp)
+
+        provider = self._provider(sample_diff_text, head_sha="sha-1")
+        engine = ReviewEngine(config=MiraConfig(), llm=mock_llm, provider=provider, state=store)
+        await engine.review_pr("https://github.com/test/repo/pull/1")
+
+        assert [(fp.pr_number, fp.head_sha) for fp in saved] == [(1, "sha-1")]
+        assert saved[0].paths
+        assert "list_pr_fingerprints" in store.calls
