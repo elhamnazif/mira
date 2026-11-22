@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -48,6 +49,12 @@ def test_every_slug_points_at_known_data(slug: str) -> None:
         if sibling is not None:
             assert slugs.get(sibling) is not None
             assert slugs.all_slugs()[sibling].provider == model.provider
+
+
+def test_the_docs_list_every_slug() -> None:
+    docs = (Path(__file__).parents[1] / "docs" / "models.md").read_text()
+    for slug, model in slugs.all_slugs().items():
+        assert f"| `{slug}` | `{model.resolve}` |" in docs
 
 
 def test_a_slug_resolves_to_a_concrete_model() -> None:
