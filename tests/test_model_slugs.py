@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from mira.exceptions import ConfigError
+from mira.config import LLMConfig
+from mira.exceptions import ConfigError, LLMError, NonRetriableLLMError
 from mira.llm import provider_profiles, slugs
+from mira.llm.provider import LLMProvider
 from mira.llm.slugs import Harness
 
 _CLAUDE_ENV = (
@@ -163,3 +168,82 @@ def test_choose_harness(
 def test_an_override_that_cannot_run_a_slug_is_refused(override: str) -> None:
     with pytest.raises(ConfigError, match=override):
         slugs.choose_harness("zai/glm", {}, override)
+
+
+# ── Fallback on a missing model ──────────────────────────────────────
+
+
+def _response(status: int, body: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status
+    resp.json.return_value = body
+    resp.text = json.dumps(body)
+    return resp
+
+
+_OK = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+_MISSING = {"error": {"message": "The model `glm-5.3` does not exist", "code": "model_not_found"}}
+
+
+async def _complete(config: LLMConfig, answer) -> tuple[str, list[str]]:
+    models: list[str] = []
+
+    async def post(*args, **kwargs):
+        models.append(kwargs["json"]["model"])
+        return answer(kwargs["json"]["model"])
+
+    with patch("mira.llm.provider.httpx.AsyncClient") as client_cls:
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=post)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client_cls.return_value = client
+        result = await LLMProvider(config).complete([{"role": "user", "content": "hi"}])
+    return result, models
+
+
+@pytest.mark.parametrize("status", [400, 404])
+async def test_a_missing_model_falls_back_once(
+    status: int, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", "k" * 20)
+    config = slugs.resolve_config(
+        LLMConfig(model="zai/glm", reasoning_effort=None, max_retries=3), {}
+    )
+
+    result, models = await _complete(
+        config,
+        lambda model: _response(status, _MISSING) if model == "glm-5.3" else _response(200, _OK),
+    )
+
+    assert result == '{"ok": true}'
+    # Not retried: one try of the model, one of its fallback.
+    assert models == ["glm-5.3", "glm-5.3-flash"]
+    assert "trying fallback zai/glm-5.3-flash" in caplog.text
+
+
+async def test_a_missing_model_with_no_fallback_stays_a_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", "k" * 20)
+    config = slugs.resolve_config(LLMConfig(model="zai/glm-flash"), {})
+
+    with pytest.raises(NonRetriableLLMError, match="model missing or unavailable"):
+        await _complete(config, lambda model: _response(404, _MISSING))
+
+
+async def test_another_client_error_does_not_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", "k" * 20)
+    config = slugs.resolve_config(LLMConfig(model="zai/glm"), {})
+
+    with pytest.raises(NonRetriableLLMError) as exc:
+        await _complete(config, lambda model: _response(400, {"error": "bad request"}))
+    assert exc.value.code == "api_error"
+
+
+async def test_both_models_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", "k" * 20)
+    config = slugs.resolve_config(LLMConfig(model="zai/glm"), {})
+
+    with pytest.raises(LLMError, match="Both primary"):
+        await _complete(config, lambda model: _response(404, _MISSING))
