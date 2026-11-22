@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -681,3 +684,154 @@ async def test_without_a_refresher_a_401_is_not_retried() -> None:
 
     assert raised.value.status_code == 401
     assert len(calls) == 1
+
+
+def _signal_during_review(mock_llm: Any, before: Any = None) -> None:  # noqa: F811
+    """Make the review send this process SIGTERM, as Actions does on a
+    cancel, and then hang until it is cancelled."""
+
+    async def review(*_: Any, **__: Any) -> str:
+        if before is not None:
+            before()
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(5)
+        raise AssertionError("the review was not stopped")
+
+    mock_llm.review.side_effect = review
+
+
+def _completed_checks(github: GitHubChecks) -> list[tuple[dict[str, Any], str]]:
+    return [
+        (body, auth)
+        for m, url, body, auth in github.requests
+        if url.endswith("/check-runs/501") and body and body.get("status") == "completed"
+    ]
+
+
+async def test_a_cancelled_run_reports_once_revokes_and_exits(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    mock_llm,  # noqa: F811
+    revoked: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_job(db)
+    posted = _bundles(monkeypatch)
+    _signal_during_review(mock_llm)
+
+    assert await _run(server) == 1
+
+    assert [(b.outcome, b.error) for b in posted] == [
+        ("failed", "Review stopped: the Actions run was cancelled before the review finished")
+    ]
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.FAILED
+    assert revoked == ["ghs_job_token_1"]
+    # The server closed the check from the result; the runner left it to it.
+    [(body, auth)] = _completed_checks(github)
+    assert (body["conclusion"], auth) == ("failure", "token ghs_app_token")
+    assert "cancelled" in body["output"]["summary"]
+
+
+async def test_a_superseded_run_that_is_cancelled_keeps_its_check(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    mock_llm,  # noqa: F811
+) -> None:
+    seed_job(db)
+    _signal_during_review(
+        mock_llm,
+        before=lambda: db.transition_review_job("job-1", JobStatus.CLAIMED, JobStatus.SUPERSEDED),
+    )
+
+    assert await _run(server) == 1
+
+    assert status_of(db) is JobStatus.SUPERSEDED
+    assert _completed_checks(github) == []
+
+
+async def test_a_review_past_its_timeout_is_reported_timed_out(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    mock_llm,  # noqa: F811
+    revoked: list[str],
+) -> None:
+    seed_job(db)
+
+    async def hang(*_: Any, **__: Any) -> str:
+        await asyncio.sleep(5)
+        raise AssertionError("the review was not stopped")
+
+    mock_llm.review.side_effect = hang
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server)) as http:
+        code = await run_job(
+            http,
+            job_id="job-1",
+            server_url=SERVER,
+            audience="mira",
+            llm=RunnerLLM(),
+            timeout=timedelta(seconds=0.5),
+        )
+
+    assert code == 1
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.error.startswith("Review timed out after")
+    assert revoked == ["ghs_job_token_1"]
+
+
+@pytest.fixture
+def report_failure_cli(server: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from click.testing import CliRunner
+
+    from mira import cli
+
+    monkeypatch.setattr(
+        cli, "_runner_http", lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=server))
+    )
+
+    def invoke(*args: str) -> Any:
+        argv = ["runner", "report-failure", "--job", "job-1", "--server", "https://mira.test"]
+        return CliRunner().invoke(cli.main, [*argv, *args])
+
+    return invoke
+
+
+def test_report_failure_fails_a_job_that_never_reported(
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    report_failure_cli: Any,
+) -> None:
+    seed_job(db, status=JobStatus.CLAIMED, claimed_at=time.time())
+
+    result = report_failure_cli("--reason", "cancelled")
+
+    assert result.exit_code == 0, result.output
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.error == runner_client.REPORTED_FAILURES["cancelled"]
+    [(body, _)] = _completed_checks(github)
+    assert body["conclusion"] == "failure"
+
+
+@pytest.mark.parametrize("status", [JobStatus.SUCCEEDED, JobStatus.SUPERSEDED])
+def test_report_failure_keeps_a_finished_or_superseded_job(
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    report_failure_cli: Any,
+    status: JobStatus,
+) -> None:
+    seed_job(db, status=status, claimed_at=time.time())
+
+    result = report_failure_cli()
+
+    assert result.exit_code == 0, result.output
+    assert status_of(db) is status
+    assert _completed_checks(github) == []

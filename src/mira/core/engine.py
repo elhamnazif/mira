@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -921,8 +922,11 @@ class ReviewEngine:
         try:
             async with self._pr_workspace(pr_info):
                 result = await self._review_pr(pr_info, state)
-        except BaseException:
-            await self._finish_check(pr_info, run_id, "failure", None)
+        except BaseException as exc:
+            # A dispatched job's check is the server's. On a cancel it closes
+            # it from the job's result, and leaves a superseded job's alone.
+            if not (isinstance(exc, asyncio.CancelledError) and self.check_run_id is not None):
+                await self._finish_check(pr_info, run_id, "failure", None)
             raise
         await self._finish_check(pr_info, run_id, self._check_status_key(result), result)
         return result
