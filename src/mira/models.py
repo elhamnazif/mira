@@ -530,6 +530,11 @@ class ReviewResult:
     incremental_since: str = ""
     pr_file_count: int = 0
 
+    @property
+    def all_chunks_failed(self) -> bool:
+        """Every review chunk failed, so nothing in the diff was reviewed."""
+        return bool(self.failed_chunks) and len(self.failed_chunks) >= self.total_chunks
+
 
 @dataclass
 class PRInfo:

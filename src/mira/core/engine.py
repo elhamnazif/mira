@@ -703,10 +703,9 @@ class ReviewEngine:
         nothing because every chunk failed must not conclude as success,
         which is what a reader takes "Code Review Complete" to mean.
         """
-        failed = len(result.failed_chunks)
-        if failed and result.total_chunks and failed >= result.total_chunks:
+        if result.all_chunks_failed:
             return "review_failed"
-        if failed or result.security_failures:
+        if result.failed_chunks or result.security_failures:
             return "incomplete"
         # Neutral only when a walkthrough was enabled AND generation was
         # genuinely attempted but produced nothing (e.g. the LLM call failed).
@@ -1304,11 +1303,6 @@ class ReviewEngine:
 
                     import os as _os
 
-                    all_chunks_failed = bool(
-                        result.failed_chunks
-                        and result.total_chunks
-                        and len(result.failed_chunks) >= result.total_chunks
-                    )
                     markdown = result.walkthrough.to_markdown(
                         bot_name=self.bot_name,
                         review_stats=stats,
@@ -1330,7 +1324,7 @@ class ReviewEngine:
                         security_failures=result.security_failures or None,
                         failure_notice=(
                             self._format_chunk_failure_notice(result.failed_chunks)
-                            if all_chunks_failed
+                            if result.all_chunks_failed
                             else None
                         ),
                         incremental_since=result.incremental_since,
@@ -1360,12 +1354,7 @@ class ReviewEngine:
             # No walkthrough (all files excluded, empty diff, or generation
             # failed) — finalize the placeholder so it doesn't sit on
             # "Reviewing this PR…" forever.
-            all_chunks_failed = bool(
-                result.failed_chunks
-                and result.total_chunks
-                and len(result.failed_chunks) >= result.total_chunks
-            )
-            if all_chunks_failed:
+            if result.all_chunks_failed:
                 markdown = (
                     f"{WALKTHROUGH_MARKER}\n## Mira PR Walkthrough\n\n---\n\n"
                     "<details>\n"
@@ -1515,8 +1504,10 @@ class ReviewEngine:
             logger.debug("Failed to record review event: %s", exc)
 
         # Anchor the SHA even on zero-finding rounds; without it round 2 has
-        # nothing to compare against and falls back to a full review.
-        if pr_info.head_sha:
+        # nothing to compare against and falls back to a full review. A round
+        # where every chunk failed reviewed nothing, so it must not anchor, or
+        # the next push would skip the changes it never saw.
+        if pr_info.head_sha and not result.all_chunks_failed:
             try:
                 state.set_last_reviewed_sha(
                     pr_info.owner,

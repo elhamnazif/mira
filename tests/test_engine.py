@@ -2252,6 +2252,42 @@ class TestIncrementalDiff:
             "o", "r", 1, "HEAD_SHA", platform="github"
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("failed", "anchored"), [(2, False), (1, True)])
+    async def test_a_round_where_every_chunk_failed_does_not_anchor_the_sha(
+        self, monkeypatch, failed, anchored
+    ):
+        """Every chunk failed, so nothing was reviewed: anchoring the head
+        would make the next push skip these changes. A partial failure still
+        anchors, since its failed paths are kept for review-rest."""
+        from mira.core.engine import ReviewEngine
+        from mira.models import ChunkFailure, ReviewResult
+
+        mock_provider = self._provider_with_threads_and_compare(threads=[])
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_repo = MagicMock(return_value=None)
+        mock_db.set_last_reviewed_sha = MagicMock()
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        async def fake_internal(self, diff_text, **kwargs):
+            return ReviewResult(
+                failed_chunks=[ChunkFailure(chunk_index=i) for i in range(failed)],
+                total_chunks=2,
+            )
+
+        monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=AsyncMock(),
+            provider=mock_provider,
+            bot_name="mira",
+            state=LocalStateStore(),
+        )
+        await engine.review_pr("https://github.com/o/r/pull/1")
+
+        assert mock_db.set_last_reviewed_sha.called is anchored
+
 
 class TestSelfCritique:
     """Second-pass critique drops confidently-wrong findings before posting."""
