@@ -300,14 +300,6 @@ def _runner_job_options(required: bool) -> Callable[[Callable[..., Any]], Callab
     return decorate
 
 
-def _runner_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(name)s %(levelname)s: %(message)s",
-        stream=sys.stdout,
-    )
-
-
 def _runner_server_url(server_url: str) -> str:
     from mira.config import check_runner_server_url
 
@@ -359,7 +351,11 @@ def _runner_http() -> Any:
     help="Stop the review after this long and report it timed out. Keep it under the "
     "job's timeout-minutes",
 )
-@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose logging. On by itself when RUNNER_DEBUG=1 or ACTIONS_STEP_DEBUG=true",
+)
 @click.pass_context
 def runner(
     ctx: click.Context,
@@ -379,11 +375,12 @@ def runner(
     import os
     import tempfile
 
+    from mira.actions_log import setup_runner_logging
     from mira.runner_client import RunnerLLM, run_job
 
     if not job_id or not server_url:
         raise click.UsageError("Missing option '--job' or '--server'.")
-    _runner_logging(verbose)
+    setup_runner_logging(verbose)
     server_url = _runner_server_url(server_url)
     # The runner keeps no index. An empty one, in a directory of its own.
     os.environ.setdefault("MIRA_INDEX_DIR", tempfile.mkdtemp(prefix="mira-index-"))
@@ -421,9 +418,10 @@ def runner_report_failure(job_id: str, server_url: str, audience: str, reason: s
 
     For the review workflow's last step. A job that already has a result,
     or was superseded, keeps it."""
+    from mira.actions_log import setup_runner_logging
     from mira.runner_client import report_failure
 
-    _runner_logging(verbose=False)
+    setup_runner_logging(verbose=False)
     server_url = _runner_server_url(server_url)
 
     async def _run() -> int:
