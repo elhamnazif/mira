@@ -137,6 +137,47 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Codex CLI response did not contain a JSON object: {excerpt}",
         safe="Codex CLI response did not contain a JSON object",
     ),
+    # Claude Code CLI provider errors
+    "claude_command_not_found": ErrorMessage(
+        full="Claude Code CLI command not found: {command!r}. Install @anthropic-ai/claude-code or set llm.claude_command.",
+        safe="Claude Code CLI command not found — install @anthropic-ai/claude-code or set llm.claude_command",
+    ),
+    "claude_auth_missing": ErrorMessage(
+        full="Claude Code provider needs one of these environment variables: {keys}",
+        safe="Claude Code credentials are not configured",
+    ),
+    "claude_auth_failed": ErrorMessage(
+        full="Claude Code rejected its credentials: {detail}",
+        safe="Claude Code rejected its credentials",
+    ),
+    "claude_rate_limited": ErrorMessage(
+        full="Claude Code hit a usage or rate limit: {detail}",
+        safe="Claude Code hit a usage or rate limit",
+    ),
+    "claude_timeout": ErrorMessage(
+        full="Claude Code CLI timed out after {seconds}s",
+        safe="Claude Code CLI timed out",
+    ),
+    "claude_exit_failed": ErrorMessage(
+        full="Claude Code CLI failed with exit {exit_code}: {detail}",
+        safe="Claude Code CLI failed",
+    ),
+    "claude_reported_error": ErrorMessage(
+        full="Claude Code CLI reported an error (exit {exit_code}): {detail}",
+        safe="Claude Code CLI reported an error",
+    ),
+    "claude_empty_response": ErrorMessage(
+        full="Claude Code CLI returned an empty response",
+        safe="Claude Code CLI returned an empty response",
+    ),
+    "claude_no_json_object": ErrorMessage(
+        full="Claude Code CLI response did not contain a JSON object: {excerpt}",
+        safe="Claude Code CLI response did not contain a JSON object",
+    ),
+    "claude_workspace_missing": ErrorMessage(
+        full="Claude Code workspace review was given a missing directory: {path}",
+        safe="Claude Code workspace review was given a missing directory",
+    ),
 }
 
 

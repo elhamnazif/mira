@@ -188,6 +188,50 @@
     "purposes": ["indexing", "review"],
     "recommended_for": []
   },
+  "claude-code-default": {
+    "label": "Claude Code default",
+    "provider": "claude-code",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 64000,
+    "input_cost_per_1m": 0.00,
+    "output_cost_per_1m": 0.00,
+    "supports_json_mode": true,
+    "purposes": ["indexing", "review"],
+    "recommended_for": []
+  },
+  "opus": {
+    "label": "Claude Opus (Claude Code alias)",
+    "provider": "claude-code",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 64000,
+    "input_cost_per_1m": 0.00,
+    "output_cost_per_1m": 0.00,
+    "supports_json_mode": true,
+    "purposes": ["review"],
+    "recommended_for": []
+  },
+  "sonnet": {
+    "label": "Claude Sonnet (Claude Code alias)",
+    "provider": "claude-code",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 64000,
+    "input_cost_per_1m": 0.00,
+    "output_cost_per_1m": 0.00,
+    "supports_json_mode": true,
+    "purposes": ["indexing", "review"],
+    "recommended_for": []
+  },
+  "haiku": {
+    "label": "Claude Haiku (Claude Code alias)",
+    "provider": "claude-code",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 64000,
+    "input_cost_per_1m": 0.00,
+    "output_cost_per_1m": 0.00,
+    "supports_json_mode": true,
+    "purposes": ["indexing"],
+    "recommended_for": []
+  },
   "codex-default": {
     "label": "Codex CLI default",
     "provider": "codex-cli",

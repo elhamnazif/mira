@@ -21,6 +21,13 @@ def create_llm(config: LLMConfig) -> LLMProviderProtocol:
 
         return CodexCLIProvider(config)
 
+    from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
+
+    if config.provider in CLAUDE_CODE_PROVIDER_NAMES:
+        from mira.llm.agent_cli import ClaudeCodeProvider
+
+        return ClaudeCodeProvider(config)
+
     if config.api_style == "responses":
         from mira.llm.responses import ResponsesProvider
 

@@ -35,6 +35,8 @@ def active_backend(config: LLMConfig) -> str:
         return "bedrock"
     if config.provider in {"codex-cli", "codex_cli", "codex"}:
         return "codex-cli"
+    if config.provider in {"claude-code", "claude_code", "claude-cli"}:
+        return "claude-code"
     profile = profiles.resolve(config.base_url)
     return "openrouter" if profile.get("name") == "openrouter" else "openai-compatible"
 
@@ -101,7 +103,7 @@ async def fetch_catalog(config: LLMConfig) -> list[dict] | None:
     backend = active_backend(config)
     if backend == "bedrock":
         cache_key = f"bedrock:{config.region}:{config.aws_profile or ''}"
-    elif backend == "codex-cli":
+    elif backend in {"codex-cli", "claude-code"}:
         return None
     else:
         cache_key = config.base_url
@@ -150,9 +152,10 @@ def build_options(backend: str, dynamic: list[dict] | None, purpose: str) -> lis
         provider = info.get("provider")
         if backend == "bedrock" and provider != "bedrock":
             continue
-        if backend == "codex-cli" and provider != "codex-cli":
+        cli_backends = {"bedrock", "codex-cli", "claude-code"}
+        if backend in cli_backends and provider != backend:
             continue
-        if backend not in {"bedrock", "codex-cli"} and provider in {"bedrock", "codex-cli"}:
+        if backend not in cli_backends and provider in cli_backends:
             continue
         if purpose not in (info.get("purposes") or []):
             continue
