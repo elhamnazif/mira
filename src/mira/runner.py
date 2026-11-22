@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mira.config import ReviewConfig
@@ -112,3 +112,5 @@ class ReviewJob:
     created_at: float = 0.0
     claimed_at: float = 0.0
     finished_at: float = 0.0
+    # The runner's UsageReport as plain data. None until its result lands.
+    usage: dict[str, Any] | None = None

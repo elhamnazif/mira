@@ -234,7 +234,8 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     error TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL DEFAULT 0,
     claimed_at REAL NOT NULL DEFAULT 0,
-    finished_at REAL NOT NULL DEFAULT 0
+    finished_at REAL NOT NULL DEFAULT 0,
+    usage TEXT  -- the runner's JSON UsageReport; NULL until its result lands
 );
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
 """
@@ -411,7 +412,8 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     error TEXT NOT NULL DEFAULT '',
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     claimed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-    finished_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    finished_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    usage TEXT  -- the runner's JSON UsageReport; NULL until its result lands
 );
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
 """
@@ -611,6 +613,11 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE repos ADD COLUMN runner TEXT NOT NULL DEFAULT ''"
             )
+        job_cols = {
+            r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(review_jobs)").fetchall()
+        }
+        if "usage" not in job_cols:
+            self._sqlite_conn.execute("ALTER TABLE review_jobs ADD COLUMN usage TEXT")
         progress_cols = {
             r[1]
             for r in self._sqlite_conn.execute("PRAGMA table_info(pr_review_progress)").fetchall()
@@ -693,6 +700,7 @@ class AppDatabase:
                     "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
                     "last_reviewed_sha TEXT NOT NULL DEFAULT ''"
                 )
+                cur.execute("ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS usage TEXT")
                 cur.execute(
                     "ALTER TABLE pr_reviewers ADD COLUMN IF NOT EXISTS "
                     "bare_approval INTEGER NOT NULL DEFAULT 0"
@@ -1850,7 +1858,7 @@ class AppDatabase:
 
     _REVIEW_JOB_COLUMNS = (
         "id, owner, repo, pr_number, head_sha, installation_id, runs_on, status, "
-        "check_run_id, run_id, run_url, error, created_at, claimed_at, finished_at"
+        "check_run_id, run_id, run_url, error, created_at, claimed_at, finished_at, usage"
     )
 
     @staticmethod
@@ -1871,12 +1879,13 @@ class AppDatabase:
             created_at=row[12],
             claimed_at=row[13],
             finished_at=row[14],
+            usage=None if row[15] is None else json.loads(row[15]),
         )
 
     def create_review_job(self, job: ReviewJob) -> None:
         self._exec(
             f"INSERT INTO review_jobs ({self._REVIEW_JOB_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job.id,
                 job.owner,
@@ -1893,6 +1902,7 @@ class AppDatabase:
                 job.created_at,
                 job.claimed_at,
                 job.finished_at,
+                None if job.usage is None else json.dumps(job.usage),
             ),
         )
 
@@ -1937,6 +1947,34 @@ class AppDatabase:
         self._exec(
             "UPDATE review_jobs SET run_id=?, run_url=? WHERE id=?", (run_id, run_url, job_id)
         )
+
+    def record_review_job_result(self, job_id: str, usage: dict[str, Any]) -> bool:
+        """Store the runner's usage report, once. False when a result was
+        already recorded, so a retried result is not applied twice."""
+        return (
+            self._exec(
+                "UPDATE review_jobs SET usage=? WHERE id=? AND usage IS NULL",
+                (json.dumps(usage), job_id),
+            )
+            > 0
+        )
+
+    def list_stale_review_jobs(
+        self, *, dispatched_before: float, claimed_before: float
+    ) -> list[ReviewJob]:
+        """Dispatched jobs created, and claimed jobs claimed, before the cutoffs."""
+        rows = self._rows(
+            f"SELECT {self._REVIEW_JOB_COLUMNS} FROM review_jobs "
+            "WHERE (status=? AND created_at<?) OR (status=? AND claimed_at<?) "
+            "ORDER BY created_at",
+            (
+                JobStatus.DISPATCHED.value,
+                dispatched_before,
+                JobStatus.CLAIMED.value,
+                claimed_before,
+            ),
+        )
+        return [self._row_to_review_job(r) for r in rows]
 
     def upsert_contributor(
         self,

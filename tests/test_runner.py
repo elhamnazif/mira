@@ -216,3 +216,47 @@ class TestReviewJobs:
     def test_illegal_transition_raises(self, db: AppDatabase, old: JobStatus, new: JobStatus):
         with pytest.raises(IllegalJobTransition):
             db.transition_review_job("j1", old, new)
+
+    def test_result_usage_is_recorded_once(self, db: AppDatabase):
+        db.create_review_job(_job())
+        assert db.get_review_job("j1").usage is None  # type: ignore[union-attr]
+        assert db.record_review_job_result("j1", {"model": "opus", "input_tokens": 10})
+        assert not db.record_review_job_result("j1", {"model": "other"})
+        job = db.get_review_job("j1")
+        assert job is not None
+        assert job.usage == {"model": "opus", "input_tokens": 10}
+
+    def test_migration_adds_usage_column(self, tmp_path: Path):
+        raw = tmp_path / "pr2.db"
+        conn = sqlite3.connect(raw)
+        conn.executescript(
+            """
+            CREATE TABLE review_jobs (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                head_sha TEXT NOT NULL,
+                installation_id INTEGER NOT NULL DEFAULT 0,
+                runs_on TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL,
+                check_run_id INTEGER,
+                run_id INTEGER,
+                run_url TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT 0,
+                claimed_at REAL NOT NULL DEFAULT 0,
+                finished_at REAL NOT NULL DEFAULT 0
+            );
+            INSERT INTO review_jobs (id, owner, repo, pr_number, head_sha, status)
+            VALUES ('old', 'o', 'r', 7, 'sha', 'dispatched');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = AppDatabase(url=str(raw), admin_password="admin")
+        job = db.get_review_job("old")
+        assert job is not None
+        assert job.usage is None
+        assert db.record_review_job_result("old", {})
