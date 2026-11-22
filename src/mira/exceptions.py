@@ -77,6 +77,15 @@ class ProviderError(MiraError):
     """Error communicating with a code hosting provider (GitHub, etc.)."""
 
 
+class WorkflowDispatchError(ProviderError):
+    """A GitHub ``workflow_dispatch`` that was refused, with its HTTP status
+    (None when the request never got an answer)."""
+
+    def __init__(self, message: str, status_code: int | None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class WorkspaceError(MiraError):
     """Error checking out a pull request into a local workspace."""
 

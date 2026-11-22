@@ -15,7 +15,7 @@ import pytest
 from github import GithubException
 
 from mira.core.diff_parser import parse_diff
-from mira.exceptions import ProviderError
+from mira.exceptions import ProviderError, WorkflowDispatchError
 from mira.models import FileChangeType, PRInfo, ReviewComment, ReviewResult, Severity
 from mira.providers import github as gh_provider
 from mira.providers.github import (
@@ -743,6 +743,101 @@ class TestCheckRuns:
             pytest.raises(ProviderError, match="failed"),
         ):
             await provider.finish_check_run(pr_info, 42, "success")
+
+
+class TestQueuedCheckRun:
+    @pytest.mark.asyncio
+    async def test_queued_run_has_no_start_time(self):
+        provider = GitHubProvider("test-token")
+        pr_info = replace(_make_pr_info(), head_sha="deadbeef")
+
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                201, json={"id": 42}, request=httpx.Request("POST", url)
+            )
+        )
+        with patch.object(httpx.AsyncClient, "post", mock_post):
+            run_id = await provider.start_check_run(pr_info, status="queued")
+
+        assert run_id == 42
+        body = mock_post.call_args.kwargs["json"]
+        assert body["status"] == "queued"
+        assert "started_at" not in body
+
+
+class TestWorkflowDispatch:
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_run(self):
+        provider = GitHubProvider("test-token")
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                200,
+                json={
+                    "workflow_run_id": 45038116508,
+                    "html_url": "https://github.com/o/r/actions/runs/45038116508",
+                },
+                request=httpx.Request("POST", url),
+            )
+        )
+        with patch.object(httpx.AsyncClient, "post", mock_post):
+            run = await provider.dispatch_workflow(
+                "o", "r", "mira.yml", ref="main", inputs={"job_id": "j"}
+            )
+
+        assert run.id == 45038116508
+        assert run.html_url == "https://github.com/o/r/actions/runs/45038116508"
+        args, kwargs = mock_post.call_args
+        assert args[0].endswith("/repos/o/r/actions/workflows/mira.yml/dispatches")
+        assert kwargs["json"] == {
+            "ref": "main",
+            "inputs": {"job_id": "j"},
+            "return_run_details": True,
+        }
+        assert kwargs["headers"]["Authorization"] == "token test-token"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_error_carries_status(self):
+        provider = GitHubProvider("test-token")
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                404, text="Not Found", request=httpx.Request("POST", url)
+            )
+        )
+        with (
+            patch.object(httpx.AsyncClient, "post", mock_post),
+            pytest.raises(WorkflowDispatchError) as excinfo,
+        ):
+            await provider.dispatch_workflow("o", "r", "mira.yml", ref="main", inputs={})
+        assert excinfo.value.status_code == 404
+        assert mock_post.call_count == 1  # never retried: a retry could start a second run
+
+    @pytest.mark.asyncio
+    async def test_cancel_posts_to_run(self):
+        provider = GitHubProvider("test-token")
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                202, json={}, request=httpx.Request("POST", url)
+            )
+        )
+        with patch.object(httpx.AsyncClient, "post", mock_post):
+            await provider.cancel_workflow_run("o", "r", 99)
+        assert mock_post.call_args.args[0].endswith("/repos/o/r/actions/runs/99/cancel")
+
+    @pytest.mark.asyncio
+    async def test_cancel_finished_run_raises(self):
+        provider = GitHubProvider("test-token")
+        mock_post = AsyncMock(
+            side_effect=lambda url, **_kwargs: httpx.Response(
+                409,
+                text="Cannot cancel a workflow run that is completed.",
+                request=httpx.Request("POST", url),
+            )
+        )
+        with (
+            patch.object(httpx.AsyncClient, "post", mock_post),
+            pytest.raises(ProviderError, match="409"),
+        ):
+            await provider.cancel_workflow_run("o", "r", 99)
 
 
 class TestFindBotComment:
