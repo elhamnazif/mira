@@ -407,6 +407,10 @@ class ReviewConfig(BaseModel):
     runner_oidc_audience: str = Field(default="mira", min_length=1)
     # A claimed job that has not reported back after this long expires.
     runner_claim_timeout_minutes: int = Field(default=120, ge=1)
+    # The URL an Actions runner reaches this server's /runner API at, sent to
+    # the workflow as its server_url input. An actions review dispatched
+    # without one fails its check and says so. Deployment only.
+    runner_server_url: str = ""
 
     @field_validator("runs_on")
     @classmethod
@@ -415,6 +419,20 @@ class ReviewConfig(BaseModel):
         if not all(labels) or any("," in label for label in labels):
             raise ValueError(f"review.runs_on labels must be non-empty, without commas: {v!r}")
         return labels
+
+    @field_validator("runner_server_url")
+    @classmethod
+    def _validate_runner_server_url(cls, v: str) -> str:
+        if not v:
+            return v
+        parsed = urlparse(v)
+        local = parsed.scheme == "http" and _is_local_host(parsed.hostname or "")
+        if not parsed.hostname or not (parsed.scheme == "https" or local):
+            raise ValueError(
+                "review.runner_server_url must be an https URL (http only for a local host), "
+                f"got {v!r}"
+            )
+        return v.rstrip("/")
 
     @field_validator("runner_workflow_refs")
     @classmethod
@@ -509,6 +527,7 @@ _DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset(
         "runner_workflow_refs",
         "runner_oidc_audience",
         "runner_claim_timeout_minutes",
+        "runner_server_url",
     }
 )
 

@@ -122,6 +122,7 @@ def _payload(sha: str = "sha1", action: str = "opened") -> dict[str, Any]:
 async def _deliver(
     db: AppDatabase, payload: dict[str, Any], app_auth: AsyncMock, **review: Any
 ) -> None:
+    review.setdefault("runner_server_url", "https://mira.example")
     cfg = MiraConfig(review=ReviewConfig(**review))
     with (
         patch("mira.dashboard.api._app_db", db),
@@ -159,7 +160,11 @@ async def test_actions_mode_queues_check_and_dispatches(db, github, app_auth, lo
     [dispatch] = github.calls("POST", "/repos/o/r/actions/workflows/mira.yml/dispatches")
     assert dispatch == {
         "ref": "trunk",
-        "inputs": {"job_id": job_id, "runs_on": '["ubuntu-latest"]'},
+        "inputs": {
+            "job_id": job_id,
+            "runs_on": '["ubuntu-latest"]',
+            "server_url": "https://mira.example",
+        },
         "return_run_details": True,
     }
 
@@ -281,6 +286,22 @@ async def test_missing_workflow_fails_job_and_check(
     assert data["error"] == job.error
 
 
+async def test_no_server_url_fails_job_and_check_without_dispatching(
+    db, github, app_auth, local_review
+):
+    await _deliver(db, _payload(), app_auth, runner="actions", runner_server_url="")
+
+    [(job_id, _, status)] = _jobs(db)
+    job = db.get_review_job(job_id)
+    assert job is not None and status == "failed"
+    assert "review.runner_server_url" in job.error
+    assert github.calls("POST", "/dispatches") == []
+    [check] = github.calls("PATCH", "/repos/o/r/check-runs/501")
+    assert check is not None
+    assert (check["conclusion"], check["output"]["summary"]) == ("failure", job.error)
+    local_review.assert_not_awaited()
+
+
 async def test_missing_permission_names_actions_write(db, github, app_auth, local_review):
     github.dispatch_status = 403
 
@@ -291,3 +312,31 @@ async def test_missing_permission_names_actions_write(db, github, app_auth, loca
     job = db.get_review_job(job_id)
     assert job is not None
     assert "Actions: write" in job.error
+
+
+@pytest.mark.parametrize(
+    ("url", "ok"),
+    [
+        ("https://mira.example/", "https://mira.example"),
+        ("http://localhost:8000", "http://localhost:8000"),
+        ("http://mira.example", None),
+        ("mira.example", None),
+    ],
+)
+def test_runner_server_url_is_https_unless_local(url: str, ok: str | None) -> None:
+    from mira.config import ConfigError, load_config
+
+    overrides = {"review.runner_server_url": url}
+    if ok is None:
+        with pytest.raises(ConfigError):
+            load_config(overrides=overrides, use_dashboard=False)
+    else:
+        assert load_config(overrides=overrides, use_dashboard=False).review.runner_server_url == ok
+
+
+def test_a_repo_cannot_point_its_runner_at_another_server(tmp_path) -> None:
+    from mira.config import load_config
+
+    repo_config = tmp_path / ".mira.yaml"
+    repo_config.write_text("review:\n  runner_server_url: https://evil.example\n")
+    assert load_config(repo_config, use_dashboard=False).review.runner_server_url == ""

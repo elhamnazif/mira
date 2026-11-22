@@ -640,7 +640,8 @@ async def handle_pull_request(
 
         db = _get_app_db()
         record = db.get_repo(owner, repo)
-        target = resolve_runner_target(record.runner if record else "", load_config().review)
+        review = load_config().review
+        target = resolve_runner_target(record.runner if record else "", review)
         if target.kind is RunnerKind.ACTIONS:
             assert isinstance(provider, GitHubProvider)
             pr_info = PRInfo(
@@ -661,6 +662,7 @@ async def handle_pull_request(
                 default_branch=payload["repository"]["default_branch"],
                 installation_id=installation_id,
                 runs_on=target.runs_on,
+                server_url=review.runner_server_url,
             )
             return
 

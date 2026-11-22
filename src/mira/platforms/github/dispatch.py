@@ -1,7 +1,8 @@
 """Hand a PR review to the repo's Mira workflow on GitHub Actions.
 
 The server records a :class:`ReviewJob`, shows a queued check, and dispatches
-``.github/workflows/mira.yml`` with the job id and the runs-on labels. A newer
+``.github/workflows/mira.yml`` with the job id, the runs-on labels and the
+URL the runner reports back to. A newer
 head SHA supersedes the PR's older job and cancels its run.
 """
 
@@ -32,9 +33,13 @@ _DISPATCH_FAILURES: dict[int | None, str] = {
     403: "The Mira GitHub App lacks the Actions: write permission on this repo.",
     422: (
         f".github/workflows/{WORKFLOW_FILE} does not accept the workflow_dispatch "
-        "inputs job_id and runs_on."
+        "inputs job_id, runs_on and server_url."
     ),
 }
+_NO_SERVER_URL = (
+    "This repo reviews on GitHub Actions, but the Mira server has no "
+    "review.runner_server_url for its runner to report to."
+)
 _DISPATCH_FAILED = "Mira could not start its runner workflow .github/workflows/{workflow} ({why})."
 
 
@@ -97,6 +102,7 @@ async def dispatch_review(
     default_branch: str,
     installation_id: int,
     runs_on: tuple[str, ...],
+    server_url: str,
 ) -> None:
     """Dispatch a review of ``pr_info.head_sha``, superseding older jobs.
 
@@ -144,21 +150,29 @@ async def dispatch_review(
         check_run_id = None
     db.set_review_job_check_run(job.id, check_run_id)
 
+    async def fail(message: str) -> RunnerDispatchError:
+        db.transition_review_job(job.id, JobStatus.DISPATCHED, JobStatus.FAILED, error=message)
+        await finish_check(
+            provider, pr_info, check_run_id, "failure", "Mira runner not started", message
+        )
+        return RunnerDispatchError(message)
+
+    if not server_url:
+        raise await fail(_NO_SERVER_URL)
     try:
         run = await provider.dispatch_workflow(
             owner,
             repo,
             WORKFLOW_FILE,
             ref=default_branch,
-            inputs={"job_id": job.id, "runs_on": json.dumps(list(runs_on))},
+            inputs={
+                "job_id": job.id,
+                "runs_on": json.dumps(list(runs_on)),
+                "server_url": server_url,
+            },
         )
     except Exception as exc:
-        message = _failure_message(exc)
-        db.transition_review_job(job.id, JobStatus.DISPATCHED, JobStatus.FAILED, error=message)
-        await finish_check(
-            provider, pr_info, check_run_id, "failure", "Mira runner not started", message
-        )
-        raise RunnerDispatchError(message) from exc
+        raise await fail(_failure_message(exc)) from exc
 
     db.set_review_job_run(job.id, run.id, run.html_url)
     current = db.get_review_job(job.id)
