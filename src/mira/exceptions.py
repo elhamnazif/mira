@@ -77,5 +77,9 @@ class ProviderError(MiraError):
     """Error communicating with a code hosting provider (GitHub, etc.)."""
 
 
+class WorkspaceError(MiraError):
+    """Error checking out a pull request into a local workspace."""
+
+
 class WebhookError(MiraError):
     """Error processing a webhook event."""
