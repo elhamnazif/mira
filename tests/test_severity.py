@@ -110,6 +110,19 @@ class TestClassifySeverity:
         result = classify_severity(comment)
         assert result.severity == Severity.WARNING
 
+    def test_style_words_do_not_downgrade_a_defect_category(self):
+        for category in ("bug", "security", "race-condition", "resource-leak"):
+            comment = self._make_comment(
+                Severity.WARNING,
+                category,
+                "Currency formatting prints cents as dollars",
+            )
+            assert classify_severity(comment).severity >= Severity.WARNING, category
+
+    def test_style_words_still_downgrade_other_categories(self):
+        comment = self._make_comment(Severity.WARNING, "clarity", "Inconsistent formatting")
+        assert classify_severity(comment).severity == Severity.NITPICK
+
     def test_severity_ordering(self):
         assert Severity.BLOCKER > Severity.WARNING > Severity.SUGGESTION > Severity.NITPICK
 

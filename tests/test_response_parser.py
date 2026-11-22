@@ -137,6 +137,47 @@ class TestConvertToReviewComments:
         assert len(comments[0].title) == 80
 
 
+class TestSeverityFloor:
+    @staticmethod
+    def _convert(category: str, severity: str) -> list:
+        data = json.dumps(
+            {
+                "comments": [
+                    {
+                        "path": "a.py",
+                        "line": 1,
+                        "title": "Total printed in dollars",
+                        "body": "cents are rendered as dollars, 100x too large",
+                        "category": category,
+                        "severity": severity,
+                        "confidence": 0.55,
+                    }
+                ]
+            }
+        )
+        return convert_to_review_comments(parse_llm_response(data))
+
+    @pytest.mark.parametrize(
+        ("category", "severity", "expected"),
+        [
+            ("bug", "nitpick", Severity.WARNING),
+            ("security", "suggestion", Severity.WARNING),
+            ("race-condition", "nitpick", Severity.WARNING),
+            ("resource-leak", "suggestion", Severity.WARNING),
+            ("bug", "blocker", Severity.BLOCKER),
+            ("clarity", "nitpick", Severity.NITPICK),
+            ("error-handling", "suggestion", Severity.SUGGESTION),
+        ],
+    )
+    def test_defect_categories_are_at_least_warning(self, category, severity, expected):
+        (comment,) = self._convert(category, severity)
+        assert comment.severity == expected
+
+    def test_raising_severity_keeps_confidence(self):
+        (comment,) = self._convert("bug", "nitpick")
+        assert comment.confidence == 0.55
+
+
 def _make_diff_files(path: str, hunk_content: str) -> list[FileDiff]:
     return [
         FileDiff(

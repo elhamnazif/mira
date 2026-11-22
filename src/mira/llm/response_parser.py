@@ -23,6 +23,15 @@ from mira.models import (
 
 logger = logging.getLogger(__name__)
 
+# A real defect in these categories breaks behavior, so it is never below
+# warning. Doubt belongs in the finding's confidence, not its severity.
+SEVERITY_FLOOR: dict[str, Severity] = {
+    "bug": Severity.WARNING,
+    "security": Severity.WARNING,
+    "race-condition": Severity.WARNING,
+    "resource-leak": Severity.WARNING,
+}
+
 
 class LLMComment(BaseModel):
     path: str
@@ -312,12 +321,24 @@ def convert_to_review_comments(
         if suggestion and existing_code and suggestion.strip() == existing_code.strip():
             suggestion = None
 
+        parsed_severity = Severity.from_str(c.severity)
+        severity = max(parsed_severity, SEVERITY_FLOOR.get(c.category, Severity.NITPICK))
+        if severity != parsed_severity:
+            logger.debug(
+                "Raised %s:%d from %s to %s for category %s",
+                c.path,
+                c.line,
+                parsed_severity.name,
+                severity.name,
+                c.category,
+            )
+
         result.append(
             ReviewComment(
                 path=c.path,
                 line=c.line,
                 end_line=c.end_line if c.end_line and c.end_line > c.line else None,
-                severity=Severity.from_str(c.severity),
+                severity=severity,
                 category=c.category,
                 title=c.title[:80] if c.title else "",
                 body=c.body,

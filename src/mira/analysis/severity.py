@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
+from mira.llm.response_parser import SEVERITY_FLOOR
 from mira.models import ReviewComment, Severity
 
 # Exploitable vulnerabilities — these deserve BLOCKER
@@ -69,7 +70,8 @@ def classify_severity(comment: ReviewComment) -> ReviewComment:
     - Exploitable vulnerabilities (injection, RCE, etc.) get upgraded to BLOCKER
     - Security smells (hardcoded keys, etc.) are capped at WARNING
     - General security issues get upgraded to at least WARNING
-    - Pure style issues get downgraded to at most NITPICK
+    - Pure style issues get downgraded to at most NITPICK, unless the category
+      has a severity floor
     """
     text = f"{comment.title} {comment.body}".lower()
     is_security = comment.category == "security"
@@ -88,8 +90,10 @@ def classify_severity(comment: ReviewComment) -> ReviewComment:
         return comment
 
     if (
-        comment.category == "style" or _is_style_only(text)
-    ) and comment.severity > Severity.NITPICK:
+        comment.category not in SEVERITY_FLOOR
+        and (comment.category == "style" or _is_style_only(text))
+        and comment.severity > Severity.NITPICK
+    ):
         return replace(comment, severity=Severity.NITPICK)
 
     return comment
