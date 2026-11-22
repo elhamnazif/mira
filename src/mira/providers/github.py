@@ -16,6 +16,7 @@ import httpx
 from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from mira.core.workspace import CheckoutSource
 from mira.exceptions import ProviderError
 from mira.models import (
     BotThreadRecord,
@@ -62,6 +63,12 @@ _GITHUB_API_URL = os.environ.get(
 _GRAPHQL_URL = os.environ.get(
     "MIRA_GITHUB_GRAPHQL_URL",
     f"{_GITHUB_API_URL}/graphql",
+)
+# Enterprise API URLs are ``https://<host>/api/v3``; clones go to ``https://<host>``.
+_GITHUB_WEB_URL = (
+    "https://github.com"
+    if _GITHUB_API_URL == "https://api.github.com"
+    else _GITHUB_API_URL.removesuffix("/api/v3")
 )
 
 
@@ -222,6 +229,17 @@ class GitHubProvider(BaseProvider):
 
     def _make_client(self, token: str):
         return Github(token, base_url=_GITHUB_API_URL)
+
+    async def checkout_source(self, pr_info: PRInfo) -> CheckoutSource | None:
+        if not pr_info.head_sha:
+            return None
+        token = await self._resolve_token()
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        return CheckoutSource(
+            clone_url=f"{_GITHUB_WEB_URL}/{pr_info.owner}/{pr_info.repo}.git",
+            sha=pr_info.head_sha,
+            auth_header=f"Basic {basic}",
+        )
 
     async def get_pr_info(self, pr_url: str) -> PRInfo:
         owner, repo, number = parse_pr_url(pr_url)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 from typing import Literal
 
+from mira.core.workspace import CheckoutSource
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -201,3 +202,7 @@ class BaseProvider(abc.ABC):
     async def get_discussion_root_body(self, pr_info: PRInfo, discussion_id: str) -> str:
         """The first comment of a thread/discussion (best-effort, "" on failure)."""
         return ""
+
+    async def checkout_source(self, pr_info: PRInfo) -> CheckoutSource | None:
+        """Where to fetch the PR head for a workspace review agent, or None if unsupported."""
+        return None

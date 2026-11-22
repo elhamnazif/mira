@@ -1864,6 +1864,13 @@ class TestEnterpriseAPIURL:
             gh = mod.GitHubProvider("tok")._make_client("tok")
             assert gh.requester.base_url == "https://api.github.com"
 
+    @pytest.mark.asyncio
+    async def test_checkout_clones_from_enterprise_host(self):
+        with self._reloaded(self._ENTERPRISE) as mod:
+            pr = PRInfo("t", "", "main", "f", "", 1, "octo", "widgets", head_sha="abc")
+            source = await mod.GitHubProvider("tok").checkout_source(pr)
+            assert source.clone_url == "https://github.example.test/octo/widgets.git"
+
 
 class TestPRDescription:
     """get_pr_description/update_pr_description must build the client like every
@@ -1934,3 +1941,36 @@ class TestPRDescription:
             pytest.raises(ProviderError, match="Failed to fetch PR description"),
         ):
             await provider.get_pr_description(_make_pr_info())
+
+
+class TestCheckoutSource:
+    def _pr(self, head_sha: str) -> PRInfo:
+        return PRInfo(
+            title="t",
+            description="",
+            base_branch="main",
+            head_branch="feature",
+            url="https://github.com/octo/widgets/pull/7",
+            number=7,
+            owner="octo",
+            repo="widgets",
+            head_sha=head_sha,
+        )
+
+    @pytest.mark.asyncio
+    async def test_github_head_with_basic_auth(self):
+        async def supplier() -> str:
+            return "ghs_installation"
+
+        source = await GitHubProvider(supplier).checkout_source(self._pr("abc123"))
+
+        assert source is not None
+        assert source.clone_url == "https://github.com/octo/widgets.git"
+        assert source.sha == "abc123"
+        scheme, encoded = source.auth_header.split(" ", 1)
+        assert scheme == "Basic"
+        assert base64.b64decode(encoded).decode() == "x-access-token:ghs_installation"
+
+    @pytest.mark.asyncio
+    async def test_none_without_head_sha(self):
+        assert await GitHubProvider("token").checkout_source(self._pr("")) is None
