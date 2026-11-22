@@ -8,8 +8,9 @@ With ``ANTHROPIC_BASE_URL`` set, the CLI talks to an Anthropic-compatible
 gateway instead, such as Z.ai's GLM Coding Plan. The gateway's key comes from
 ``ANTHROPIC_AUTH_TOKEN`` (or ``ANTHROPIC_API_KEY``), and the
 ``ANTHROPIC_DEFAULT_*_MODEL`` variables map ``--model sonnet`` and the other
-aliases to the gateway's models. A subscription token is never sent to a
-gateway.
+aliases to the gateway's models. ``ANTHROPIC_CUSTOM_HEADERS`` adds request
+headers for the gateway and is redacted from output like the key. A
+subscription token is never sent to a gateway.
 
 Security posture of every invocation (checked against Claude Code 2.1.330):
 
@@ -42,6 +43,9 @@ from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult
 _AUTH_ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # With ANTHROPIC_BASE_URL set, only a key meant for that gateway is sent.
 _GATEWAY_AUTH_ENV_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+# Extra request headers for the gateway, one "Name: value" per line. They
+# often carry auth, so they are handled like the key.
+_GATEWAY_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS"
 # Gateway settings the CLI reads. None of them is a secret.
 _GATEWAY_ENV_KEYS = (
     "ANTHROPIC_BASE_URL",
@@ -79,12 +83,28 @@ class ClaudeCodeProvider(AgentCLIProvider):
         return self.config.claude_timeout_seconds
 
     def _auth_env(self) -> dict[str, str]:
-        keys = _GATEWAY_AUTH_ENV_KEYS if os.environ.get("ANTHROPIC_BASE_URL") else _AUTH_ENV_KEYS
+        gateway = bool(os.environ.get("ANTHROPIC_BASE_URL"))
+        keys = _GATEWAY_AUTH_ENV_KEYS if gateway else _AUTH_ENV_KEYS
         for key in keys:
             value = os.environ.get(key)
             if value:
-                return {key: value}
+                headers = os.environ.get(_GATEWAY_HEADERS_ENV_KEY) if gateway else None
+                return {key: value, **({_GATEWAY_HEADERS_ENV_KEY: headers} if headers else {})}
         raise NonRetriableLLMError("claude_auth_missing", keys=", ".join(keys))
+
+    def _secret_values(self) -> list[str]:
+        """The credentials, plus each gateway header's value on its own, since
+        output can quote one header without the others."""
+        values = super()._secret_values()
+        try:
+            headers = self._auth_env().get(_GATEWAY_HEADERS_ENV_KEY, "")
+        except LLMError:
+            headers = ""
+        for line in headers.splitlines():
+            value = line.partition(":")[2].strip()
+            if len(value) >= 8:
+                values.append(value)
+        return values
 
     def _extra_env(self) -> dict[str, str]:
         return {

@@ -65,6 +65,12 @@ up as in [Z.ai's Claude Code guide](https://docs.z.ai/devpack/tool/claude).
 With `ANTHROPIC_BASE_URL` set, Mira never sends `CLAUDE_CODE_OAUTH_TOKEN`
 to the gateway.
 
+A gateway that needs extra request headers, such as its own auth header,
+takes them from the `ANTHROPIC_CUSTOM_HEADERS` secret, one `Name: value`
+per line. It is a secret because headers often carry credentials, and Mira
+redacts it from review output like the key. Mira passes it to Claude Code
+only with `ANTHROPIC_BASE_URL` set.
+
 **Any OpenAI-compatible endpoint**, such as OpenRouter, DeepSeek, Together,
 vLLM or Ollama.
 

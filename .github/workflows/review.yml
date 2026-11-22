@@ -39,6 +39,9 @@ on:
       MIRA_LLM_API_KEY:
         description: Key for the endpoint in the MIRA_RUNNER_LLM_BASE_URL variable
         required: false
+      ANTHROPIC_CUSTOM_HEADERS:
+        description: 'Extra headers for the ANTHROPIC_BASE_URL gateway, one "Name: value" per line'
+        required: false
 
 permissions: {}
 
@@ -126,6 +129,7 @@ jobs:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           MIRA_LLM_API_KEY: ${{ secrets.MIRA_LLM_API_KEY }}
+          ANTHROPIC_CUSTOM_HEADERS: ${{ secrets.ANTHROPIC_CUSTOM_HEADERS }}
           # In a reusable workflow, vars are the calling repo's variables.
           # Each is optional; an unset one is empty and means the default.
           MIRA_RUNNER_LLM_PROVIDER: ${{ vars.MIRA_RUNNER_LLM_PROVIDER }}
