@@ -13,6 +13,7 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 from mira.exceptions import ConfigError
+from mira.runner import RunnerKind
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +392,21 @@ class ReviewConfig(BaseModel):
     # locally before pushing — only the final diff gets reviewed.
     review_on_synchronize: bool = True
 
+    # Where reviews run. "local" reviews in this process. "actions" dispatches
+    # the repo's .github/workflows/mira.yml with `runs_on` as its runs-on
+    # labels, e.g. ["ubuntu-latest"] or ["self-hosted", "sora"]. Deployment
+    # only: a repo's .mira.yaml cannot set either (see _DEPLOYMENT_ONLY_REVIEW_KEYS).
+    runner: RunnerKind = RunnerKind.LOCAL
+    runs_on: list[str] = Field(default_factory=lambda: ["ubuntu-latest"], min_length=1)
+
+    @field_validator("runs_on")
+    @classmethod
+    def _validate_runs_on(cls, v: list[str]) -> list[str]:
+        labels = [label.strip() for label in v]
+        if not all(labels) or any("," in label for label in labels):
+            raise ValueError(f"review.runs_on labels must be non-empty, without commas: {v!r}")
+        return labels
+
 
 class IndexConfig(BaseModel):
     # Concurrent LLM summarization batches per repo during indexing. The
@@ -463,6 +479,9 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
     }
 )
 
+# Where reviews run decides which machine and secrets see the code.
+_DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset({"runner", "runs_on"})
+
 
 def _strip_deployment_only_settings(overlay: dict[str, Any]) -> dict[str, Any]:
     """Remove deployment-only settings from an untrusted per-repo overlay."""
@@ -473,6 +492,11 @@ def _strip_deployment_only_settings(overlay: dict[str, Any]) -> dict[str, Any]:
         for key in _DEPLOYMENT_ONLY_LLM_KEYS:
             cleaned_llm.pop(key, None)
         cleaned["llm"] = cleaned_llm
+    review = cleaned.get("review")
+    if isinstance(review, dict):
+        cleaned["review"] = {
+            k: v for k, v in review.items() if k not in _DEPLOYMENT_ONLY_REVIEW_KEYS
+        }
     # Command authorization is deployment-controlled: a repository must not
     # be able to widen its own command allowlist.
     cleaned.pop("commands", None)
