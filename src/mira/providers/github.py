@@ -216,6 +216,7 @@ def _is_unauthorized(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None and current not in seen:
         seen.append(current)
+        status: int | None
         if isinstance(current, GithubException):
             status = current.status
         elif isinstance(current, httpx.HTTPStatusError):

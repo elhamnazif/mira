@@ -456,9 +456,9 @@ async def _review_error(
         logger.error("Review of %s stopped by %s", pr_url, signals[0])
         return "Review stopped: the Actions run was cancelled before the review finished"
     except Exception as exc:
-        if isinstance(exc, TimeoutError) and review.cancelled():
+        if isinstance(exc, TimeoutError) and review.cancelled() and timeout:
             logger.error("Review of %s did not finish within %s", pr_url, timeout)
-            return f"Review timed out after {_minutes(timeout)} minutes"
+            return f"Review timed out after {int(timeout.total_seconds() // 60)} minutes"
         logger.exception("Review of %s failed", pr_url)
         return _safe_error(exc)
     if result.all_chunks_failed:
@@ -470,10 +470,6 @@ async def _review_error(
         return error
     logger.info("Reviewed %s: %d comments", pr_url, len(result.comments))
     return ""
-
-
-def _minutes(timeout: timedelta | None) -> int:
-    return int(timeout.total_seconds() // 60) if timeout else 0
 
 
 @contextmanager

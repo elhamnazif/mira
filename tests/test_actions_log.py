@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -44,12 +45,18 @@ def _fresh_root() -> None:
     ],
 )
 def test_the_runs_debug_setting_turns_on_verbose(
-    bare_root: None, monkeypatch: pytest.MonkeyPatch, env: dict[str, str], level: int
+    bare_root: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: dict[str, str],
+    level: int,
 ) -> None:
     async def run_job(*_: Any, **__: Any) -> int:
         return 0
 
     monkeypatch.setattr(runner_client, "run_job", run_job)
+    # The command sets MIRA_INDEX_DIR when it is unset, which later tests would see.
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
     _fresh_root()
 
     result = CliRunner().invoke(
