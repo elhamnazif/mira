@@ -260,3 +260,32 @@ class TestReviewPromptCrossBoundaryTracing:
         messages = build_review_prompt(files, config)
         system = messages[0]["content"]
         assert "## Cross-Boundary Tracing" in system
+
+
+class TestReviewPromptQualityRules:
+    def _system(self) -> str:
+        files = [FileDiff(path="test.py", change_type=FileChangeType.MODIFIED)]
+        return _system_text(build_review_prompt(files, MiraConfig()))
+
+    def test_approach_and_blocking_bar(self):
+        system = self._system()
+        assert "Judge the approach as well as the lines." in system
+        assert "only when a senior engineer on this team would block or redirect the PR" in system
+
+    def test_size_is_not_triviality(self):
+        assert "A one-line change to auth, SQL, money" in self._system()
+
+    def test_drops_bloat_shaped_findings(self):
+        system = self._system()
+        assert "defensive checks for cases that cannot happen" in system
+        assert "an abstraction with one caller" in system
+        assert "tests that assert a tautology" in system
+
+    def test_root_cause_scope(self):
+        assert "root cause is in lines this PR added or modified" in self._system()
+
+    def test_one_comment_per_root_cause(self):
+        assert "File one comment per root cause." in self._system()
+
+    def test_attribution_stays_out_of_the_rendered_prompt(self):
+        assert "Pullfrog" not in self._system()
