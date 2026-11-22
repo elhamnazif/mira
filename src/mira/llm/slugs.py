@@ -147,9 +147,11 @@ def effort_level(
 ) -> str | None:
     """Land Mira's effort ``level`` on a model's ``ladder``.
 
-    The level's position picks a rung, rounding down so a run never costs more
-    than asked. Rungs that turn reasoning off, and rungs outside ``accepted``
-    (what the harness's pinned CLI takes), are dropped first. None means no
+    A rung with the level's own name wins. Otherwise the level's position picks
+    the nearest rung, ties going up, so ``medium`` on a ``low, high, max``
+    ladder runs at ``high`` as the provider profile's effort map does, not at
+    the cheapest rung. Rungs that turn reasoning off, and rungs outside
+    ``accepted`` (what the harness's pinned CLI takes), are dropped first. None means no
     effort flag: reasoning is off, or the model has no effort control. A level
     Mira has no position for passes through unchanged.
     """
@@ -165,7 +167,9 @@ def effort_level(
     ]
     if not rungs:
         return None
-    return rungs[int(position * (len(rungs) - 1))]
+    if level in rungs:
+        return level
+    return rungs[int(position * (len(rungs) - 1) + 0.5)]
 
 
 def choose_harness(

@@ -128,8 +128,7 @@ def get_security_model(
     db_value: str | None = None,
     db_review_model: str | None = None,
 ) -> str:
-    """Resolve the security-pass model: DB → config.security_model → review tier,
-    or the review tier's cheap sibling when it is a slug that has one.
+    """Resolve the security-pass model: DB → config.security_model → review tier.
 
     The review-tier fallback includes the dashboard's review_model setting
     (``db_review_model``) — without it, an instance whose review model lives
@@ -137,14 +136,14 @@ def get_security_model(
 
     Never falls back to ``indexing_model`` — the security sweep is the
     highest-stakes cheap pass, and silently downgrading it to the indexing
-    tier trades security recall for indexing cost savings. A slug's cheap
-    sibling is the slug's own choice, and setting ``security_model`` avoids it.
+    tier trades security recall for indexing cost savings. The same holds for
+    a slug's cheap sibling, so it is never used here.
     """
     if db_value:
         return db_value
     if config.security_model:
         return config.security_model
-    return slugs.cheap_for(get_review_model(config, db_review_model))
+    return get_review_model(config, db_review_model)
 
 
 # Thinking effort used when neither the dashboard nor mira.yaml sets one. The

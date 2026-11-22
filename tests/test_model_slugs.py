@@ -105,16 +105,17 @@ THREE = ("low", "high", "max")
     [
         # A five-rung ladder lands each level on itself.
         *((FIVE, level, None, level) for level in FIVE),
-        # A shorter ladder rounds down: medium (0.25) and xhigh (0.75) fold onto lower rungs.
+        # A level the ladder lacks lands on the nearest rung, ties going up, so
+        # medium on low/high/max runs at high, matching the profile's effort map.
         (THREE, "low", None, "low"),
-        (THREE, "medium", None, "low"),
+        (THREE, "medium", None, "high"),
         (THREE, "high", None, "high"),
-        (THREE, "xhigh", None, "high"),
+        (THREE, "xhigh", None, "max"),
         (THREE, "max", None, "max"),
         # Rungs that turn reasoning off are dropped before the lookup.
         (("none", "low", "medium", "high", "xhigh"), "low", None, "low"),
         (("none", "low", "medium", "high", "xhigh"), "max", None, "xhigh"),
-        (("minimal", "low", "medium", "high"), "medium", None, "low"),
+        (("minimal", "low", "medium", "high"), "medium", None, "medium"),
         # So are rungs the harness's CLI does not take.
         (("low", "high", "ultra"), "max", frozenset({"low", "high"}), "high"),
         # Reasoning off, or a model with no effort control: no flag.
@@ -206,8 +207,8 @@ def test_create_llm_runs_a_slug_on_its_api_profile(
     assert llm.config.base_url == "https://api.z.ai/api/paas/v4"
     assert llm.config.api_key_env == "ZAI_API_KEY"
     assert llm.config.fallback_model == "zai/glm-5.3-flash"
-    # Mira's default "medium" rounds down to GLM's floor rung.
-    assert llm.config.reasoning_effort == "low"
+    # Mira's default "medium" lands on GLM's "high", as the plain zai profile maps it.
+    assert llm.config.reasoning_effort == "high"
 
 
 def test_create_llm_runs_an_anthropic_slug_on_claude_code_with_a_token(
@@ -273,16 +274,14 @@ def test_a_plain_model_id_is_unchanged(
 # ── Cheap siblings ───────────────────────────────────────────────────
 
 
-def test_indexing_and_security_take_the_cheap_sibling() -> None:
+def test_indexing_takes_the_cheap_sibling_and_security_stays_on_the_review_model() -> None:
     config = MiraConfig.model_validate({"llm": {"model": "anthropic/claude-opus"}}).llm
 
     assert llm_config_for("review", config, use_dashboard=False).model == "anthropic/claude-opus"
     assert (
         llm_config_for("indexing", config, use_dashboard=False).model == "anthropic/claude-sonnet"
     )
-    assert (
-        llm_config_for("security", config, use_dashboard=False).model == "anthropic/claude-sonnet"
-    )
+    assert llm_config_for("security", config, use_dashboard=False).model == "anthropic/claude-opus"
 
 
 def test_a_configured_pass_model_beats_the_cheap_sibling() -> None:
@@ -405,12 +404,15 @@ def test_the_runner_runs_zai_glm_on_the_api_with_a_zai_key(
     assert review.config.api_key_env == "ZAI_API_KEY"
     assert review.config.model == "zai/glm-5.3"
     review.preflight()
-    # Indexing and security run on the cheap sibling, on the same endpoint.
-    for purpose in ("indexing", "security"):
-        cheap = llms[purpose]
-        assert isinstance(cheap, LLMProvider)
-        assert cheap.config.model == "zai/glm-5.3-flash"
-        assert cheap.config.base_url == "https://api.z.ai/api/paas/v4"
+    # Indexing runs on the cheap sibling, on the same endpoint. Security stays
+    # on the review model.
+    cheap = llms["indexing"]
+    assert isinstance(cheap, LLMProvider)
+    assert cheap.config.model == "zai/glm-5.3-flash"
+    assert cheap.config.base_url == "https://api.z.ai/api/paas/v4"
+    security = llms["security"]
+    assert isinstance(security, LLMProvider)
+    assert security.config.model == "zai/glm-5.3"
 
 
 def test_the_runner_runs_claude_sonnet_on_claude_code_with_an_oauth_token(

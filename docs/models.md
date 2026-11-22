@@ -59,15 +59,16 @@ fails with a configuration error.
 ## Effort, cheap siblings and fallback
 
 **Effort.** Mira's review effort (`low` to `max`) is a point on a scale, and
-each model's own levels divide that scale. A point between two levels rounds
-down, so a review never costs more than the setting asks for. On
-`zai/glm`, `medium` runs as `low` and `xhigh` runs as `high`. Levels that turn
+each model's own levels divide that scale. A level the model has runs as
+itself. Any other lands on the nearest level, ties going up, so on `zai/glm`
+(`low`, `high`, `max`) `medium` runs as `high`, as the plain `zai` profile
+does, and `xhigh` runs as `max`. Levels that turn
 reasoning off (`none`, `minimal`) are never picked, and neither are levels
 the Claude Code CLI does not take.
 
-**Cheap sibling.** When `indexing_model` or `security_model` is unset, those
-passes run on the slug's cheap sibling. Set `security_model` to keep the
-security pass on the review model.
+**Cheap sibling.** When `indexing_model` is unset, indexing runs on the slug's
+cheap sibling. The security pass never does: it stays on the review model
+unless `security_model` names another.
 
 **Fallback.** When the endpoint answers that the model does not exist, or the
 model stays unavailable after retries, Mira tries the slug's fallback once for
