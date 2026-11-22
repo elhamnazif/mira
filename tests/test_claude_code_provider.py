@@ -102,7 +102,16 @@ MESSAGES = [
 @pytest.fixture(autouse=True)
 def _auth_env(monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "API_TIMEOUT_MS",
+    ):
+        monkeypatch.delenv(key, raising=False)
     # A Mira service secret that must never reach the CLI.
     monkeypatch.setenv("GITHUB_PRIVATE_KEY", "service-secret-do-not-leak")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-do-not-leak")
@@ -362,6 +371,82 @@ class TestErrors:
         with pytest.raises(LLMError) as exc:
             await provider.review(MESSAGES)
         assert exc.value.code == "claude_timeout"
+
+
+# A Z.ai-shaped key: no credential pattern matches it, so only the
+# value-based redaction can catch it.
+GATEWAY_KEY = "0123456789abcdef0123456789abcdef.AbCdEfGhIjKlMnOp"
+
+GATEWAY_ENV = {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3[1m]",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3-flash[1m]",
+    "API_TIMEOUT_MS": "3000000",
+}
+
+
+class TestGateway:
+    @pytest.fixture(autouse=True)
+    def _gateway_env(self, monkeypatch):
+        for key, value in GATEWAY_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", GATEWAY_KEY)
+
+    async def test_gateway_settings_and_key_reach_the_cli(self, tmp_path, caplog):
+        script, record = _fake_claude(tmp_path)
+        with caplog.at_level("DEBUG"):
+            await _provider(script, model="sonnet").review(MESSAGES)
+
+        (call,) = _calls(record)
+        env = call["env"]
+        assert {k: env.get(k) for k in GATEWAY_ENV} == GATEWAY_ENV
+        assert env["ANTHROPIC_AUTH_TOKEN"] == GATEWAY_KEY
+        # The subscription token never goes to a third-party gateway.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert call["argv"][call["argv"].index("--model") + 1] == "sonnet"
+        assert call["argv"][call["argv"].index("--setting-sources") + 1] == ""
+        assert not any(GATEWAY_KEY in arg for arg in call["argv"])
+        assert GATEWAY_KEY not in caplog.text
+
+    async def test_the_gateway_model_is_reported(self, tmp_path):
+        payload = {
+            **SUCCESS_PAYLOAD,
+            "modelUsage": {
+                "glm-5.3": {"inputTokens": 900, "outputTokens": 250},
+                "glm-5.3-flash": {"inputTokens": 40, "outputTokens": 10},
+            },
+        }
+        script, _ = _fake_claude(tmp_path, payload)
+        provider = _provider(script, model="sonnet")
+        await provider.review(MESSAGES)
+        assert provider.usage_details["models"] == ["glm-5.3"]
+
+    async def test_the_gateway_key_is_redacted_from_output(self, tmp_path):
+        payload = {**SUCCESS_PAYLOAD, "result": f"key {GATEWAY_KEY}", "structured_output": None}
+        script, _ = _fake_claude(tmp_path, payload)
+        text = await _provider(script).complete(MESSAGES, json_mode=False)
+        assert GATEWAY_KEY not in text
+        assert _REDACTED in text
+
+    def test_a_gateway_with_only_a_subscription_token_fails_preflight(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
+        script, _ = _fake_claude(tmp_path)
+        with pytest.raises(NonRetriableLLMError) as exc:
+            _provider(script).preflight()
+        assert exc.value.code == "claude_auth_missing"
+        assert "ANTHROPIC_AUTH_TOKEN" in exc.value.safe_message
+        assert TOKEN not in exc.value.safe_message
+
+    async def test_without_a_gateway_no_gateway_settings_are_sent(self, tmp_path, monkeypatch):
+        for key in GATEWAY_ENV:
+            monkeypatch.delenv(key)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
+        script, record = _fake_claude(tmp_path)
+        await _provider(script).review(MESSAGES)
+        env = _calls(record)[0]["env"]
+        assert not set(GATEWAY_ENV) & set(env)
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
 
 
 class TestPreflight:

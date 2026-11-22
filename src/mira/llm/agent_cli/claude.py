@@ -4,6 +4,13 @@ This provider runs the real Claude Code CLI. With ``CLAUDE_CODE_OAUTH_TOKEN``
 (from ``claude setup-token``) it bills a Claude Pro or Max subscription. With
 ``ANTHROPIC_API_KEY`` it bills the API.
 
+With ``ANTHROPIC_BASE_URL`` set, the CLI talks to an Anthropic-compatible
+gateway instead, such as Z.ai's GLM Coding Plan. The gateway's key comes from
+``ANTHROPIC_AUTH_TOKEN`` (or ``ANTHROPIC_API_KEY``), and the
+``ANTHROPIC_DEFAULT_*_MODEL`` variables map ``--model sonnet`` and the other
+aliases to the gateway's models. A subscription token is never sent to a
+gateway.
+
 Security posture of every invocation (checked against Claude Code 2.1.330):
 
 * ``--setting-sources ""``: no user, project or local settings are loaded.
@@ -32,7 +39,17 @@ from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm.agent_cli.base import AgentCLIProvider, CLIRunResult
 
 # Credentials Claude Code accepts, in the order they are preferred.
-_AUTH_ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+_AUTH_ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# With ANTHROPIC_BASE_URL set, only a key meant for that gateway is sent.
+_GATEWAY_AUTH_ENV_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+# Gateway settings the CLI reads. None of them is a secret.
+_GATEWAY_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "API_TIMEOUT_MS",
+)
 
 # Values accepted by ``claude --effort``.
 _EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -62,11 +79,12 @@ class ClaudeCodeProvider(AgentCLIProvider):
         return self.config.claude_timeout_seconds
 
     def _auth_env(self) -> dict[str, str]:
-        for key in _AUTH_ENV_KEYS:
+        keys = _GATEWAY_AUTH_ENV_KEYS if os.environ.get("ANTHROPIC_BASE_URL") else _AUTH_ENV_KEYS
+        for key in keys:
             value = os.environ.get(key)
             if value:
                 return {key: value}
-        raise NonRetriableLLMError("claude_auth_missing", keys=", ".join(_AUTH_ENV_KEYS))
+        raise NonRetriableLLMError("claude_auth_missing", keys=", ".join(keys))
 
     def _extra_env(self) -> dict[str, str]:
         return {
@@ -74,6 +92,7 @@ class ClaudeCodeProvider(AgentCLIProvider):
             "DISABLE_AUTOUPDATER": "1",
             # Drop telemetry and other traffic a headless review does not need.
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            **{key: os.environ[key] for key in _GATEWAY_ENV_KEYS if os.environ.get(key)},
         }
 
     def _command(

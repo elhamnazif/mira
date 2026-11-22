@@ -109,8 +109,9 @@ class LLMConfig(BaseModel):
     codex_sandbox: Literal["read-only"] = "read-only"
     codex_timeout_seconds: int = Field(default=900, gt=0)
     # Claude Code CLI provider settings (provider: claude-code). Auth comes from
-    # CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`, subscription) or
-    # ANTHROPIC_API_KEY in Mira's environment; nothing else is passed to the CLI.
+    # CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`, subscription),
+    # ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN in Mira's environment, plus the
+    # ANTHROPIC_BASE_URL gateway settings; nothing else is passed to the CLI.
     claude_command: str = "claude"
     claude_timeout_seconds: int = Field(default=900, gt=0)
 
