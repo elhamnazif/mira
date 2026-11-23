@@ -23,6 +23,7 @@ from mira.llm.prompts.review import (
     build_dependency_review_prompt,
     build_security_review_prompt,
 )
+from mira.llm.provider_errors import classify_provider_error
 from mira.llm.response_parser import (
     convert_to_review_comments,
     loads_lenient,
@@ -49,6 +50,8 @@ class AgenticLoopResult:
     tool_calls: list[dict] = field(default_factory=list)
     last_content: str = ""
     error: str | None = None
+    # Why the model provider refused, when the loop failed on its refusal.
+    cause: str | None = None
 
 
 class PassResult(list):
@@ -368,12 +371,14 @@ async def agentic_review_loop(
             if not investigated:
                 # Nothing gathered yet: report it; the caller's single-shot
                 # path is the better recovery than forcing an empty transcript.
+                kind = classify_provider_error(exc)
                 return AgenticLoopResult(
                     conversation=convo,
                     hops=hop + 1,
                     tool_calls=calls_made,
                     last_content=last_content,
                     error=error,
+                    cause=str(kind) if kind else None,
                 )
             # Evidence already gathered is worth a submission.
             return await _force_and_finish(

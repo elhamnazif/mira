@@ -487,3 +487,32 @@ def test_response_excerpt_is_bounded_and_single_line():
     excerpt = _response_excerpt("secret\n" + "x" * 1000)
     assert "\n" not in excerpt
     assert len(excerpt) <= 301
+
+
+@pytest.mark.asyncio
+async def test_a_provider_refusal_names_its_cause_in_the_chunk_failure(monkeypatch, tmp_path):
+    from mira.exceptions import LLMError
+    from mira.llm.provider_errors import ProviderErrorKind
+
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    llm = _ReviewLLM(set())
+
+    async def refuse(messages, tools):
+        raise LLMError(
+            "agentic_failed",
+            model="glm-5.3",
+            error='LLM API error 429: {"error":{"code":"1113","message":"Insufficient balance '
+            'or no resource package. Please recharge."}}',
+        )
+
+    llm.complete_agentic = refuse  # type: ignore[method-assign]
+    engine = _engine(llm)
+    engine._agentic_source_fetcher = _FakeFetcher()
+    engine._agentic_repo_tree = ["src/a.py"]
+
+    result = await engine.review_diff(_diff("src/a.py"))
+
+    assert result.all_chunks_failed
+    assert [f.reason for f in result.failed_chunks] == [
+        f"review failed ({ProviderErrorKind.QUOTA})"
+    ]

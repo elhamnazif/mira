@@ -1972,6 +1972,7 @@ class ReviewEngine:
                             parsed.summary or "",
                         )
 
+                    loop_result: Any = None
                     if (
                         _has_workspace_agent(self.llm)
                         and getattr(self.llm, "workspace", None) is not None
@@ -2025,11 +2026,12 @@ class ReviewEngine:
                             idx + 1,
                             len(chunks),
                         )
+                        cause = getattr(loop_result, "cause", None)
                         return _ChunkOutcome(
                             failure=_chunk_failure(
                                 idx,
                                 chunk,
-                                "structured output failed",
+                                f"review failed ({cause})" if cause else "structured output failed",
                                 hops=hops,
                             )
                         )
