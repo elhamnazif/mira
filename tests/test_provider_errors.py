@@ -78,7 +78,7 @@ def test_other_errors_are_not_classified(exc: Exception) -> None:
 def test_the_safe_error_leads_with_the_cause_and_omits_the_provider_text() -> None:
     exc = _api_error(401, f'{{"error": "Invalid API key: {KEY}", "key": "{KEY}"}}')
 
-    error = _safe_error(exc)
+    error = _safe_error(exc, "review")
 
     assert error == (
         "Review failed: the model provider rejected its credentials (invalid, expired or "
@@ -88,4 +88,10 @@ def test_the_safe_error_leads_with_the_cause_and_omits_the_provider_text() -> No
 
 
 def test_an_unclassified_error_keeps_the_type_only() -> None:
-    assert _safe_error(RuntimeError(f"boom {KEY}")) == "RuntimeError"
+    assert _safe_error(RuntimeError(f"boom {KEY}"), "review") == "RuntimeError"
+
+
+def test_the_safe_error_names_a_job_that_is_not_a_review() -> None:
+    error = _safe_error(_api_error(401, "{}"), "learning")
+
+    assert error.startswith("Learning failed: the model provider rejected its credentials")

@@ -9,19 +9,26 @@ applies them with :func:`apply_writes`.
 
 Writes carry no owner or repo, and only review and feedback records name a
 PR. The server applies them to the job's own PR, so a runner cannot write
-state for a repo it was not sent to.
+state for a repo it was not sent to. The server records where a review ran
+from the job, not from the runner.
 
 An index job gets an :class:`IndexSnapshot` instead and indexes through a
 :class:`RemoteIndexStore`. Its :data:`IndexWrite` s can outgrow one request,
 so the runner uploads them as :class:`IndexPart` s before its result, and
 the server applies every part to the job's repo in one transaction when the
 result lands (:func:`apply_index_writes`).
+
+A learning job gets a :class:`LearningSnapshot` of the repo's recent human
+review comments and learns through a :class:`RemoteLearningStore`. Its
+rules come back as :class:`UpsertLearnedRule` writes, which no other job
+may send.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -36,19 +43,27 @@ from pydantic import (
     model_validator,
 )
 
+from mira.analysis.feedback import HUMAN_PATTERN, HUMAN_REVIEW, recent_human_reviews
 from mira.config import MiraConfig, _strip_deployment_only_settings
-from mira.core.state_store import FeedbackRecord, ReviewRecord, ReviewStateStore
+from mira.core.state_store import (
+    FeedbackRecord,
+    LocalStateStore,
+    ReviewRecord,
+    ReviewStateStore,
+)
 from mira.dashboard.db import PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import (
     DirectorySummary,
+    FeedbackEventRow,
     FileDigest,
     FileSummary,
     IndexRun,
+    IndexStore,
     IndexWriter,
     ReviewContext,
 )
 from mira.models import PRFingerprint
-from mira.runner import JobTask, ReviewTask
+from mira.runner import JobKind, JobTask, ReviewJob, ReviewTask, RunnerKind, RunnerTarget
 
 # A secret that serializes to its value on the wire but never shows in a repr
 # or a log line.
@@ -66,6 +81,10 @@ class PRKey(_Wire):
     owner: str
     repo: str
     pr_number: int
+
+
+def job_pr(job: ReviewJob) -> PRKey:
+    return PRKey(platform="github", owner=job.owner, repo=job.repo, pr_number=job.pr_number)
 
 
 class StateSnapshot(_Wire):
@@ -122,12 +141,23 @@ class RecordFeedback(_Wire):
     feedback: FeedbackRecord
 
 
+class UpsertLearnedRule(_Wire):
+    """A rule the model learned from human reviews. It can only be one of
+    those rules: the server applies it as a pending ``human_pattern`` rule."""
+
+    op: Literal["upsert_learned_rule"] = "upsert_learned_rule"
+    rule_text: str = Field(min_length=1, max_length=4000)
+    path_pattern: str = Field(pattern=r"^__llm_pattern_\d+__$")
+    sample_count: int = Field(ge=0)
+
+
 StateWrite = Annotated[
     SetLastReviewedSha
     | UpsertPRReviewProgress
     | RecordReview
     | UpsertPRFingerprint
-    | RecordFeedback,
+    | RecordFeedback
+    | UpsertLearnedRule,
     Field(discriminator="op"),
 ]
 
@@ -144,6 +174,14 @@ class IndexSnapshot(_Wire):
 
     repo: RepoKey
     files: list[FileDigest]
+
+
+class LearningSnapshot(_Wire):
+    """What learning from human reviews reads: the repo's recent human
+    review comments, as ``recent_human_reviews`` picks them."""
+
+    repo: RepoKey
+    human_reviews: list[FeedbackEventRow]
 
 
 class RemoveIndexedPaths(_Wire):
@@ -241,8 +279,9 @@ class JobSpec(_Wire):
     # server's own machine (see runner_config).
     config: dict[str, Any]
     # An IndexSnapshot for an index job, which is on the repo: pr_url is
-    # then the repo's URL and head_sha is empty.
-    snapshot: StateSnapshot | IndexSnapshot
+    # then the repo's URL and head_sha is empty. A LearningSnapshot for a
+    # learning job.
+    snapshot: StateSnapshot | IndexSnapshot | LearningSnapshot
     github_token: WireSecret
     token_expires_at: datetime
     # Model credentials from the server (review.runner_credentials), by env
@@ -253,11 +292,17 @@ class JobSpec(_Wire):
 
     @model_validator(mode="after")
     def _snapshot_fits_task(self) -> JobSpec:
-        if self.task.kind.indexes != isinstance(self.snapshot, IndexSnapshot):
+        if type(self.snapshot) is not snapshot_type(self.task.kind):
             raise ValueError(
                 f"a {self.task.kind} job cannot run on a {type(self.snapshot).__name__}"
             )
         return self
+
+
+def snapshot_type(kind: JobKind) -> type[StateSnapshot | IndexSnapshot | LearningSnapshot]:
+    if kind.indexes:
+        return IndexSnapshot
+    return LearningSnapshot if kind is JobKind.LEARN else StateSnapshot
 
 
 class TokenGrant(_Wire):
@@ -425,10 +470,62 @@ class RemoteStateStore:
         )
 
 
-def check_writes(pr: PRKey, writes: Sequence[StateWrite]) -> None:
-    """Raise ValueError when a write does not belong to ``pr``. Only review
-    and feedback records name their PR; every other write takes the job's."""
+def build_learning_snapshot(store: IndexStore, repo: RepoKey) -> LearningSnapshot:
+    return LearningSnapshot(repo=repo, human_reviews=recent_human_reviews(store))
+
+
+class RemoteLearningStore:
+    """The repo's human reviews for a runner's learning job, read from a
+    snapshot. The rules learned are buffered for :meth:`bundle`."""
+
+    def __init__(self, snapshot: LearningSnapshot) -> None:
+        self._human_reviews = snapshot.human_reviews
+        self.writes: list[StateWrite] = []
+
+    def list_feedback(self, limit: int = 500) -> list[FeedbackEventRow]:
+        return self._human_reviews[:limit]
+
+    def upsert_learned_rule(
+        self,
+        rule_text: str,
+        source_signal: str,
+        category: str,
+        path_pattern: str,
+        sample_count: int,
+    ) -> None:
+        if (source_signal, category) != (HUMAN_PATTERN, HUMAN_REVIEW):
+            raise ValueError(f"a runner learns only {HUMAN_PATTERN} rules, not {source_signal}")
+        self.writes.append(
+            UpsertLearnedRule(
+                rule_text=rule_text, path_pattern=path_pattern, sample_count=sample_count
+            )
+        )
+
+    def bundle(
+        self,
+        job_id: str,
+        outcome: Literal["succeeded", "failed"],
+        *,
+        error: str = "",
+        usage: UsageReport | None = None,
+    ) -> ResultBundle:
+        return ResultBundle(
+            job_id=job_id,
+            outcome=outcome,
+            error=error,
+            writes=list(self.writes),
+            usage=usage or UsageReport(),
+        )
+
+
+def check_writes(job: ReviewJob, writes: Sequence[StateWrite]) -> None:
+    """Raise ValueError when a write does not belong to ``job``. Only a
+    learning job learns rules, and it writes nothing else. Only review and
+    feedback records name their PR; every other write takes the job's."""
+    pr = job_pr(job)
     for write in writes:
+        if isinstance(write, UpsertLearnedRule) != (job.kind is JobKind.LEARN):
+            raise ValueError(f"a {job.kind} job cannot send {write.op}")
         match write:
             case (
                 RecordReview(review=ReviewRecord(pr_number=number))
@@ -437,11 +534,14 @@ def check_writes(pr: PRKey, writes: Sequence[StateWrite]) -> None:
                 raise ValueError(f"{write.op} for PR {number}, job is {pr}")
 
 
-def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite]) -> None:
-    """Apply a runner's buffered writes to ``pr``, in order, after
-    :func:`check_writes` passes for all of them."""
-    check_writes(pr, writes)
+def apply_writes(store: LocalStateStore, job: ReviewJob, writes: Sequence[StateWrite]) -> None:
+    """Apply a runner's buffered writes to the job's PR, in order, after
+    :func:`check_writes` passes for all of them. A review is recorded as run
+    on the job's runner and workflow run."""
+    check_writes(job, writes)
+    pr = job_pr(job)
     owner, repo, number, platform = pr.owner, pr.repo, pr.pr_number, pr.platform
+    runner = str(RunnerTarget(RunnerKind.ACTIONS, job.runs_on))
     for write in writes:
         match write:
             case SetLastReviewedSha(sha=sha, base_sha=base_sha):
@@ -459,11 +559,21 @@ def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite
                 )
                 store.upsert_pr_review_progress(progress, platform=platform)
             case RecordReview(review=review):
-                store.record_review(owner, repo, review, platform=platform)
+                ran = replace(review, runner=runner, run_url=job.run_url)
+                store.record_review(owner, repo, ran, platform=platform)
             case UpsertPRFingerprint(fingerprint=fingerprint):
                 store.upsert_pr_fingerprint(owner, repo, fingerprint, platform=platform)
             case RecordFeedback(feedback=feedback):
                 store.record_feedback(owner, repo, feedback, platform=platform)
+            case UpsertLearnedRule():
+                store.upsert_learned_rule(
+                    owner,
+                    repo,
+                    write.rule_text,
+                    write.path_pattern,
+                    write.sample_count,
+                    platform=platform,
+                )
 
 
 class RemoteIndexStore:

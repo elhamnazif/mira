@@ -42,16 +42,19 @@ from mira.runner_protocol import (
     IndexPart,
     IndexSnapshot,
     JobSpec,
-    PRKey,
+    LearningSnapshot,
     RepoKey,
     ResultBundle,
     StateSnapshot,
     TokenGrant,
     apply_writes,
+    build_learning_snapshot,
     build_snapshot,
     check_index_writes,
     check_writes,
+    job_pr,
     runner_config,
+    snapshot_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,8 +67,8 @@ RUNNER_TOKEN_PERMISSIONS = {
     "issues": "write",
     "checks": "write",
 }
-# An index job only reads the code.
-INDEX_TOKEN_PERMISSIONS = {"contents": "read"}
+# A job that posts nothing only reads the code.
+READ_TOKEN_PERMISSIONS = {"contents": "read"}
 MAX_RESULT_BYTES = 8 * 1024 * 1024
 # GitHub cancels a job that waits for a self-hosted runner for 24 hours.
 DISPATCHED_TTL_S = 25 * 3600
@@ -82,27 +85,24 @@ def _db() -> AppDatabase:
     return api._app_db
 
 
-def _pr_key(job: ReviewJob) -> PRKey:
-    return PRKey(platform="github", owner=job.owner, repo=job.repo, pr_number=job.pr_number)
-
-
 def _pr_url(job: ReviewJob) -> str:
     """The job's PR, or for an index job its repo."""
     repo_url = f"https://github.com/{job.owner}/{job.repo}"
     return repo_url if job.kind.indexes else f"{repo_url}/pull/{job.pr_number}"
 
 
-def _snapshot(job: ReviewJob) -> StateSnapshot | IndexSnapshot:
-    if not job.kind.indexes:
-        return build_snapshot(LocalStateStore(), _pr_key(job))
+def _snapshot(job: ReviewJob) -> StateSnapshot | IndexSnapshot | LearningSnapshot:
+    kind = snapshot_type(job.kind)
+    if kind is StateSnapshot:
+        return build_snapshot(LocalStateStore(), job_pr(job))
+    repo = RepoKey(platform="github", owner=job.owner, repo=job.repo)
     store = IndexStore.open(job.owner, job.repo, allow_fallback=False)
     try:
-        files = store.list_file_digests()
+        if kind is LearningSnapshot:
+            return build_learning_snapshot(store, repo)
+        return IndexSnapshot(repo=repo, files=store.list_file_digests())
     finally:
         store.close()
-    return IndexSnapshot(
-        repo=RepoKey(platform="github", owner=job.owner, repo=job.repo), files=files
-    )
 
 
 def _pr_info(job: ReviewJob) -> PRInfo:
@@ -186,7 +186,7 @@ def create_runner_router(
 
     async def mint(job: ReviewJob) -> InstallationToken:
         try:
-            permissions = INDEX_TOKEN_PERMISSIONS if job.kind.indexes else RUNNER_TOKEN_PERMISSIONS
+            permissions = RUNNER_TOKEN_PERMISSIONS if job.kind.posts else READ_TOKEN_PERMISSIONS
             return await app_auth.mint_repo_token(job.installation_id, job.repo, permissions)
         except Exception as exc:
             logger.warning("Could not mint a runner token for job %s: %s", job.id, exc)
@@ -273,7 +273,7 @@ def create_runner_router(
             bundle = ResultBundle.model_validate_json(raw)
             if bundle.job_id != job.id:
                 raise ValueError(f"bundle is for job {bundle.job_id}")
-            check_writes(_pr_key(job), bundle.writes)
+            check_writes(job, bundle.writes)
             if job.kind.indexes:
                 _check_index_result(_db(), job, bundle)
         except (ValidationError, ValueError) as exc:
@@ -382,7 +382,7 @@ def _accept_result(
             moved = db.get_review_job(job.id)
             status = moved.status if moved else status
             logger.warning("Review job %s moved to %s while its result arrived", job.id, status)
-    apply_writes(LocalStateStore(), _pr_key(job), bundle.writes)
+    apply_writes(LocalStateStore(), job, bundle.writes)
     logger.info(
         "Applied %d state writes from job %s (%s)", len(bundle.writes), job.id, bundle.outcome
     )
@@ -393,7 +393,7 @@ def _accept_result(
 _EXPIRY: dict[JobStatus, tuple[CheckConclusion, str]] = {
     JobStatus.DISPATCHED: (
         "neutral",
-        f"No Mira runner picked up this review within {DISPATCHED_TTL_S // 3600} hours.",
+        f"No Mira runner picked up this {{label}} job within {DISPATCHED_TTL_S // 3600} hours.",
     ),
     JobStatus.CLAIMED: (
         "failure",
@@ -414,11 +414,11 @@ async def expire_stale_jobs(
     expired: list[tuple[ReviewJob, CheckConclusion, str]] = []
     for job in stale:
         conclusion, template = _EXPIRY[job.status]
-        reason = template.format(minutes=claim_timeout_minutes)
+        reason = template.format(label=job.kind.label, minutes=claim_timeout_minutes)
         if db.transition_review_job(job.id, job.status, JobStatus.EXPIRED, error=reason):
             expired.append((job, conclusion, reason))
     for job, conclusion, reason in expired:
-        logger.info("Expired review job %s (%s): %s", job.id, job.status, reason)
+        logger.info("Expired %s job %s (%s): %s", job.kind, job.id, job.status, reason)
         if job.kind.indexes:
             finish_index_job(db, job, None, reason)
         else:

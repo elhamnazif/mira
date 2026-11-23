@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
+from mira.runner import RunnerKind
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ class ReviewRecord:
     reviewed_paths: list[str] = field(default_factory=list)
     # path, line, severity, category, title, body, github_comment_id
     comments: list[dict[str, Any]] = field(default_factory=list)
+    # Where the review ran, as a RunnerTarget's str, and its Actions run.
+    # The server sets them for a review a runner sent.
+    runner: str = RunnerKind.LOCAL.value
+    run_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,6 +183,8 @@ class LocalStateStore:
                 author=review.author,
                 author_avatar_url=review.author_avatar_url,
                 reviewed_paths=json.dumps(review.reviewed_paths),
+                runner=review.runner,
+                run_url=review.run_url,
             )
             store.add_review_comments(event.id, review.pr_number, review.pr_url, review.comments)
             try:
@@ -194,6 +201,28 @@ class LocalStateStore:
     ) -> None:
         with _index(owner, repo, platform) as store:
             store.upsert_pr_fingerprint(fingerprint)
+
+    def upsert_learned_rule(
+        self,
+        owner: str,
+        repo: str,
+        rule_text: str,
+        path_pattern: str,
+        sample_count: int,
+        *,
+        platform: str,
+    ) -> None:
+        """Record a rule the model learned from human reviews."""
+        from mira.analysis.feedback import HUMAN_PATTERN, HUMAN_REVIEW
+
+        with _index(owner, repo, platform) as store:
+            store.upsert_learned_rule(
+                rule_text=rule_text,
+                source_signal=HUMAN_PATTERN,
+                category=HUMAN_REVIEW,
+                path_pattern=path_pattern,
+                sample_count=sample_count,
+            )
 
     def record_feedback(
         self, owner: str, repo: str, feedback: FeedbackRecord, *, platform: str

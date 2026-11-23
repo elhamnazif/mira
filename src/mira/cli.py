@@ -412,10 +412,10 @@ def runner(
     type=click.Choice(["cancelled", "failed"]),
     default="failed",
     show_default=True,
-    help="Why the review step ended without a result",
+    help="Why the runner step ended without a result",
 )
 def runner_report_failure(job_id: str, server_url: str, audience: str, reason: str) -> None:
-    """Report a job failed when its review step ended without reporting.
+    """Report a job failed when its runner step ended without reporting.
 
     For the review workflow's last step. A job that already has a result,
     or was superseded, keeps it."""

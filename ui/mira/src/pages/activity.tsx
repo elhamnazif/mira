@@ -48,6 +48,7 @@ import {
   type ActivityEventModel,
   type ActivityReviewModel,
   type PRReplyModel,
+  type ReviewRunModel,
 } from "@/lib/api"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
@@ -1222,7 +1223,33 @@ function ReviewEntry({
         {review.tokens_used.toLocaleString()} tokens ·{" "}
         {(review.duration_ms / 1000).toFixed(1)}s
       </div>
+      {review.run && <ReviewRun run={review.run} />}
     </>
+  )
+}
+
+function ReviewRun({ run }: { run: ReviewRunModel }) {
+  const where =
+    run.where === "server"
+      ? "Ran on the Mira server"
+      : `Ran on GitHub Actions (${run.runs_on.join(", ")})`
+  return (
+    <div className="mt-1 text-xs text-muted-foreground">
+      {run.url ? (
+        <a
+          href={run.url}
+          target="_blank"
+          rel="noreferrer"
+          title="Open the Actions run"
+          className="inline-flex items-center gap-1 transition-colors hover:text-foreground"
+        >
+          {where}
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      ) : (
+        where
+      )}
+    </div>
   )
 }
 

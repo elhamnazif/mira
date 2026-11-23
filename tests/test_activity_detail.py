@@ -127,3 +127,35 @@ def test_activity_detail_404_for_unknown_pr(patched_db: AppDatabase):
     with pytest.raises(HTTPException) as exc:
         api.get_activity_detail("acme", "web", 999)
     assert exc.value.status_code == 404
+
+
+def test_each_review_says_where_it_ran(patched_db: AppDatabase):
+    from mira.core.state_store import LocalStateStore, ReviewRecord
+
+    _seed(patched_db)
+    LocalStateStore().record_review(
+        "acme",
+        "web",
+        ReviewRecord(
+            pr_number=1,
+            pr_title="Fix auth",
+            pr_url="https://github.com/acme/web/pull/1",
+            author="octocat",
+            author_avatar_url="",
+            comments_posted=0,
+            blockers=0,
+            warnings=0,
+            suggestions=0,
+            files_reviewed=1,
+            lines_changed=3,
+            tokens_used=10,
+            duration_ms=5,
+            categories="",
+        ),
+        platform="github",
+    )
+
+    runs = [r.run for r in api.get_activity_detail("acme", "web", 1).reviews]
+    # The server's own review, then two recorded before reviews said where.
+    assert runs == [api.ReviewRunModel(where="server"), None, None]
+    assert core.list_activity().events[0].run == api.ReviewRunModel(where="server")

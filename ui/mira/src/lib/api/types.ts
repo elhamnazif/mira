@@ -176,6 +176,14 @@ export interface RelatedRepoModel {
   edge_count: number
 }
 
+// Where a review ran: on the Mira server, or on GitHub Actions with the
+// job's runs-on labels and its workflow run, when it has one.
+export interface ReviewRunModel {
+  where: "server" | "actions"
+  runs_on: string[]
+  url: string
+}
+
 export interface ReviewEventModel {
   id: number
   pr_number: number
@@ -191,6 +199,8 @@ export interface ReviewEventModel {
   duration_ms: number
   categories: string
   created_at: number
+  // null for a review recorded before reviews said where they ran.
+  run: ReviewRunModel | null
 }
 
 export interface ActivityEventModel extends ReviewEventModel {

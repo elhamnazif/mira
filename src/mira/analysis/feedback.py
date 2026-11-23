@@ -7,10 +7,11 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
+from typing import Any, Protocol
 
 from jinja2 import Environment, FileSystemLoader
 
-from mira.index.store import IndexStore
+from mira.index.store import FeedbackEventRow, IndexStore
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,34 @@ _MIN_REJECTS_CATEGORY = int(os.environ.get("MIRA_FEEDBACK_MIN_CAT", "5"))
 # Minimum total events and accept rate threshold for positive rules.
 _MIN_CATEGORY_EVENTS_FOR_ACCEPT = int(os.environ.get("MIRA_FEEDBACK_ACCEPT_MIN", "5"))
 _ACCEPT_RATE_THRESHOLD = float(os.environ.get("MIRA_FEEDBACK_ACCEPT_RATE", "0.8"))
+# The recent feedback events the LLM synthesis looks for human reviews in.
+_FEEDBACK_WINDOW = 500
 # Max human-review comments to include in a single LLM synthesis call.
 _MAX_HUMAN_COMMENTS = int(os.environ.get("MIRA_HUMAN_SYNTH_MAX", "50"))
 # Max rules the LLM is allowed to emit per synthesis run.
 _MAX_LLM_RULES = int(os.environ.get("MIRA_HUMAN_SYNTH_MAX_RULES", "5"))
 
 _TEMPLATE_DIR = Path(__file__).parent.parent / "llm" / "prompts" / "templates"
+
+# The signal and category of every rule the LLM learns from human reviews.
+HUMAN_PATTERN = "human_pattern"
+HUMAN_REVIEW = "human_review"
+
+
+class HumanReviewStore(Protocol):
+    """What the LLM synthesis reads and writes: a repo's IndexStore, or a
+    runner's snapshot of it."""
+
+    def list_feedback(self, limit: int = ...) -> list[FeedbackEventRow]: ...
+
+    def upsert_learned_rule(
+        self,
+        rule_text: str,
+        source_signal: str,
+        category: str,
+        path_pattern: str,
+        sample_count: int,
+    ) -> Any: ...
 
 
 def _dir_of(path: str) -> str:
@@ -131,7 +154,14 @@ def synthesize_rules(store: IndexStore) -> int:
     return upserted
 
 
-async def synthesize_from_human_reviews(store: IndexStore, llm) -> int:  # type: ignore[no-untyped-def]
+def recent_human_reviews(store: HumanReviewStore) -> list[FeedbackEventRow]:
+    """The human review comments the LLM synthesis reads, newest first and
+    capped for prompt size."""
+    events = store.list_feedback(limit=_FEEDBACK_WINDOW)
+    return [e for e in events if e.signal == HUMAN_REVIEW][:_MAX_HUMAN_COMMENTS]
+
+
+async def synthesize_from_human_reviews(store: HumanReviewStore, llm) -> int:  # type: ignore[no-untyped-def]
     """Use an LLM to extract reviewer-style rules from human review comments.
 
     Collects ``human_review`` feedback events (bodies of human PR review
@@ -139,15 +169,12 @@ async def synthesize_from_human_reviews(store: IndexStore, llm) -> int:  # type:
     ``source_signal='human_pattern'``. Intended to run after each PR merge
     against the cheap indexing model.
 
-    Returns the number of rules upserted.
+    Returns the number of rules upserted. Raises when the LLM call fails.
     """
-    events = store.list_feedback(limit=500)
-    human_events = [e for e in events if e.signal == "human_review"]
-    if len(human_events) < 2:
+    recent = recent_human_reviews(store)
+    if len(recent) < 2:
         return 0
 
-    # Most recent comments first; cap to the most recent N for prompt size.
-    recent = human_events[:_MAX_HUMAN_COMMENTS]
     comments = [
         {
             "path": e.comment_path,
@@ -166,15 +193,11 @@ async def synthesize_from_human_reviews(store: IndexStore, llm) -> int:  # type:
     template = env.get_template("synthesize_feedback.jinja2")
     prompt = template.render(comments=comments, max_rules=_MAX_LLM_RULES)
 
-    try:
-        raw = await llm.complete(
-            messages=[{"role": "user", "content": prompt}],
-            json_mode=True,
-            temperature=0.0,
-        )
-    except Exception as exc:
-        logger.warning("LLM synthesis failed: %s", exc)
-        return 0
+    raw = await llm.complete(
+        messages=[{"role": "user", "content": prompt}],
+        json_mode=True,
+        temperature=0.0,
+    )
 
     try:
         data = json.loads(strip_think_blocks(strip_code_fences(raw)))
@@ -200,8 +223,8 @@ async def synthesize_from_human_reviews(store: IndexStore, llm) -> int:  # type:
         # Use a synthetic unique path_pattern per rule so upsert keys don't collide.
         store.upsert_learned_rule(
             rule_text=rule_text,
-            source_signal="human_pattern",
-            category="human_review",
+            source_signal=HUMAN_PATTERN,
+            category=HUMAN_REVIEW,
             path_pattern=f"__llm_pattern_{idx}__",
             sample_count=max(evidence, len(comments)),
         )

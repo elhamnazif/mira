@@ -215,7 +215,23 @@ indexing progress follow the job. A whole-repo index shows as indexing from
 dispatch until its result. A failed job leaves a repo that has an index
 **ready**, so pushes keep indexing it, and shows the job's error.
 
-## Not yet on Actions
+## Learning from merged PRs
 
-Learning from a merged PR keeps its rule-based signals on a repo that reviews
-on Actions, but skips the model pass over human reviews.
+When a PR merges on a repo that reviews on Actions, the server records its
+signals itself: which of Mira's comments stood, and the human review
+comments. It also updates the rules it derives from those signals without a
+model. When the PR had human review comments, the server then dispatches a
+learning job through the same `mira.yml` for the model pass over them.
+
+The job gets the repo's recent human review comments from the server and
+asks the runner's indexing model for rules. Its GitHub token has only
+**Contents: read**, since the job posts nothing. The rules it sends back
+land as pending learned rules, as they do on a local repo, and wait for an
+admin to approve them. A learning job can write no other kind of rule and no
+review state. A job that fails or never reports learns nothing.
+
+## Where a review ran
+
+The dashboard's activity timeline says where each review ran: on the Mira
+server, or on GitHub Actions with the job's `runs-on` labels and a link to
+its workflow run. Reviews recorded before this was tracked show neither.

@@ -62,6 +62,7 @@ def review_event_model(e: ReviewEvent) -> _api.ReviewEventModel:
         duration_ms=e.duration_ms,
         categories=e.categories,
         created_at=e.created_at,
+        run=_api.review_run(e.runner, e.run_url),
     )
 
 
@@ -128,6 +129,7 @@ def collect_activity(
                                 duration_ms=e.duration_ms,
                                 categories=e.categories,
                                 created_at=e.created_at,
+                                run=_api.review_run(e.runner, e.run_url),
                                 owner=repo_record.owner,
                                 repo=repo_record.repo,
                                 author_username=e.author,

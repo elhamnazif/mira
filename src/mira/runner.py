@@ -3,7 +3,8 @@
 ``local`` runs every model call in the server process. ``actions``
 dispatches the repo's ``mira.yml`` workflow, whose ``runs-on`` takes the
 target's labels, and tracks the run as a :class:`ReviewJob`. A job runs one
-:data:`JobTask`: a review, an answer to an @mention, or an index of the repo.
+:data:`JobTask`: a review, an answer to an @mention, an index of the repo, or
+the model pass of learning from a merged PR.
 """
 
 from __future__ import annotations
@@ -32,6 +33,12 @@ class RunnerTarget:
     def __post_init__(self) -> None:
         if (self.kind is RunnerKind.ACTIONS) != bool(self.runs_on):
             raise ValueError(f"runs_on must be set exactly for actions runners, got {self!r}")
+
+    def __str__(self) -> str:
+        """The form :func:`parse_runner_override` reads."""
+        if self.kind is RunnerKind.LOCAL:
+            return RunnerKind.LOCAL.value
+        return f"{RunnerKind.ACTIONS.value}:{','.join(self.runs_on)}"
 
 
 def parse_runner_override(value: str) -> RunnerTarget | None:
@@ -118,7 +125,7 @@ class IllegalJobTransition(ValueError):
 
 def check_transition(old: JobStatus, new: JobStatus) -> None:
     if new not in _TRANSITIONS[old]:
-        raise IllegalJobTransition(f"review job cannot go from {old} to {new}")
+        raise IllegalJobTransition(f"a job cannot go from {old} to {new}")
 
 
 class JobKind(StrEnum):
@@ -128,6 +135,12 @@ class JobKind(StrEnum):
     THREAD_REPLY = "thread_reply"
     INDEX_REPO = "index_repo"
     INDEX_DIFF = "index_diff"
+    LEARN = "learn"
+
+    @property
+    def label(self) -> str:
+        """The kind as people read it, in a job's errors."""
+        return _LABELS[self]
 
     @property
     def reviews_pr(self) -> bool:
@@ -140,6 +153,23 @@ class JobKind(StrEnum):
         """Whether the job writes the repo's index. Such a job is on the
         repo, not a PR, and a repo has one active at a time."""
         return self in (JobKind.INDEX_REPO, JobKind.INDEX_DIFF)
+
+    @property
+    def posts(self) -> bool:
+        """Whether the job posts to its PR. The others only read, so their
+        GitHub token can only read."""
+        return not (self.indexes or self is JobKind.LEARN)
+
+
+_LABELS = {
+    JobKind.REVIEW: "review",
+    JobKind.REVIEW_REST: "review",
+    JobKind.ASK: "question",
+    JobKind.THREAD_REPLY: "thread reply",
+    JobKind.INDEX_REPO: "index",
+    JobKind.INDEX_DIFF: "index",
+    JobKind.LEARN: "learning",
+}
 
 
 class _Task(BaseModel):
@@ -210,9 +240,22 @@ class IndexDiffTask(_Task):
     removed_paths: tuple[str, ...]
 
 
+class LearnTask(_Task):
+    """Learn review rules with the model from the repo's recent human review
+    comments, after a merge recorded them. The job is on the merged PR."""
+
+    kind: Literal[JobKind.LEARN] = JobKind.LEARN
+
+
 IndexTask = IndexRepoTask | IndexDiffTask
 JobTask = Annotated[
-    ReviewTask | ReviewRestTask | AskTask | ThreadReplyTask | IndexRepoTask | IndexDiffTask,
+    ReviewTask
+    | ReviewRestTask
+    | AskTask
+    | ThreadReplyTask
+    | IndexRepoTask
+    | IndexDiffTask
+    | LearnTask,
     Field(discriminator="kind"),
 ]
 _JOB_TASK: TypeAdapter[JobTask] = TypeAdapter(JobTask)

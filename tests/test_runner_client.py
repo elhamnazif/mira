@@ -237,6 +237,28 @@ async def test_claim_review_result(
     assert all(q["audience"] == "mira" and q["api-version"] == "2.0" for q in oidc_requests)
 
 
+async def test_the_dashboard_shows_where_a_runner_review_ran(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+) -> None:
+    from mira.dashboard import api
+    from mira.dashboard.routers import core
+
+    db.register_repo("test", "repo")
+    run_url = "https://github.com/test/repo/actions/runs/1001"
+    seed_job(db, runs_on=("self-hosted", "sora"), run_url=run_url)
+
+    assert await _run(server) == 0
+
+    ran = api.ReviewRunModel(where="actions", runs_on=["self-hosted", "sora"], url=run_url)
+    [review] = api.get_activity_detail("test", "repo", 1).reviews
+    assert review.run == ran
+    [event] = core.list_activity().events
+    assert event.run == ran
+
+
 async def test_a_job_that_is_not_claimable_exits_0_without_reviewing(
     server: FastAPI,
     db: AppDatabase,  # noqa: F811
@@ -775,7 +797,7 @@ async def test_a_cancelled_run_reports_once_revokes_and_exits(
     assert await _run(server) == 1
 
     assert [(b.outcome, b.error) for b in posted] == [
-        ("failed", "Review stopped: the Actions run was cancelled before the review finished")
+        ("failed", "Review stopped: the Actions run was cancelled before it finished")
     ]
     job = db.get_review_job("job-1")
     assert job is not None and job.status is JobStatus.FAILED

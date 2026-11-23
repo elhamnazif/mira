@@ -29,6 +29,7 @@ from mira.platforms.mentions import strip_mentions
 from mira.runner import (
     AskTask,
     JobTask,
+    LearnTask,
     ReviewRestTask,
     ReviewTask,
     ThreadReply,
@@ -446,13 +447,13 @@ async def run_pr_merged_learning(
     merged_by: str,
     platform: str = "github",
     *,
-    use_model: bool = True,
+    dispatch: Dispatch | None = None,
 ) -> None:
     """Platform-neutral merge-time learning: record accept/reject + human-review
     signals and synthesize rules. Shared by GitHub and GitLab.
 
-    ``use_model=False`` keeps the deterministic rules but skips the model pass
-    over human reviews, for a server that runs no model."""
+    With ``dispatch``, the model pass over human reviews goes to it as a
+    :class:`LearnTask`. The signals and the deterministic rules stay here."""
     from mira.providers.formatting import parse_bot_comment_metadata
 
     owner, repo, number, pr_url = pr_info.owner, pr_info.repo, pr_info.number, pr_info.url
@@ -539,7 +540,10 @@ async def run_pr_merged_learning(
 
         deterministic_rules = synthesize_rules(store)
 
-        if human_recorded > 0 and use_model:
+        if human_recorded > 0 and dispatch is not None:
+            await dispatch(LearnTask())
+            logger.info("Dispatched learning from the human reviews of %s", pr_url)
+        elif human_recorded > 0:
             try:
                 config = load_config()
                 from mira.dashboard.models_config import llm_config_for

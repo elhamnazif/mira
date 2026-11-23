@@ -628,7 +628,7 @@ def _runner_target(owner: str, repo: str) -> RunnerTarget:
 
 
 def _dispatcher(provider: BaseProvider, payload: dict[str, Any], pr_url: str) -> Dispatch | None:
-    """Where a comment's model work goes: None runs it in this process, else
+    """Where an event's model work goes: None runs it in this process, else
     it becomes a job for the repo's Actions runner, as a review does."""
     repository = payload["repository"]
     target = _runner_target(repository["owner"]["login"], repository["name"])
@@ -955,7 +955,7 @@ async def handle_pr_merged(
             pr_info,
             bot_name,
             merged_by,
-            use_model=_runner_target(owner, repo).kind is not RunnerKind.ACTIONS,
+            dispatch=_dispatcher(provider, payload, pr_url),
         )
     except Exception:
         logger.exception("Error handling pr_merged event on %s", pr_url)

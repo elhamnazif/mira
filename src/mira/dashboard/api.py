@@ -27,6 +27,7 @@ from mira.dashboard.auth import AuthMiddleware, create_auth_router
 from mira.dashboard.db import AppDatabase, RepoRecord
 from mira.index.relationships import RelationshipStore
 from mira.index.store import IndexingSuperseded, IndexStore
+from mira.runner import RunnerKind, parse_runner_override
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,25 @@ class RelatedRepoModel(BaseModel):
     edge_count: int
 
 
+class ReviewRunModel(BaseModel):
+    """Where a review ran: on the Mira server, or on GitHub Actions with the
+    job's runs-on labels and its workflow run, when it has one."""
+
+    where: Literal["server", "actions"]
+    runs_on: list[str] = []
+    url: str = ""
+
+
+def review_run(runner: str, run_url: str) -> ReviewRunModel | None:
+    """A review event's runner and run URL, or None when it recorded none."""
+    target = parse_runner_override(runner)
+    if target is None:
+        return None
+    if target.kind is RunnerKind.LOCAL:
+        return ReviewRunModel(where="server")
+    return ReviewRunModel(where="actions", runs_on=list(target.runs_on), url=run_url)
+
+
 class ReviewEventModel(BaseModel):
     id: int
     pr_number: int
@@ -239,6 +259,7 @@ class ReviewEventModel(BaseModel):
     duration_ms: int
     categories: str
     created_at: float
+    run: ReviewRunModel | None = None
 
 
 class ActivityEventModel(ReviewEventModel):
@@ -1489,6 +1510,7 @@ def get_activity_detail(owner: str, repo: str, pr_number: int) -> ActivityDetail
                 duration_ms=e.duration_ms,
                 categories=e.categories,
                 created_at=e.created_at,
+                run=review_run(e.runner, e.run_url),
                 reviewed_paths=_paths(e.reviewed_paths),
                 comments=comments_by_review.get(e.id, []),
             )

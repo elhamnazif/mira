@@ -1,5 +1,6 @@
 """RemoteStateStore answers like LocalStateStore, and its buffered writes,
-applied on the server, leave the rows LocalStateStore writes directly."""
+applied on the server, leave the rows LocalStateStore writes directly. A
+learning job's rules land as the server's own synthesis would write them."""
 
 from __future__ import annotations
 
@@ -13,20 +14,37 @@ from mira.core.state_store import FeedbackRecord, LocalStateStore, ReviewRecord
 from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
+from mira.runner import LearnTask, ReviewJob
 from mira.runner_protocol import (
+    LearningSnapshot,
     PRKey,
     RecordFeedback,
     RecordReview,
+    RemoteLearningStore,
     RemoteStateStore,
+    RepoKey,
     ResultBundle,
     StateSnapshot,
+    UpsertLearnedRule,
     UsageReport,
     apply_writes,
+    build_learning_snapshot,
     build_snapshot,
     runner_config,
 )
 
 PR = PRKey(platform="github", owner="o", repo="r", pr_number=7)
+# A review job on PR, whose writes the tests apply.
+JOB = ReviewJob(
+    id="j",
+    owner="o",
+    repo="r",
+    pr_number=7,
+    head_sha="sha-1",
+    installation_id=1,
+    runs_on=("self-hosted", "sora"),
+    run_url="https://github.com/o/r/actions/runs/1",
+)
 
 
 def _review(pr_number: int = 7) -> ReviewRecord:
@@ -186,14 +204,18 @@ def local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalStateStore:
     return LocalStateStore()
 
 
+_NOT_STATE = {"id", "created_at", "runner", "run_url"}
+
+
 def state_rows(pr: PRKey = PR) -> dict:
-    """The review state LocalStateStore persists for ``pr``, minus ids and times."""
+    """The review state LocalStateStore persists for ``pr``, minus ids, times
+    and where each review ran."""
     from mira.dashboard import api
 
     store = IndexStore.open(pr.owner, pr.repo)
     try:
         events = [
-            {k: v for k, v in asdict(e).items() if k not in {"id", "created_at"}}
+            {k: v for k, v in asdict(e).items() if k not in _NOT_STATE}
             for e in store.list_review_events_for_pr(pr.pr_number)
         ]
         comments = [
@@ -232,7 +254,7 @@ def test_applied_writes_equal_direct_local_writes(
         remote = RemoteStateStore(build_snapshot(local, PR))
         _review_round(remote, sha)
         bundle = ResultBundle.model_validate_json(remote.bundle("j", "succeeded").model_dump_json())
-        apply_writes(local, PR, bundle.writes)
+        apply_writes(local, JOB, bundle.writes)
 
     assert state_rows() == direct
     assert direct["sha"] == "sha-2" and len(direct["events"]) == 2
@@ -273,7 +295,7 @@ def test_apply_refuses_a_review_of_another_pr_before_writing(local: LocalStateSt
     from mira.runner_protocol import SetLastReviewedSha
 
     with pytest.raises(ValueError):
-        apply_writes(local, PR, [SetLastReviewedSha(sha="x"), RecordReview(review=_review(8))])
+        apply_writes(local, JOB, [SetLastReviewedSha(sha="x"), RecordReview(review=_review(8))])
     assert local.get_last_reviewed("o", "r", 7, platform="github") == ReviewedVersion()
 
 
@@ -309,7 +331,7 @@ def test_applied_feedback_equals_direct_local_feedback(
     remote = RemoteStateStore(_snapshot())
     remote.record_feedback("o", "r", _feedback(), platform="github")
     bundle = ResultBundle.model_validate_json(remote.bundle("j", "succeeded").model_dump_json())
-    apply_writes(local, PR, bundle.writes)
+    apply_writes(local, JOB, bundle.writes)
 
     assert _feedback_rows() == direct
     assert [(r["signal"], r["comment_path"], r["actor"]) for r in direct] == [
@@ -321,7 +343,7 @@ def test_feedback_for_another_pr_is_refused(local: LocalStateStore) -> None:
     with pytest.raises(ValueError):
         RemoteStateStore(_snapshot()).record_feedback("o", "r", _feedback(8), platform="github")
     with pytest.raises(ValueError):
-        apply_writes(local, PR, [RecordFeedback(feedback=_feedback(8))])
+        apply_writes(local, JOB, [RecordFeedback(feedback=_feedback(8))])
     assert _feedback_rows() == []
 
 
@@ -341,3 +363,108 @@ def test_runner_config_drops_the_servers_own_settings() -> None:
     assert "runner" not in data["review"] and "runs_on" not in data["review"]
     assert (data["llm"]["model"], data["review"]["max_chunks_per_review"]) == ("m", 2)
     assert MiraConfig.model_validate(data).review.max_chunks_per_review == 2
+
+
+def _ran_on() -> list[tuple[str, str]]:
+    store = IndexStore.open("o", "r")
+    try:
+        return [(e.runner, e.run_url) for e in store.list_review_events_for_pr(7)]
+    finally:
+        store.close()
+
+
+def test_an_applied_review_records_the_jobs_runner_not_the_runners_claim(
+    local: LocalStateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local.record_review("o", "r", _review(), platform="github")
+    assert _ran_on() == [("local", "")]
+
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "applied"))
+    claimed = ReviewRecord(**{**asdict(_review()), "runner": "local", "run_url": "https://evil"})
+    apply_writes(local, JOB, [RecordReview(review=claimed)])
+
+    assert _ran_on() == [("actions:self-hosted,sora", "https://github.com/o/r/actions/runs/1")]
+
+
+def _learning_job() -> ReviewJob:
+    return ReviewJob(
+        id="l",
+        owner="o",
+        repo="r",
+        pr_number=7,
+        head_sha="sha-1",
+        installation_id=1,
+        runs_on=("ubuntu-latest",),
+        task=LearnTask(),
+    )
+
+
+def _rule() -> UpsertLearnedRule:
+    return UpsertLearnedRule(
+        rule_text="Avoid raw SQL.", path_pattern="__llm_pattern_0__", sample_count=3
+    )
+
+
+def test_only_a_learning_job_learns_rules_and_it_writes_nothing_else(
+    local: LocalStateStore,
+) -> None:
+    with pytest.raises(ValueError, match="review job cannot send upsert_learned_rule"):
+        apply_writes(local, JOB, [_rule()])
+    with pytest.raises(ValueError, match="learn job cannot send record_feedback"):
+        apply_writes(local, _learning_job(), [RecordFeedback(feedback=_feedback())])
+    store = IndexStore.open("o", "r")
+    try:
+        assert store.list_learned_rules() == []
+    finally:
+        store.close()
+
+
+def test_learned_rules_round_trip_into_pending_human_pattern_rules(
+    local: LocalStateStore,
+) -> None:
+    store = IndexStore.open("o", "r")
+    try:
+        for i, signal in enumerate(["human_review", "accepted", "human_review"]):
+            store.record_feedback(
+                pr_number=i,
+                pr_url="",
+                comment_path="db.py",
+                comment_line=i,
+                comment_category="human_review",
+                comment_severity="",
+                comment_title=f"comment {i}",
+                signal=signal,
+                actor="alice",
+            )
+        wire = build_learning_snapshot(store, RepoKey(platform="github", owner="o", repo="r"))
+    finally:
+        store.close()
+
+    remote = RemoteLearningStore(LearningSnapshot.model_validate_json(wire.model_dump_json()))
+    assert [e.comment_title for e in remote.list_feedback()] == ["comment 2", "comment 0"]
+    with pytest.raises(ValueError):
+        remote.upsert_learned_rule("x", "rejected", "bug", "__llm_pattern_0__", 1)
+    remote.upsert_learned_rule(
+        "Avoid raw SQL.", "human_pattern", "human_review", "__llm_pattern_0__", 3
+    )
+    bundle = ResultBundle.model_validate_json(remote.bundle("l", "succeeded").model_dump_json())
+    assert bundle.writes == [_rule()]
+    apply_writes(local, _learning_job(), bundle.writes)
+
+    store = IndexStore.open("o", "r")
+    try:
+        [rule] = store.list_learned_rules()
+    finally:
+        store.close()
+    assert (rule.rule_text, rule.source_signal, rule.category, rule.status, rule.sample_count) == (
+        "Avoid raw SQL.",
+        "human_pattern",
+        "human_review",
+        "pending",
+        3,
+    )
+
+
+def test_a_learned_rule_cannot_name_another_rule() -> None:
+    with pytest.raises(ValueError):
+        UpsertLearnedRule(rule_text="x", path_pattern="src/*", sample_count=1)

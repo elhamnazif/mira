@@ -3,9 +3,10 @@
 The run proves who it is with its Actions OIDC token, claims the job from
 the server, and runs the job's task: a review with the real engine against
 the claimed state snapshot, an answer to an @mention through the same
-handler the server uses in local mode, or an index of the repo through the
-server's own indexer. It posts the writes back in one result bundle, after
-an index's writes in parts. Exit codes:
+handler the server uses in local mode, an index of the repo through the
+server's own indexer, or the model pass of learning from a merged PR with
+the server's own synthesis. It posts the writes back in one result bundle,
+after an index's writes in parts. Exit codes:
 
 - 0: the task finished and the server has its result, or the job was
   no longer this run's to claim (409).
@@ -30,6 +31,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr, ValidationError
 
+from mira.analysis.feedback import synthesize_from_human_reviews
 from mira.config import MiraConfig, _is_local_host, set_global_defaults_data
 from mira.core.engine import ReviewEngine
 from mira.dashboard.models_config import llm_config_for
@@ -50,6 +52,7 @@ from mira.runner import (
     IndexDiffTask,
     IndexRepoTask,
     IndexTask,
+    LearnTask,
     ReviewRestTask,
     ReviewTask,
     ThreadReplyTask,
@@ -60,7 +63,9 @@ from mira.runner_protocol import (
     IndexReport,
     IndexSnapshot,
     JobSpec,
+    LearningSnapshot,
     RemoteIndexStore,
+    RemoteLearningStore,
     RemoteStateStore,
     ResultBundle,
     TokenGrant,
@@ -396,14 +401,14 @@ def usage_report(llms: Iterable[Any]) -> UsageReport:
     )
 
 
-def _safe_error(exc: BaseException) -> str:
+def _safe_error(exc: BaseException, label: str) -> str:
     """A short error for the job record and the PR's check, without the
     exception's own text unless Mira wrote it to be shown. A model
-    provider's refusal leads with its cause."""
+    provider's refusal leads with its cause and the job's kind, ``label``."""
     message = exc.safe_message if isinstance(exc, MiraError) else ""
     error = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
     kind = classify_provider_error(exc)
-    return f"Review failed: {kind} ({error})" if kind else error
+    return f"{label.capitalize()} failed: {kind} ({error})" if kind else error
 
 
 # Actions stops a cancelled run with SIGINT, then SIGTERM 7.5 s later, and
@@ -412,10 +417,11 @@ _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _REPORT_AFTER_STOP_S = 6.0
 _REVOKE_AFTER_STOP_S = 2.0
 
-# What report-failure tells the server, by why the review step ended.
+# What report-failure tells the server, by why the runner step ended. That
+# step never learned the job's kind, so these name none.
 REPORTED_FAILURES = {
-    "cancelled": "Review stopped: the Actions run was cancelled before the review reported",
-    "failed": "Review failed: the review step ended before it reported a result",
+    "cancelled": "Job stopped: the Actions run was cancelled before the job reported",
+    "failed": "Job failed: the runner step ended before it reported a result",
 }
 
 
@@ -428,10 +434,10 @@ async def run_job(
     llm: RunnerLLM,
     timeout: timedelta | None = None,
 ) -> int:
-    """Claim, review and report one job. Returns the process exit code.
+    """Claim, run and report one job. Returns the process exit code.
 
     The first SIGINT or SIGTERM, which is how Actions cancels a run, or the
-    end of ``timeout`` stops the review, and the job is reported failed with
+    end of ``timeout`` stops the task, and the job is reported failed with
     the reason. The run revokes its GitHub tokens before it returns."""
     api = RunnerAPI(http, server_url, job_id, audience)
     try:
@@ -459,7 +465,7 @@ async def run_job(
     work = asyncio.create_task(_run_task(spec, llm, api, tokens, store, llms))
     with _cancel_on_signal(work) as signals:
         try:
-            error = await _task_error(work, signals, timeout, spec.pr_url)
+            error = await _task_error(work, signals, timeout, spec)
             outcome: Literal["succeeded", "failed"] = "failed" if error else "succeeded"
             bundle = store.bundle(job_id, outcome, error=error, usage=usage_report(llms))
             try:
@@ -486,14 +492,18 @@ def _adopt_credentials(spec: JobSpec) -> None:
             os.environ[name] = value
 
 
-def _store(spec: JobSpec) -> RemoteStateStore | RemoteIndexStore:
-    """Where the job's task reads and writes state. JobSpec checks that an
-    index task comes with an index snapshot and every other task with a
-    PR's."""
+Store = RemoteStateStore | RemoteIndexStore | RemoteLearningStore
+
+
+def _store(spec: JobSpec) -> Store:
+    """Where the job's task reads and writes state. JobSpec checks that the
+    snapshot fits the task."""
     if isinstance(spec.snapshot, IndexSnapshot):
         task = spec.task
         reconcile = isinstance(task, IndexRepoTask) and task.reconcile
         return RemoteIndexStore(spec.snapshot, reconcile=reconcile)
+    if isinstance(spec.snapshot, LearningSnapshot):
+        return RemoteLearningStore(spec.snapshot)
     return RemoteStateStore(spec.snapshot)
 
 
@@ -502,7 +512,7 @@ async def _run_task(
     llm: RunnerLLM,
     api: RunnerAPI,
     tokens: TokenSupplier,
-    store: RemoteStateStore | RemoteIndexStore,
+    store: Store,
     llms: list[Any],
 ) -> str:
     """Run the job's task. Returns why it failed, or "" if it did not."""
@@ -518,6 +528,12 @@ async def _run_task(
     if isinstance(task, IndexRepoTask | IndexDiffTask):
         assert isinstance(store, RemoteIndexStore)
         return await _run_index(api, task, config, llms[1], tokens, store)
+    if isinstance(task, LearnTask):
+        assert isinstance(store, RemoteLearningStore)
+        # The server's own merge-time synthesis, on the indexing model.
+        rules = await synthesize_from_human_reviews(store, llms[1])
+        logger.info("Learned %d rules from the human reviews of %s", rules, spec.pr_url)
+        return ""
     assert isinstance(store, RemoteStateStore)
     provider = GitHubProvider(tokens, on_unauthorized=tokens.invalidate)
     match task:
@@ -637,22 +653,24 @@ def _review_failure(result: ReviewResult, pr_url: str) -> str:
 
 
 async def _task_error(
-    work: asyncio.Task[str], signals: list[str], timeout: timedelta | None, pr_url: str
+    work: asyncio.Task[str], signals: list[str], timeout: timedelta | None, spec: JobSpec
 ) -> str:
     """Wait for the task. Returns why the job failed, or "" if it did not."""
+    label = spec.task.kind.label
     try:
         return await asyncio.wait_for(work, timeout.total_seconds() if timeout else None)
     except asyncio.CancelledError:
         if not signals:
             raise
-        logger.error("Review of %s stopped by %s", pr_url, signals[0])
-        return "Review stopped: the Actions run was cancelled before the review finished"
+        logger.error("The %s of %s stopped on %s", label, spec.pr_url, signals[0])
+        return f"{label.capitalize()} stopped: the Actions run was cancelled before it finished"
     except Exception as exc:
         if isinstance(exc, TimeoutError) and work.cancelled() and timeout:
-            logger.error("Review of %s did not finish within %s", pr_url, timeout)
-            return f"Review timed out after {int(timeout.total_seconds() // 60)} minutes"
-        logger.exception("Review of %s failed", pr_url)
-        return _safe_error(exc)
+            logger.error("The %s of %s did not finish within %s", label, spec.pr_url, timeout)
+            minutes = int(timeout.total_seconds() // 60)
+            return f"{label.capitalize()} timed out after {minutes} minutes"
+        logger.exception("The %s of %s failed", label, spec.pr_url)
+        return _safe_error(exc, label)
 
 
 @contextmanager
@@ -665,7 +683,7 @@ def _cancel_on_signal(task: asyncio.Task[Any]) -> Iterator[list[str]]:
     def stop(sig: signal.Signals) -> None:
         received.append(sig.name)
         if len(received) == 1:
-            logger.warning("Got %s: stopping the review and reporting it", sig.name)
+            logger.warning("Got %s: stopping the job and reporting it", sig.name)
             task.cancel()
 
     for sig in _STOP_SIGNALS:
@@ -680,7 +698,7 @@ def _cancel_on_signal(task: asyncio.Task[Any]) -> Iterator[list[str]]:
 async def report_failure(
     http: httpx.AsyncClient, *, job_id: str, server_url: str, audience: str, reason: str
 ) -> int:
-    """Post a failed result for a job whose review step ended without
+    """Post a failed result for a job whose runner step ended without
     reporting, for the workflow's last step. The server applies only a
     job's first result and leaves a superseded job's check alone, so a run
     that did report keeps its result."""
