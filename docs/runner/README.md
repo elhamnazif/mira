@@ -51,6 +51,10 @@ repo's endpoint.
 | Variable | `MIRA_RUNNER_LLM_PROVIDER` | `zai` |
 | Variable | `MIRA_RUNNER_MODEL` | `glm-5.3` |
 
+**Z.ai GLM Coding Plan key, on Mira's own engine.** The same, with
+`MIRA_RUNNER_LLM_PROVIDER` set to `zai-coding`, which uses Z.ai's Coding Plan
+endpoint (`https://api.z.ai/api/coding/paas/v4`).
+
 **Z.ai GLM Coding Plan through Claude Code.** Z.ai limits Coding Plan keys
 to supported coding tools, so Mira runs it through the Claude Code CLI, set
 up as in [Z.ai's Claude Code guide](https://docs.z.ai/devpack/tool/claude).
