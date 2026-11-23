@@ -59,6 +59,16 @@ class NonRetriableLLMError(LLMError):
     """LLM client error (4xx) that should not be retried."""
 
 
+class ProviderBusyError(LLMError):
+    """The endpoint is rate limiting or overloaded (429, 503, 529). Worth a
+    longer wait than other transient errors, honouring ``retry_after`` seconds
+    when the endpoint sent one."""
+
+    def __init__(self, code: str, retry_after: float = 0.0, **kwargs: object) -> None:
+        super().__init__(code, **kwargs)
+        self.retry_after = retry_after
+
+
 class StructuredOutputError(LLMError):
     """A successful LLM response that lacked the required structured tool call.
 

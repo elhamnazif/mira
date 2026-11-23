@@ -9,10 +9,21 @@ import re
 from typing import ClassVar, Protocol, runtime_checkable
 
 import httpx
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError, NonRetriableLLMError, StructuredOutputError
+from mira.exceptions import (
+    LLMError,
+    NonRetriableLLMError,
+    ProviderBusyError,
+    StructuredOutputError,
+)
 from mira.llm import provider_profiles as profiles
 from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL, SUBMIT_WALKTHROUGH_TOOL
 
@@ -159,6 +170,27 @@ def _retriable(exception: BaseException) -> bool:
     )
 
 
+# A busy endpoint (rate limit, overload) gets this many attempts, waiting
+# BUSY_MIN_WAIT doubling up to BUSY_MAX_WAIT seconds between them: about
+# three minutes in all, enough to ride out a provider's load spike.
+BUSY_ATTEMPTS = 6
+BUSY_MIN_WAIT = 10
+BUSY_MAX_WAIT = 60
+_BUSY_STATUSES = (429, 503, 529)
+
+
+def _retry_after(resp: httpx.Response) -> float:
+    try:
+        return max(0.0, float(resp.headers.get("retry-after", "")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _busy(state: RetryCallState) -> ProviderBusyError | None:
+    exc = state.outcome.exception() if state.outcome else None
+    return exc if isinstance(exc, ProviderBusyError) else None
+
+
 # Output budget for the one retry after a response was cut off at ``max_tokens``
 # when the configured budget was lower than this (the default is this value,
 # which the published benchmark ran with).
@@ -220,13 +252,25 @@ class OpenAICompatibleProvider:
 
         # Apply retry decorator imperatively so it reads config values
         # (max_retries, retry_min_wait, retry_max_wait) at instance time.
+        stop_default = stop_after_attempt(config.max_retries)
+        stop_busy = stop_after_attempt(BUSY_ATTEMPTS)
+        wait_default = wait_exponential(
+            multiplier=1, min=config.retry_min_wait, max=config.retry_max_wait
+        )
+        wait_busy = wait_exponential(multiplier=BUSY_MIN_WAIT, max=BUSY_MAX_WAIT)
+
+        def stop(state: RetryCallState) -> bool:
+            return (stop_busy if _busy(state) else stop_default)(state)
+
+        def wait(state: RetryCallState) -> float:
+            busy = _busy(state)
+            if busy is None:
+                return wait_default(state)
+            return min(max(busy.retry_after, wait_busy(state)), BUSY_MAX_WAIT)
+
         self._retry = retry(
-            stop=stop_after_attempt(config.max_retries),
-            wait=wait_exponential(
-                multiplier=1,
-                min=config.retry_min_wait,
-                max=config.retry_max_wait,
-            ),
+            stop=stop,
+            wait=wait,
             retry=retry_if_exception(_retriable),
             reraise=True,
         )
@@ -468,7 +512,14 @@ class OpenAICompatibleProvider:
                 raise NonRetriableLLMError(
                     "model_unavailable", status=resp.status_code, body=resp.text
                 )
-            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+            if resp.status_code in _BUSY_STATUSES:
+                raise ProviderBusyError(
+                    "api_error",
+                    retry_after=_retry_after(resp),
+                    status=resp.status_code,
+                    body=resp.text,
+                )
+            if 400 <= resp.status_code < 500:
                 raise NonRetriableLLMError("api_error", status=resp.status_code, body=resp.text)
             raise LLMError("api_error", status=resp.status_code, body=resp.text)
 

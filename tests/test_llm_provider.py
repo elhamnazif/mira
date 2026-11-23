@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from mira.config import LLMConfig
-from mira.exceptions import LLMError, NonRetriableLLMError
+from mira.exceptions import LLMError, NonRetriableLLMError, ProviderBusyError
 from mira.llm import create_llm
 from mira.llm.provider import LLMProvider
 from mira.llm.utils import _JSON_HINT
@@ -285,7 +285,7 @@ class TestPerCallTemperatureOmission:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("api_style", ["chat", "responses"])
-    @pytest.mark.parametrize("status", [400, 503])
+    @pytest.mark.parametrize("status", [400, 500])
     async def test_omission_survives_existing_retry_and_fallback_rules(
         self, monkeypatch, api_style, status
     ):
@@ -766,17 +766,47 @@ class TestComplete:
             assert mock_client.post.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_429_raises_retriable_error(self):
-        """429 (rate limit) raises LLMError and retries."""
-        config = LLMConfig(
-            model="test-model",
-            max_retries=3,
-            retry_min_wait=0,
-            retry_max_wait=0,
-        )
+    @pytest.mark.parametrize(
+        ("status", "retry_after", "waits"),
+        [
+            (429, None, [10, 20, 40, 60, 60]),
+            (503, None, [10, 20, 40, 60, 60]),
+            (429, "45", [45, 45, 45, 60, 60]),
+        ],
+    )
+    async def test_a_busy_endpoint_is_waited_out_for_minutes(self, status, retry_after, waits):
+        """A rate limit or overload is retried for about three minutes, longer
+        than other transient errors, and a Retry-After header is honoured."""
+        config = LLMConfig(model="test-model", max_retries=3, retry_min_wait=0, retry_max_wait=0)
         provider = LLMProvider(config)
+        mock_resp = _mock_httpx_response({}, status_code=status)
+        mock_resp.headers = {"retry-after": retry_after} if retry_after else {}
+        slept: list[float] = []
 
-        mock_resp = _mock_httpx_response({}, status_code=429)
+        async def record(seconds: float) -> None:
+            slept.append(seconds)
+
+        with (
+            patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls,
+            patch("asyncio.sleep", record),
+        ):
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            with pytest.raises(LLMError) as raised:
+                await provider.complete([{"role": "user", "content": "hi"}])
+
+        assert isinstance(raised.value.__cause__, ProviderBusyError)
+        assert slept == waits
+
+    @pytest.mark.asyncio
+    async def test_other_server_errors_keep_the_configured_retries(self):
+        config = LLMConfig(model="test-model", max_retries=3, retry_min_wait=0, retry_max_wait=0)
+        provider = LLMProvider(config)
+        mock_resp = _mock_httpx_response({}, status_code=500)
 
         with patch("mira.llm.provider.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -788,7 +818,6 @@ class TestComplete:
             with pytest.raises(LLMError):
                 await provider.complete([{"role": "user", "content": "hi"}])
 
-            # Retriable: 3 attempts
             assert mock_client.post.call_count == 3
 
 
