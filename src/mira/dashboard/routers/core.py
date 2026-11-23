@@ -64,9 +64,13 @@ def estimate_cost() -> CostEstimate:
         estimate_indexing_cost,
         get_indexing_model,
     )
+    from mira.runner import RunnerKind
 
     config = load_config()
     model = get_indexing_model(config.llm, _api._app_db.get_setting("indexing_model"))
+    # Repos that review on Actions index on their runner, with the runner's model.
+    if config.review.runner is RunnerKind.ACTIONS and config.review.runner_model:
+        model = config.review.runner_model
 
     # Sum file counts across all pending repos
     total_files = sum(

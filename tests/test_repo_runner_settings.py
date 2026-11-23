@@ -96,3 +96,9 @@ def test_parse_runner_llm() -> None:
     for bad in ("glm-5.3", ":glm", "zai coding:glm"):
         with pytest.raises(ValueError):
             parse_runner_llm(bad)
+
+
+def test_the_indexing_estimate_names_the_runner_model(db: AppDatabase) -> None:
+    from mira.dashboard.routers.core import estimate_cost
+
+    assert estimate_cost().model == "glm-5.3"
