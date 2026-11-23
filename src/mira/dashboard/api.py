@@ -542,6 +542,28 @@ class SetupRequest(BaseModel):
     index_mode: str  # "full" or "light"
 
 
+async def _dispatch_initial_index(record: RepoRecord) -> bool:
+    """Hand ``record``'s first index to its Actions runner when it reviews
+    on Actions. Returns whether it is the runner's to index."""
+    from mira.platforms.github.index_jobs import actions_runs_on, dispatch_repo_index
+    from mira.runner import IndexRepoTask
+
+    runs_on = actions_runs_on(record)
+    if not runs_on:
+        return False
+    full_name = f"{record.owner}/{record.repo}"
+    try:
+        task = IndexRepoTask(full=record.index_mode == "full")
+        failure = await dispatch_repo_index(_build_app_auth(), _app_db, record, task, runs_on)
+    except Exception as exc:
+        logger.exception("Could not dispatch the initial index of %s", full_name)
+        failure = str(exc) or type(exc).__name__
+        _app_db.set_repo_status(record.owner, record.repo, "failed", error=failure)
+    if failure:
+        logger.warning("Initial index of %s not started on Actions: %s", full_name, failure)
+    return True
+
+
 async def _run_initial_indexing(default_mode: str) -> None:
     """Index repos that `complete_setup` just enabled.
 
@@ -553,6 +575,7 @@ async def _run_initial_indexing(default_mode: str) -> None:
 
     repos = _app_db.list_repos()
     to_index = [r for r in repos if r.index_mode != "none" and r.status in ("pending", "indexing")]
+    to_index = [r for r in to_index if not await _dispatch_initial_index(r)]
 
     if not to_index:
         return

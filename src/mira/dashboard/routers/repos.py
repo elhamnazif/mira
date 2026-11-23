@@ -473,7 +473,23 @@ async def trigger_index(owner: str, repo: str, request: Request, full: bool = Fa
     records = _api._app_db.get_repo_any_platform(owner, repo)
     # Same owner/repo can exist on multiple platforms; prefer
     # github → gitlab → forgejo → bitbucket (the historical fallback order).
-    platform = _pick_platform_record(records).platform if records else "github"
+    record = _pick_platform_record(records) if records else None
+    platform = record.platform if record else "github"
+
+    from mira.platforms.github.index_jobs import actions_runs_on, dispatch_repo_index
+    from mira.runner import IndexRepoTask
+
+    if record is not None and (runs_on := actions_runs_on(record)):
+        failure = await dispatch_repo_index(
+            _api._build_app_auth(),
+            _api._app_db,
+            record,
+            IndexRepoTask(full=full, reset=full),
+            runs_on,
+        )
+        if failure:
+            raise HTTPException(status_code=502, detail=failure)
+        return {"status": "indexing", "full": full}
 
     from mira.platforms.fetch import EmptyRepoError, make_fetcher
 
@@ -606,6 +622,13 @@ async def cancel_index(owner: str, repo: str, request: Request) -> dict:
     from mira.index.status import tracker
 
     full_name = f"{owner}/{repo}"
+    records = _api._app_db.get_repo_any_platform(owner, repo)
+    record = _pick_platform_record(records) if records else None
+    from mira.platforms.github.index_jobs import actions_runs_on, cancel_index_jobs
+
+    if record is not None and actions_runs_on(record):
+        cancelled = await cancel_index_jobs(_api._build_app_auth(), _api._app_db, owner, repo)
+        return {"status": "cancelling" if cancelled else "not_indexing"}
     if tracker.request_cancel(full_name):
         return {"status": "cancelling"}
     return {"status": "not_indexing"}

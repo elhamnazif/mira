@@ -13,6 +13,7 @@ import io
 import logging
 import re
 import tarfile
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 from urllib.parse import quote
 
@@ -174,21 +175,26 @@ def _strip_tarball(
 
 
 class GitHubRepoFetcher:
-    """Fetches repo content via the GitHub REST API."""
+    """Fetches repo content via the GitHub REST API. ``token`` is a token or
+    an async supplier of one, awaited before each request, so a long index
+    can outlive its first token."""
 
-    def __init__(self, token: str, api_url: str = "https://api.github.com") -> None:
+    def __init__(
+        self, token: str | Callable[[], Awaitable[str]], api_url: str = "https://api.github.com"
+    ) -> None:
         self._token = token
         self._api = api_url.rstrip("/")
         self._snapshot_trees: dict[tuple[str, str, str], str] = {}
 
-    def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}", "Accept": accept}
+    async def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
+        token = self._token if isinstance(self._token, str) else await self._token()
+        return {"Authorization": f"Bearer {token}", "Accept": accept}
 
     async def default_branch(self, owner: str, repo: str) -> str:
         url = f"{self._api}/repos/{owner}/{repo}"
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(url, headers=self._headers(), timeout=15)
+                resp = await client.get(url, headers=await self._headers(), timeout=15)
                 resp.raise_for_status()
                 return str(resp.json().get("default_branch", "main"))
         except Exception as exc:
@@ -197,7 +203,7 @@ class GitHubRepoFetcher:
 
     async def branch_head(self, owner: str, repo: str, branch: str) -> str:
         url = f"{self._api}/repos/{owner}/{repo}/branches/{quote(branch, safe='')}"
-        data = await _fetch_branch(url, self._headers())
+        data = await _fetch_branch(url, await self._headers())
         commit = _branch_sha(data, "commit", "sha")
         # Content endpoints take the commit SHA. GitHub's tree API takes the tree SHA.
         self._snapshot_trees[owner, repo, commit] = _branch_sha(
@@ -209,7 +215,7 @@ class GitHubRepoFetcher:
         tree_ref = self._snapshot_trees.get((owner, repo, branch), branch)
         url = f"{self._api}/repos/{owner}/{repo}/git/trees/{quote(tree_ref, safe='')}?recursive=1"
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=self._headers(), timeout=30)
+            resp = await client.get(url, headers=await self._headers(), timeout=30)
             # GitHub returns 409 (and sometimes 404) for an empty repo.
             if resp.status_code in (404, 409):
                 raise EmptyRepoError(owner, repo)
@@ -224,7 +230,7 @@ class GitHubRepoFetcher:
         self, owner: str, repo: str, path: str, ref: str, semaphore=None
     ) -> str | None:
         url = f"{self._api}/repos/{owner}/{repo}/contents/{quote(path, safe='/')}"
-        headers = self._headers("application/vnd.github.raw+json")
+        headers = await self._headers("application/vnd.github.raw+json")
 
         async def _fetch() -> str | None:
             try:
@@ -252,7 +258,7 @@ class GitHubRepoFetcher:
         indexable_paths: set[str] | None = None,
     ) -> dict[str, str] | None:
         url = f"{self._api}/repos/{owner}/{repo}/tarball/{quote(ref, safe='')}"
-        headers = {**self._headers(), "User-Agent": "mira-indexer"}
+        headers = {**(await self._headers()), "User-Agent": "mira-indexer"}
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
                 resp = await client.get(url, headers=headers)

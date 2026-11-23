@@ -1,5 +1,5 @@
 """The runner API: an Actions runner claims its job, refreshes its GitHub
-token, and reports its result.
+token, uploads an index job's writes, and reports its result.
 
 Every route authenticates with the run's GitHub Actions OIDC token only
 (``Authorization: Bearer``), never a dashboard session. A periodic sweep
@@ -21,9 +21,11 @@ from pydantic import SecretStr, ValidationError
 from mira.config import load_config
 from mira.core.state_store import LocalStateStore
 from mira.dashboard.db import AppDatabase
+from mira.index.store import IndexStore
 from mira.models import PRInfo
 from mira.platforms.github.auth import GitHubAppAuth, InstallationToken
 from mira.platforms.github.dispatch import finish_check
+from mira.platforms.github.index_jobs import finish_index_job
 from mira.platforms.github.oidc import (
     GitHubOIDCVerifier,
     InvalidRunnerToken,
@@ -32,14 +34,22 @@ from mira.platforms.github.oidc import (
 )
 from mira.providers.base import CheckConclusion
 from mira.providers.github import GitHubProvider
-from mira.runner import JobStatus, ReviewJob, RunnerLLMChoice, parse_runner_llm
+from mira.runner import IndexRepoTask, JobStatus, ReviewJob, RunnerLLMChoice, parse_runner_llm
 from mira.runner_protocol import (
+    MAX_INDEX_PART_BYTES,
+    MAX_INDEX_PARTS,
+    IndexEnd,
+    IndexPart,
+    IndexSnapshot,
     JobSpec,
     PRKey,
+    RepoKey,
     ResultBundle,
+    StateSnapshot,
     TokenGrant,
     apply_writes,
     build_snapshot,
+    check_index_writes,
     check_writes,
     runner_config,
 )
@@ -54,10 +64,15 @@ RUNNER_TOKEN_PERMISSIONS = {
     "issues": "write",
     "checks": "write",
 }
+# An index job only reads the code.
+INDEX_TOKEN_PERMISSIONS = {"contents": "read"}
 MAX_RESULT_BYTES = 8 * 1024 * 1024
 # GitHub cancels a job that waits for a self-hosted runner for 24 hours.
 DISPATCHED_TTL_S = 25 * 3600
 SWEEP_INTERVAL_S = 600
+# The sweep keeps an ended index job's parts this long, so it never drops
+# them while another replica still applies them.
+PARTS_KEPT_S = 3600
 
 
 def _db() -> AppDatabase:
@@ -72,7 +87,22 @@ def _pr_key(job: ReviewJob) -> PRKey:
 
 
 def _pr_url(job: ReviewJob) -> str:
-    return f"https://github.com/{job.owner}/{job.repo}/pull/{job.pr_number}"
+    """The job's PR, or for an index job its repo."""
+    repo_url = f"https://github.com/{job.owner}/{job.repo}"
+    return repo_url if job.kind.indexes else f"{repo_url}/pull/{job.pr_number}"
+
+
+def _snapshot(job: ReviewJob) -> StateSnapshot | IndexSnapshot:
+    if not job.kind.indexes:
+        return build_snapshot(LocalStateStore(), _pr_key(job))
+    store = IndexStore.open(job.owner, job.repo, allow_fallback=False)
+    try:
+        files = store.list_file_digests()
+    finally:
+        store.close()
+    return IndexSnapshot(
+        repo=RepoKey(platform="github", owner=job.owner, repo=job.repo), files=files
+    )
 
 
 def _pr_info(job: ReviewJob) -> PRInfo:
@@ -156,9 +186,8 @@ def create_runner_router(
 
     async def mint(job: ReviewJob) -> InstallationToken:
         try:
-            return await app_auth.mint_repo_token(
-                job.installation_id, job.repo, RUNNER_TOKEN_PERMISSIONS
-            )
+            permissions = INDEX_TOKEN_PERMISSIONS if job.kind.indexes else RUNNER_TOKEN_PERMISSIONS
+            return await app_auth.mint_repo_token(job.installation_id, job.repo, permissions)
         except Exception as exc:
             logger.warning("Could not mint a runner token for job %s: %s", job.id, exc)
             raise HTTPException(status_code=502, detail="could not mint a GitHub token") from None
@@ -176,7 +205,7 @@ def create_runner_router(
         # job's run, retrying after it lost the first answer.
         if job.status is not JobStatus.CLAIMED:
             return _conflict(job)
-        snapshot = build_snapshot(LocalStateStore(), _pr_key(job))
+        snapshot = _snapshot(job)
         grant = await mint(job)
         config = load_config()
         review = config.review
@@ -217,6 +246,25 @@ def create_runner_router(
         body = TokenGrant(github_token=SecretStr(grant.token), token_expires_at=grant.expires_at)
         return Response(content=body.model_dump_json(), media_type="application/json")
 
+    @router.post("/jobs/{job_id}/index/{seq}")
+    async def index_part(job_id: str, seq: int, request: Request) -> Response:
+        """Stage part ``seq`` of an index job's writes until its result."""
+        job = await authorize(request, job_id)
+        if not job.kind.indexes:
+            raise HTTPException(status_code=404, detail="not an index job")
+        if job.status is not JobStatus.CLAIMED:
+            return _conflict(job)
+        raw = await _read_body(request, MAX_INDEX_PART_BYTES)
+        try:
+            if not 0 <= seq < MAX_INDEX_PARTS:
+                raise ValueError(f"part {seq} is out of range")
+            check_index_writes(IndexPart.model_validate_json(raw).writes)
+        except (ValidationError, ValueError) as exc:
+            logger.warning("Rejected part %s of job %s: %s", seq, job.id, exc)
+            raise HTTPException(status_code=422, detail="invalid index part") from None
+        _db().put_job_part(job.id, seq, raw.decode())
+        return JSONResponse(content={"seq": seq})
+
     @router.post("/jobs/{job_id}/result")
     async def result(job_id: str, request: Request) -> Response:
         job = await authorize(request, job_id)
@@ -226,6 +274,8 @@ def create_runner_router(
             if bundle.job_id != job.id:
                 raise ValueError(f"bundle is for job {bundle.job_id}")
             check_writes(_pr_key(job), bundle.writes)
+            if job.kind.indexes:
+                _check_index_result(_db(), job, bundle)
         except (ValidationError, ValueError) as exc:
             logger.warning("Rejected the result for job %s: %s", job.id, exc)
             raise HTTPException(status_code=422, detail="invalid result bundle") from None
@@ -233,6 +283,23 @@ def create_runner_router(
         # From here to the end of _accept_result nothing awaits, so no other
         # request on this server moves the job in between.
         current = _db().get_review_job(job.id) or job
+        if current.kind.indexes:
+            status, written = _accept_index_result(_db(), current, bundle)
+            if status is None:
+                return _conflict(current)
+            if (
+                written is not None
+                and isinstance(current.task, IndexRepoTask)
+                and bundle.index is not None
+                and bundle.index.end is IndexEnd.COMPLETE
+            ):
+                from mira.outbound_webhooks import INDEXING_COMPLETED, dispatch_event
+
+                await dispatch_event(
+                    INDEXING_COMPLETED,
+                    {"repo": f"{current.owner}/{current.repo}", "files_indexed": written},
+                )
+            return JSONResponse(content={"status": status, "applied": written is not None})
         status, applied = _accept_result(_db(), current, bundle)
         if status is None:
             return _conflict(current)
@@ -243,6 +310,45 @@ def create_runner_router(
         return JSONResponse(content={"status": status, "applied": applied})
 
     return router
+
+
+def _check_index_result(db: AppDatabase, job: ReviewJob, bundle: ResultBundle) -> None:
+    """Raise ValueError unless an index job's result names exactly the
+    parts it uploaded. A job that can no longer take a result is not
+    checked: its parts may be gone already."""
+    if bundle.writes:
+        raise ValueError("an index job writes no review state")
+    if bundle.index is not None and job.status is JobStatus.CLAIMED:
+        stored = db.list_job_part_seqs(job.id)
+        if stored != list(range(bundle.index.parts)):
+            raise ValueError(f"result names {bundle.index.parts} parts, the server holds {stored}")
+
+
+def _accept_index_result(
+    db: AppDatabase, job: ReviewJob, bundle: ResultBundle
+) -> tuple[JobStatus | None, int | None]:
+    """Record an index job's result and apply its writes. Returns the job's
+    status afterwards, or None when it cannot take a result, and the file
+    summaries applied, or None when nothing was applied.
+
+    Unlike a review's, the writes of a job superseded or expired after its
+    claim are not applied: a newer run owns the index, and the stale writes
+    would undo its work.
+    """
+    if job.status is not JobStatus.CLAIMED:
+        return (job.status if job.claimed_at else None), None
+    if not db.record_review_job_result(job.id, bundle.usage.model_dump(mode="json")):
+        return job.status, None
+    new = JobStatus.SUCCEEDED if bundle.outcome == "succeeded" else JobStatus.FAILED
+    if not db.transition_review_job(
+        job.id, JobStatus.CLAIMED, new, error=bundle.error if new is JobStatus.FAILED else ""
+    ):
+        moved = db.get_review_job(job.id)
+        return (moved.status if moved else job.status), None
+    try:
+        return new, finish_index_job(db, job, bundle.index, bundle.error)
+    finally:
+        db.delete_job_parts(job.id)
 
 
 def _accept_result(
@@ -313,7 +419,11 @@ async def expire_stale_jobs(
             expired.append((job, conclusion, reason))
     for job, conclusion, reason in expired:
         logger.info("Expired review job %s (%s): %s", job.id, job.status, reason)
-        await _finish_job_check(app_auth, job, conclusion, "Review expired", reason)
+        if job.kind.indexes:
+            finish_index_job(db, job, None, reason)
+        else:
+            await _finish_job_check(app_auth, job, conclusion, "Review expired", reason)
+    db.purge_job_parts(ended_before=now - PARTS_KEPT_S)
     return [job for job, _, _ in expired]
 
 

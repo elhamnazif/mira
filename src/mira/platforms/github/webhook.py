@@ -23,6 +23,7 @@ from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.github.auth import GitHubAppAuth
 from mira.platforms.github.dispatch import dispatch_job
+from mira.platforms.github.index_jobs import dispatch_index_job
 from mira.platforms.handlers import (
     _PAUSE_KEYWORDS,
     _REJECT_KEYWORDS,
@@ -46,7 +47,14 @@ from mira.platforms.mentions import (
 from mira.providers import create_provider
 from mira.providers.base import BaseProvider
 from mira.providers.github import GitHubProvider
-from mira.runner import JobTask, ReviewTask, RunnerKind, RunnerTarget, resolve_runner_target
+from mira.runner import (
+    IndexDiffTask,
+    JobTask,
+    ReviewTask,
+    RunnerKind,
+    RunnerTarget,
+    resolve_runner_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1205,6 +1213,7 @@ async def handle_push_index(
 
     If the push touches more than _INCREMENTAL_FILE_CAP files (e.g. a large
     rebase), queues a full re-index instead of inline incremental updates.
+    A repo that reviews on Actions is indexed there as a job.
     """
     installation_id: int = payload.get("installation", {}).get("id", 0)
 
@@ -1246,6 +1255,27 @@ async def handle_push_index(
             logger.debug("Push to %s/%s had no file changes", owner, repo_name)
             return
 
+        target = _runner_target(owner, repo_name)
+        if target.kind is RunnerKind.ACTIONS:
+            failure = await dispatch_index_job(
+                GitHubProvider(partial(app_auth.get_installation_token, installation_id)),
+                app_db,
+                owner,
+                repo_name,
+                IndexDiffTask(
+                    branch=default_branch,
+                    changed_paths=tuple(sorted(changed_paths)),
+                    removed_paths=tuple(sorted(removed_paths)),
+                ),
+                default_branch=default_branch,
+                installation_id=installation_id,
+                runs_on=target.runs_on,
+                server_url=load_config().review.runner_server_url,
+            )
+            if failure:
+                logger.warning("Push to %s/%s not indexed: %s", owner, repo_name, failure)
+            return
+
         await run_incremental_index(
             owner,
             repo_name,
@@ -1279,11 +1309,20 @@ def _reconcile_repo_statuses() -> None:
 
     If the actual IndexStore has files for a repo whose row says 'indexing',
     promote the row to 'ready' with the real file count. If the store is
-    empty, demote to 'pending' so the user can retry from the dashboard.
+    empty, demote to 'pending' so the user can retry from the dashboard. A
+    repo an Actions runner is still indexing keeps its row and is tracked
+    again.
     """
     app_db = _get_app_db()
+    on_runner = {(job.owner, job.repo) for job in app_db.list_active_index_jobs()}
     for r in app_db.list_repos():
         if r.status != "indexing":
+            continue
+        if (r.owner, r.repo) in on_runner and r.platform == "github":
+            # A runner is still indexing it, and its result sets the status.
+            from mira.index.status import tracker
+
+            tracker.start(f"{r.owner}/{r.repo}")
             continue
         try:
             store = IndexStore.open(r.owner, r.repo, platform=r.platform)

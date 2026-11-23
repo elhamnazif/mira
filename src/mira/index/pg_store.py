@@ -22,6 +22,7 @@ from mira.index.store import (
     DirectorySummary,
     ExternalRef,
     FeedbackEventRow,
+    FileDigest,
     FileSummary,
     IndexingSuperseded,
     IndexRun,
@@ -654,10 +655,10 @@ class PgIndexStore(_StoreSharedMixin):
         self._url = url
         _get_conn(url)  # eager connect + schema init
 
-    def claim_index_run(self) -> IndexRun:
+    def claim_index_run(self, token: str | None = None) -> IndexRun:
         if _index_write_connection.get() is not None:
             raise RuntimeError("Cannot claim an index run inside another transaction")
-        token = uuid4().hex
+        token = token or uuid4().hex
         key = (self._owner, self._repo)
         with _index_transaction(self._url) as conn:
             # An existing installation can start multiple workers at once.
@@ -881,6 +882,13 @@ class PgIndexStore(_StoreSharedMixin):
             (self._owner, self._repo),
         )
         return {r[0] for r in rows}
+
+    def list_file_digests(self) -> list[FileDigest]:
+        rows = self._fetchall(
+            "SELECT path, content_hash, summary FROM files WHERE owner=%s AND repo=%s",
+            (self._owner, self._repo),
+        )
+        return [FileDigest(*row) for row in rows]
 
     # ── Directories ──
 

@@ -2,9 +2,10 @@
 
 The run proves who it is with its Actions OIDC token, claims the job from
 the server, and runs the job's task: a review with the real engine against
-the claimed state snapshot, or an answer to an @mention through the same
-handler the server uses in local mode. It posts the writes back in one
-result bundle. Exit codes:
+the claimed state snapshot, an answer to an @mention through the same
+handler the server uses in local mode, or an index of the repo through the
+server's own indexer. It posts the writes back in one result bundle, after
+an index's writes in parts. Exit codes:
 
 - 0: the task finished and the server has its result, or the job was
   no longer this run's to claim (409).
@@ -33,16 +34,39 @@ from mira.config import MiraConfig, _is_local_host, set_global_defaults_data
 from mira.core.engine import ReviewEngine
 from mira.dashboard.models_config import llm_config_for
 from mira.exceptions import ConfigError, MiraError
+from mira.index.indexer import IndexingRecoveryPending, index_repo
 from mira.llm import create_llm, slugs
 from mira.llm import provider_profiles as profiles
 from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
 from mira.llm.provider_errors import classify_provider_error
 from mira.models import ReviewResult
+from mira.platforms.fetch import EmptyRepoError, GitHubRepoFetcher
 from mira.platforms.handlers import answer_question, reply_in_thread
+from mira.platforms.index_handlers import index_push
 from mira.providers.github import _GITHUB_API_URL as GITHUB_API_URL
 from mira.providers.github import GitHubProvider
-from mira.runner import AskTask, ReviewRestTask, ReviewTask, ThreadReplyTask
-from mira.runner_protocol import JobSpec, RemoteStateStore, ResultBundle, TokenGrant, UsageReport
+from mira.runner import (
+    AskTask,
+    IndexDiffTask,
+    IndexRepoTask,
+    IndexTask,
+    ReviewRestTask,
+    ReviewTask,
+    ThreadReplyTask,
+)
+from mira.runner_protocol import (
+    MAX_INDEX_PART_BYTES,
+    IndexEnd,
+    IndexReport,
+    IndexSnapshot,
+    JobSpec,
+    RemoteIndexStore,
+    RemoteStateStore,
+    ResultBundle,
+    TokenGrant,
+    UsageReport,
+    index_parts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +76,8 @@ _BACKOFF_S: tuple[float, ...] = (2, 4, 8, 16, 30, 60, 60)
 # stored its run id, so it is retried a few times.
 _FORBIDDEN_RETRIES_S: tuple[float, ...] = (5, 10, 15)
 _RETRY_STATUSES = frozenset({502, 503, 504})
+# The largest index part the runner uploads. Tests shrink it.
+_PART_BYTES = MAX_INDEX_PART_BYTES
 # Refresh the GitHub token this long before it expires.
 TOKEN_REFRESH_MARGIN = timedelta(minutes=5)
 # The key of an endpoint the runner is pointed at by URL.
@@ -174,6 +200,11 @@ class RunnerAPI:
         grant = TokenGrant.model_validate_json(resp.content)
         _mask(grant.github_token.get_secret_value())
         return grant
+
+    async def post_index_part(self, seq: int, body: bytes) -> None:
+        resp = await self.post(f"index/{seq}", body)
+        if resp.status_code != 200:
+            raise RunnerError(f"index part {seq} refused: HTTP {resp.status_code}")
 
     async def post_result(self, bundle: ResultBundle) -> None:
         resp = await self.post("result", bundle.model_dump_json().encode())
@@ -422,10 +453,10 @@ async def run_job(
         )
 
     tokens = TokenSupplier(api, spec)
-    store = RemoteStateStore(spec.snapshot)
+    store = _store(spec)
     # Filled as the LLMs are made, so a failed review still reports their usage.
     llms: list[Any] = []
-    work = asyncio.create_task(_run_task(spec, llm, tokens, store, llms))
+    work = asyncio.create_task(_run_task(spec, llm, api, tokens, store, llms))
     with _cancel_on_signal(work) as signals:
         try:
             error = await _task_error(work, signals, timeout, spec.pr_url)
@@ -455,8 +486,24 @@ def _adopt_credentials(spec: JobSpec) -> None:
             os.environ[name] = value
 
 
+def _store(spec: JobSpec) -> RemoteStateStore | RemoteIndexStore:
+    """Where the job's task reads and writes state. JobSpec checks that an
+    index task comes with an index snapshot and every other task with a
+    PR's."""
+    if isinstance(spec.snapshot, IndexSnapshot):
+        task = spec.task
+        reconcile = isinstance(task, IndexRepoTask) and task.reconcile
+        return RemoteIndexStore(spec.snapshot, reconcile=reconcile)
+    return RemoteStateStore(spec.snapshot)
+
+
 async def _run_task(
-    spec: JobSpec, llm: RunnerLLM, tokens: TokenSupplier, store: RemoteStateStore, llms: list[Any]
+    spec: JobSpec,
+    llm: RunnerLLM,
+    api: RunnerAPI,
+    tokens: TokenSupplier,
+    store: RemoteStateStore | RemoteIndexStore,
+    llms: list[Any],
 ) -> str:
     """Run the job's task. Returns why it failed, or "" if it did not."""
     config = job_config(spec, llm)
@@ -467,8 +514,12 @@ async def _run_task(
     # A missing secret fails the job here, not after a review of failed calls.
     for each in {id(each): each for each in llms}.values():
         each.preflight()
-    provider = GitHubProvider(tokens, on_unauthorized=tokens.invalidate)
     task = spec.task
+    if isinstance(task, IndexRepoTask | IndexDiffTask):
+        assert isinstance(store, RemoteIndexStore)
+        return await _run_index(api, task, config, llms[1], tokens, store)
+    assert isinstance(store, RemoteStateStore)
+    provider = GitHubProvider(tokens, on_unauthorized=tokens.invalidate)
     match task:
         case AskTask():
             await answer_question(provider, llms[0], spec.pr_url, task)
@@ -501,6 +552,76 @@ async def _run_task(
                 review_only_paths=set(task.paths) if isinstance(task, ReviewRestTask) else None,
             )
             return _review_failure(await engine.review_pr(spec.pr_url), spec.pr_url)
+
+
+_INCOMPLETE = (
+    "Index incomplete: some files could not be read or summarized, "
+    "so the next index run reconciles them"
+)
+
+
+async def _run_index(
+    api: RunnerAPI,
+    task: IndexTask,
+    config: MiraConfig,
+    llm: Any,
+    tokens: TokenSupplier,
+    store: RemoteIndexStore,
+) -> str:
+    """Index the repo into ``store`` with the server's indexer, then upload
+    the writes. Returns why the job failed, or "" if it did not. A run that
+    fails outright uploads nothing, so the server's index is untouched."""
+    owner, repo = store.repo.owner, store.repo.repo
+    fetcher = GitHubRepoFetcher(tokens, GITHUB_API_URL)
+    run = store.claim_index_run()
+    error = ""
+    try:
+        match task:
+            case IndexRepoTask(full=full, reset=reset):
+                await index_repo(
+                    owner,
+                    repo,
+                    config=config,
+                    store=store,
+                    llm=llm,
+                    full=full,
+                    reset=reset,
+                    fetcher=fetcher,
+                    run=run,
+                )
+            case IndexDiffTask():
+                await index_push(
+                    owner,
+                    repo,
+                    fetcher,
+                    list(task.changed_paths),
+                    list(task.removed_paths),
+                    task.branch,
+                    config=config,
+                    store=store,
+                    llm=llm,
+                    run=run,
+                )
+        end = IndexEnd.COMPLETE if store.finished else IndexEnd.INCOMPLETE
+    except IndexingRecoveryPending as exc:
+        logger.warning("Index of %s/%s is incomplete: %s", owner, repo, exc)
+        end = IndexEnd.INCOMPLETE
+    except EmptyRepoError:
+        end = IndexEnd.EMPTY
+    if end is IndexEnd.INCOMPLETE:
+        error = _INCOMPLETE
+    try:
+        parts = index_parts(store.writes, _PART_BYTES)
+        for seq, body in enumerate(parts):
+            await api.post_index_part(seq, body)
+    except (ValueError, RunnerError) as exc:
+        logger.error("Could not upload the index of %s/%s: %s", owner, repo, exc)
+        return f"Index upload failed: {exc}"
+    store.report = IndexReport(end=end, parts=len(parts))
+    logger.info(
+        "Indexed %s/%s (%s): %d writes in %d parts", owner, repo, end, len(store.writes), len(parts)
+    )
+    return error
 
 
 def _review_failure(result: ReviewResult, pr_url: str) -> str:

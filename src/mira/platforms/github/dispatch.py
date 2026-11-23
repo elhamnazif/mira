@@ -74,18 +74,59 @@ async def finish_check(
         logger.warning("Failed to finish check run %s on %s: %s", check_run_id, pr_info.url, exc)
 
 
+async def cancel_run(provider: GitHubProvider, job: ReviewJob) -> None:
+    """Best effort: cancel a superseded job's workflow run."""
+    if job.run_id is None:
+        logger.warning("Superseded job %s has no workflow run to cancel", job.id)
+        return
+    try:
+        await provider.cancel_workflow_run(job.owner, job.repo, job.run_id)
+        logger.info("Cancelled workflow run %s of superseded job %s", job.run_id, job.id)
+    except Exception as exc:
+        logger.warning("Could not cancel workflow run %s of job %s: %s", job.run_id, job.id, exc)
+
+
+async def start_workflow(
+    provider: GitHubProvider,
+    db: AppDatabase,
+    job: ReviewJob,
+    *,
+    default_branch: str,
+    server_url: str,
+) -> str:
+    """Dispatch the job's workflow run and record it. Returns why GitHub
+    did not start it, or "" when it did."""
+    if not server_url:
+        return _NO_SERVER_URL
+    try:
+        run = await provider.dispatch_workflow(
+            job.owner,
+            job.repo,
+            WORKFLOW_FILE,
+            ref=default_branch,
+            inputs={
+                "job_id": job.id,
+                "runs_on": json.dumps(list(job.runs_on)),
+                "server_url": server_url,
+            },
+        )
+    except Exception as exc:
+        logger.warning("Could not dispatch %s for job %s: %s", WORKFLOW_FILE, job.id, exc)
+        return _failure_message(exc)
+    db.set_review_job_run(job.id, run.id, run.html_url)
+    return ""
+
+
+def superseded_in_flight(db: AppDatabase, job: ReviewJob) -> ReviewJob | None:
+    """The job, when a newer one superseded it while its dispatch was in
+    flight, before there was a run to cancel."""
+    current = db.get_review_job(job.id)
+    return current if current is not None and current.status is JobStatus.SUPERSEDED else None
+
+
 async def _retire(provider: GitHubProvider, job: ReviewJob, pr_info: PRInfo) -> None:
     """Best effort: cancel a superseded job's run and close its check."""
-    if job.run_id is None:
-        logger.warning("Superseded review job %s has no workflow run to cancel", job.id)
-    else:
-        try:
-            await provider.cancel_workflow_run(job.owner, job.repo, job.run_id)
-            logger.info("Cancelled workflow run %s of superseded job %s", job.run_id, job.id)
-        except Exception as exc:
-            logger.warning(
-                "Could not cancel workflow run %s of job %s: %s", job.run_id, job.id, exc
-            )
+    await cancel_run(provider, job)
     await finish_check(
         provider,
         pr_info,
@@ -166,30 +207,12 @@ async def dispatch_job(
         )
         return RunnerDispatchError(message)
 
-    if not server_url:
-        raise await fail(_NO_SERVER_URL)
-    try:
-        run = await provider.dispatch_workflow(
-            owner,
-            repo,
-            WORKFLOW_FILE,
-            ref=default_branch,
-            inputs={
-                "job_id": job.id,
-                "runs_on": json.dumps(list(runs_on)),
-                "server_url": server_url,
-            },
-        )
-    except Exception as exc:
-        raise await fail(_failure_message(exc)) from exc
-
-    db.set_review_job_run(job.id, run.id, run.html_url)
-    current = db.get_review_job(job.id)
-    if current is not None and current.status is JobStatus.SUPERSEDED:
-        # A newer push superseded this job while its dispatch was in flight,
-        # before there was a run to cancel.
+    failure = await start_workflow(
+        provider, db, job, default_branch=default_branch, server_url=server_url
+    )
+    if failure:
+        raise await fail(failure)
+    if (current := superseded_in_flight(db, job)) is not None:
         await _retire(provider, current, pr_info)
         return
-    logger.info(
-        "Dispatched %s of %s to %s (job %s, run %s)", job.kind, pr_info.url, runs_on, job.id, run.id
-    )
+    logger.info("Dispatched %s of %s to %s (job %s)", job.kind, pr_info.url, runs_on, job.id)

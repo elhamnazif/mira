@@ -25,6 +25,7 @@ from mira.index.store import (
     IndexingSuperseded,
     IndexRun,
     IndexStore,
+    IndexWriter,
     SymbolInfo,
 )
 from mira.llm import create_llm
@@ -365,7 +366,7 @@ async def _summarize_batch(
 
 
 @contextmanager
-def _complete_index_run(store: IndexStore, run: IndexRun) -> Iterator[None]:
+def _complete_index_run(store: IndexWriter, run: IndexRun) -> Iterator[None]:
     # Keep the pending marker after an exception or cancellation. A later
     # incremental push must reconcile paths it may not have in its payload.
     try:
@@ -400,7 +401,7 @@ async def index_repo(
     repo: str,
     token: str | None = None,
     config: MiraConfig | None = None,
-    store: IndexStore | None = None,
+    store: IndexWriter | None = None,
     llm: Any = None,
     full: bool = False,
     branch: str | None = None,
@@ -465,7 +466,7 @@ async def _index_repo(
     owner: str,
     repo: str,
     config: MiraConfig,
-    store: IndexStore,
+    store: IndexWriter,
     llm: Any,
     fetcher: RepoFetcher,
     branch: str | None,
@@ -734,7 +735,7 @@ async def _index_conventions(
     fetch_sem: asyncio.Semaphore,
     cached_contents: dict[str, str] | None = None,
     *,
-    store: IndexStore,
+    store: IndexWriter,
     run: IndexRun,
     platform: str = "github",
 ) -> None:
@@ -762,10 +763,8 @@ async def _index_conventions(
         return
 
     try:
-        from mira.dashboard.api import _app_db
-
         with store.index_write(run):
-            _app_db.set_repo_conventions(owner, repo, extracted, platform=platform)
+            store.set_repo_conventions(owner, repo, extracted, platform=platform)
         logger.info(
             "Extracted %d-char conventions block for %s/%s from %s",
             len(extracted),
@@ -781,7 +780,7 @@ async def _index_conventions(
         logger.warning("Failed to persist conventions for %s/%s: %s", owner, repo, exc)
 
 
-def _store_manifest_file(store: IndexStore, path: str, content: str) -> int:
+def _store_manifest_file(store: IndexWriter, path: str, content: str) -> int:
     """Parse one manifest and replace its package rows. An empty parse still
     replaces, so stale entries for the path are dropped. Returns package count."""
     packages = parse_manifest(path, content, for_inventory=True)
@@ -807,7 +806,7 @@ async def _index_manifests(
     repo: str,
     fetcher: RepoFetcher,
     branch: str,
-    store: IndexStore,
+    store: IndexWriter,
     tree_paths: list[str],
     fetch_sem: asyncio.Semaphore,
     cached_contents: dict[str, str] | None = None,
@@ -847,7 +846,7 @@ async def _index_manifests(
 
 
 async def _summarize_directories(
-    store: IndexStore, llm: Any, semaphore: asyncio.Semaphore, run: IndexRun
+    store: IndexWriter, llm: Any, semaphore: asyncio.Semaphore, run: IndexRun
 ) -> None:
     """Generate directory summaries from file summaries.
 
@@ -962,7 +961,7 @@ async def _refresh_manifests_incremental(
     repo: str,
     fetcher: RepoFetcher,
     branch: str,
-    store: IndexStore,
+    store: IndexWriter,
     changed_paths: list[str] | None,
     removed_paths: list[str] | None,
     run: IndexRun,
@@ -996,7 +995,7 @@ async def index_diff(
     repo: str,
     token: str | None = None,
     config: MiraConfig | None = None,
-    store: IndexStore | None = None,
+    store: IndexWriter | None = None,
     llm: Any = None,
     changed_paths: list[str] | None = None,
     removed_paths: list[str] | None = None,
@@ -1065,7 +1064,7 @@ async def _index_diff(
     owner: str,
     repo: str,
     config: MiraConfig,
-    store: IndexStore,
+    store: IndexWriter,
     llm: Any,
     fetcher: RepoFetcher,
     branch: str,
@@ -1158,7 +1157,7 @@ async def _index_diff(
 
 
 async def _summarize_directories_selective(
-    store: IndexStore,
+    store: IndexWriter,
     llm: Any,
     semaphore: asyncio.Semaphore,
     target_dirs: set[str],

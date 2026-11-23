@@ -10,20 +10,43 @@ applies them with :func:`apply_writes`.
 Writes carry no owner or repo, and only review and feedback records name a
 PR. The server applies them to the job's own PR, so a runner cannot write
 state for a repo it was not sent to.
+
+An index job gets an :class:`IndexSnapshot` instead and indexes through a
+:class:`RemoteIndexStore`. Its :data:`IndexWrite` s can outgrow one request,
+so the runner uploads them as :class:`IndexPart` s before its result, and
+the server applies every part to the job's repo in one transaction when the
+result lands (:func:`apply_index_writes`).
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, SecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    SecretStr,
+    TypeAdapter,
+    model_validator,
+)
 
 from mira.config import MiraConfig, _strip_deployment_only_settings
 from mira.core.state_store import FeedbackRecord, ReviewRecord, ReviewStateStore
 from mira.dashboard.db import PRReviewProgress, RepoRecord, ReviewedVersion
-from mira.index.store import ReviewContext
+from mira.index.store import (
+    DirectorySummary,
+    FileDigest,
+    FileSummary,
+    IndexRun,
+    IndexWriter,
+    ReviewContext,
+)
 from mira.models import PRFingerprint
 from mira.runner import JobTask, ReviewTask
 
@@ -109,6 +132,102 @@ StateWrite = Annotated[
 ]
 
 
+class RepoKey(_Wire):
+    platform: str
+    owner: str
+    repo: str
+
+
+class IndexSnapshot(_Wire):
+    """What indexing reads back from the repo's index: each indexed file's
+    content hash and summary."""
+
+    repo: RepoKey
+    files: list[FileDigest]
+
+
+class RemoveIndexedPaths(_Wire):
+    op: Literal["remove_paths"] = "remove_paths"
+    paths: list[str]
+
+
+class UpsertFileSummary(_Wire):
+    op: Literal["upsert_summary"] = "upsert_summary"
+    summary: FileSummary
+
+
+class UpsertDirectorySummary(_Wire):
+    op: Literal["upsert_directory"] = "upsert_directory"
+    directory: DirectorySummary
+
+
+class ManifestPackage(_Wire):
+    name: str
+    kind: str
+    version: str
+    file_path: str
+    is_dev: bool
+    scan_eligible: bool = True
+
+
+class ReplaceManifestPackages(_Wire):
+    op: Literal["replace_manifest_packages"] = "replace_manifest_packages"
+    path: str
+    packages: list[ManifestPackage]
+
+
+class ClearMissingManifests(_Wire):
+    """Drop the packages of every manifest not in ``live_paths``."""
+
+    op: Literal["clear_missing_manifests"] = "clear_missing_manifests"
+    live_paths: list[str]
+
+
+class SetConventions(_Wire):
+    op: Literal["set_conventions"] = "set_conventions"
+    conventions: str
+
+
+IndexWrite = Annotated[
+    RemoveIndexedPaths
+    | UpsertFileSummary
+    | UpsertDirectorySummary
+    | ReplaceManifestPackages
+    | ClearMissingManifests
+    | SetConventions,
+    Field(discriminator="op"),
+]
+_INDEX_WRITE: TypeAdapter[IndexWrite] = TypeAdapter(IndexWrite)
+
+MAX_INDEX_PART_BYTES = 4 * 1024 * 1024
+MAX_INDEX_PARTS = 256
+# Paths per RemoveIndexedPaths, so a reset of a large repo still fits a part.
+_PATHS_PER_WRITE = 1000
+
+
+class IndexPart(_Wire):
+    writes: list[IndexWrite]
+
+
+class IndexEnd(StrEnum):
+    """How an index run that left its writes fit to apply ended."""
+
+    # The run finished, so the index is current.
+    COMPLETE = "complete"
+    # Some files were missed. The writes stand, and the next run reconciles.
+    INCOMPLETE = "incomplete"
+    # The repo has no commits yet.
+    EMPTY = "empty"
+
+
+class IndexReport(_Wire):
+    """An index job's outcome: how its run ended and how many parts it
+    uploaded. A job that reports none has no writes to apply."""
+
+    end: IndexEnd
+    parts: int = Field(ge=0, le=MAX_INDEX_PARTS)
+
+
 class JobSpec(_Wire):
     job_id: str
     # A spec from a server older than job kinds carries no task: a review.
@@ -121,7 +240,9 @@ class JobSpec(_Wire):
     # MiraConfig as plain data, without the settings that describe the
     # server's own machine (see runner_config).
     config: dict[str, Any]
-    snapshot: StateSnapshot
+    # An IndexSnapshot for an index job, which is on the repo: pr_url is
+    # then the repo's URL and head_sha is empty.
+    snapshot: StateSnapshot | IndexSnapshot
     github_token: WireSecret
     token_expires_at: datetime
     # Model credentials from the server (review.runner_credentials), by env
@@ -129,6 +250,14 @@ class JobSpec(_Wire):
     credentials: dict[str, WireSecret] = Field(default_factory=dict)
     llm_provider: str = ""
     llm_model: str = ""
+
+    @model_validator(mode="after")
+    def _snapshot_fits_task(self) -> JobSpec:
+        if self.task.kind.indexes != isinstance(self.snapshot, IndexSnapshot):
+            raise ValueError(
+                f"a {self.task.kind} job cannot run on a {type(self.snapshot).__name__}"
+            )
+        return self
 
 
 class TokenGrant(_Wire):
@@ -150,6 +279,7 @@ class ResultBundle(_Wire):
     error: str = Field(default="", max_length=4000)
     writes: list[StateWrite] = Field(default_factory=list)
     usage: UsageReport = Field(default_factory=UsageReport)
+    index: IndexReport | None = None
 
 
 def runner_config(config: MiraConfig) -> dict[str, Any]:
@@ -334,3 +464,146 @@ def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite
                 store.upsert_pr_fingerprint(owner, repo, fingerprint, platform=platform)
             case RecordFeedback(feedback=feedback):
                 store.record_feedback(owner, repo, feedback, platform=platform)
+
+
+class RemoteIndexStore:
+    """The repo's index for a runner's index job, read from a snapshot.
+
+    Writes are buffered in order, and later reads see them. ``get_summary``
+    returns only the content hash and summary, which is all indexing reads
+    back. ``index_write`` fences nothing here: the server applies the writes
+    under the job's own index run. ``finished`` says whether indexing
+    finished its run, and ``report`` is set once the writes are uploaded.
+    """
+
+    def __init__(self, snapshot: IndexSnapshot, *, reconcile: bool) -> None:
+        self.repo = snapshot.repo
+        self._reconcile = reconcile
+        self._files = {digest.path: digest for digest in snapshot.files}
+        self.writes: list[IndexWrite] = []
+        self.finished = False
+        self.report: IndexReport | None = None
+
+    def claim_index_run(self, token: str | None = None) -> IndexRun:
+        return IndexRun(token or "runner", self._reconcile)
+
+    @contextmanager
+    def index_write(self, run: IndexRun) -> Iterator[None]:
+        yield
+
+    def finish_index_run(self, run: IndexRun) -> None:
+        self.finished = True
+
+    def get_summary(self, path: str) -> FileSummary | None:
+        digest = self._files.get(path)
+        if digest is None:
+            return None
+        return FileSummary(
+            path=path, language="", summary=digest.summary, content_hash=digest.content_hash
+        )
+
+    def all_paths(self) -> set[str]:
+        return set(self._files)
+
+    def upsert_summary(self, summary: FileSummary) -> None:
+        self._files[summary.path] = FileDigest(summary.path, summary.content_hash, summary.summary)
+        self.writes.append(UpsertFileSummary(summary=summary))
+
+    def upsert_directory(self, summary: DirectorySummary) -> None:
+        self.writes.append(UpsertDirectorySummary(directory=summary))
+
+    def remove_paths(self, paths: list[str]) -> None:
+        for path in paths:
+            self._files.pop(path, None)
+        for i in range(0, len(paths), _PATHS_PER_WRITE):
+            self.writes.append(RemoveIndexedPaths(paths=paths[i : i + _PATHS_PER_WRITE]))
+
+    def replace_manifest_packages(self, file_path: str, packages: list[dict]) -> int:
+        manifest = [ManifestPackage.model_validate(package) for package in packages]
+        self.writes.append(ReplaceManifestPackages(path=file_path, packages=manifest))
+        return len(packages)
+
+    def clear_manifest_packages_for_missing_files(self, live_paths: set[str]) -> int:
+        self.writes.append(ClearMissingManifests(live_paths=sorted(live_paths)))
+        return 0
+
+    def set_repo_conventions(
+        self, owner: str, repo: str, conventions: str, *, platform: str
+    ) -> None:
+        if (platform, owner, repo) != (self.repo.platform, self.repo.owner, self.repo.repo):
+            raise ValueError(f"this runner indexes {self.repo}, not {owner}/{repo}")
+        self.writes.append(SetConventions(conventions=conventions))
+
+    def close(self) -> None:
+        pass
+
+    def bundle(
+        self,
+        job_id: str,
+        outcome: Literal["succeeded", "failed"],
+        *,
+        error: str = "",
+        usage: UsageReport | None = None,
+    ) -> ResultBundle:
+        return ResultBundle(
+            job_id=job_id,
+            outcome=outcome,
+            error=error,
+            usage=usage or UsageReport(),
+            index=self.report,
+        )
+
+
+def index_parts(writes: Sequence[IndexWrite], max_bytes: int = MAX_INDEX_PART_BYTES) -> list[bytes]:
+    """``writes`` in order as serialized :class:`IndexPart` bodies of at most
+    ``max_bytes`` each. Raises ValueError when one write alone is larger, or
+    when there are more than :data:`MAX_INDEX_PARTS` parts."""
+    head, tail = b'{"writes":[', b"]}"
+    parts: list[list[bytes]] = []
+    size = max_bytes
+    for write in writes:
+        item = _INDEX_WRITE.dump_json(write)
+        if len(head) + len(item) + len(tail) > max_bytes:
+            raise ValueError(f"a {write.op} write of {len(item)} bytes does not fit in a part")
+        if size + 1 + len(item) > max_bytes:
+            parts.append([])
+            size = len(head) + len(tail) - 1
+        parts[-1].append(item)
+        size += 1 + len(item)
+    if len(parts) > MAX_INDEX_PARTS:
+        raise ValueError(f"the index is {len(parts)} parts, over the limit of {MAX_INDEX_PARTS}")
+    return [head + b",".join(items) + tail for items in parts]
+
+
+def check_index_writes(writes: Sequence[IndexWrite]) -> None:
+    """Raise ValueError when a manifest write lists a package of another file."""
+    for write in writes:
+        if isinstance(write, ReplaceManifestPackages) and any(
+            package.file_path != write.path for package in write.packages
+        ):
+            raise ValueError(f"packages of another file in the manifest write for {write.path}")
+
+
+def apply_index_writes(store: IndexWriter, repo: RepoKey, writes: Sequence[IndexWrite]) -> int:
+    """Apply a runner's index writes to ``repo``'s index, in order, inside
+    the caller's ``index_write``. Returns the file summaries written."""
+    check_index_writes(writes)
+    summaries = 0
+    for write in writes:
+        match write:
+            case RemoveIndexedPaths(paths=paths):
+                store.remove_paths(paths)
+            case UpsertFileSummary(summary=summary):
+                store.upsert_summary(summary)
+                summaries += 1
+            case UpsertDirectorySummary(directory=directory):
+                store.upsert_directory(directory)
+            case ReplaceManifestPackages(path=path, packages=packages):
+                store.replace_manifest_packages(path, [p.model_dump() for p in packages])
+            case ClearMissingManifests(live_paths=live_paths):
+                store.clear_manifest_packages_for_missing_files(set(live_paths))
+            case SetConventions(conventions=conventions):
+                store.set_repo_conventions(
+                    repo.owner, repo.repo, conventions, platform=repo.platform
+                )
+    return summaries

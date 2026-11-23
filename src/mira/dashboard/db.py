@@ -22,6 +22,7 @@ from typing import Any
 
 from mira.runner import (
     ACTIVE_JOB_STATUSES,
+    REPO_JOB,
     JobStatus,
     ReviewJob,
     check_transition,
@@ -250,6 +251,15 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     payload TEXT NOT NULL DEFAULT '{}'  -- the job's task, as JSON without its kind
 );
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
+
+-- An index job's writes, uploaded in parts before its result and applied
+-- together when the result lands (mira.runner_protocol.IndexPart).
+CREATE TABLE IF NOT EXISTS runner_job_parts (
+    job_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+);
 """
 
 _PG_SCHEMA = """
@@ -432,6 +442,15 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     payload TEXT NOT NULL DEFAULT '{}'  -- the job's task, as JSON without its kind
 );
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
+
+-- An index job's writes, uploaded in parts before its result and applied
+-- together when the result lands (mira.runner_protocol.IndexPart).
+CREATE TABLE IF NOT EXISTS runner_job_parts (
+    job_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+);
 """
 
 SESSION_DURATION = 86400 * 7  # 7 days
@@ -2035,6 +2054,47 @@ class AppDatabase:
                 (json.dumps(usage), job_id),
             )
             > 0
+        )
+
+    def list_active_index_jobs(self) -> list[ReviewJob]:
+        """Index jobs that are dispatched or claimed, on every repo."""
+        rows = self._rows(
+            f"SELECT {self._REVIEW_JOB_COLUMNS} FROM review_jobs "
+            "WHERE pr_number=? AND status IN (?, ?) ORDER BY created_at",
+            (REPO_JOB, *(s.value for s in ACTIVE_JOB_STATUSES)),
+        )
+        return [job for job in map(self._row_to_review_job, rows) if job.kind.indexes]
+
+    def put_job_part(self, job_id: str, seq: int, body: str) -> None:
+        """Store part ``seq`` of a job's upload. A retried part replaces it."""
+        self._exec(
+            "INSERT INTO runner_job_parts (job_id, seq, body) VALUES (?, ?, ?) "
+            "ON CONFLICT (job_id, seq) DO UPDATE SET body=excluded.body",
+            (job_id, seq, body),
+        )
+
+    def list_job_part_seqs(self, job_id: str) -> list[int]:
+        rows = self._rows("SELECT seq FROM runner_job_parts WHERE job_id=? ORDER BY seq", (job_id,))
+        return [row[0] for row in rows]
+
+    def get_job_part(self, job_id: str, seq: int) -> str:
+        rows = self._rows(
+            "SELECT body FROM runner_job_parts WHERE job_id=? AND seq=?", (job_id, seq)
+        )
+        if not rows:
+            raise KeyError(f"job {job_id} has no part {seq}")
+        return str(rows[0][0])
+
+    def delete_job_parts(self, job_id: str) -> None:
+        self._exec("DELETE FROM runner_job_parts WHERE job_id=?", (job_id,))
+
+    def purge_job_parts(self, ended_before: float) -> int:
+        """Drop the parts of every job that ended before ``ended_before``. A
+        job that ended since may still be applying its parts."""
+        return self._exec(
+            "DELETE FROM runner_job_parts WHERE job_id NOT IN "
+            "(SELECT id FROM review_jobs WHERE finished_at=0 OR finished_at>=?)",
+            (ended_before,),
         )
 
     def list_stale_review_jobs(

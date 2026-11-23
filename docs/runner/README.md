@@ -178,6 +178,43 @@ A push supersedes the PR's queued or running review and review-rest jobs and
 cancels their runs. It never cancels a question or a thread reply, and a
 question never cancels a review.
 
+## Indexing
+
+On a repo that reviews on Actions, the server calls no model to index it.
+Each of these dispatches an index job through the same `mira.yml`:
+
+- **Index** or **Full re-index** on the dashboard, and the first index of a
+  newly added repo.
+- A push to the default branch. The job indexes the changed and removed
+  files. A push too large to index file by file becomes a whole-repo index.
+
+The job's GitHub token has only **Contents: read**. The runner indexes with
+the server's own indexer against a snapshot of the repo's index: each
+indexed file's path, content hash and summary. A file whose content has not
+changed is not summarized again.
+
+The runner uploads its writes to `/runner/jobs/{id}/index/{seq}` in parts of
+at most 4 MiB, then posts its result. The server stages the parts and applies
+them all in one transaction when the result lands. Reviews read the index
+only from the server, so they never see a partly applied job.
+
+At dispatch the job claims the repo's index, so until a newer job or a local
+index run claims it, only this job's result can write to it.
+
+- A newer index job supersedes the repo's queued or running one and cancels
+  its run. The late result of a superseded or expired job is never applied.
+- A push that supersedes a job, or that finds the index pending, becomes a
+  whole-repo index that reconciles it.
+- A job that fails, is cancelled from the dashboard, or never reports leaves
+  the index as it was and marked pending, so the next index job reconciles
+  it. A job that indexes only some files applies them, and the index stays
+  pending.
+
+The repo's status, file count, last-indexed time and the dashboard's
+indexing progress follow the job. A whole-repo index shows as indexing from
+dispatch until its result. A failed job leaves a repo that has an index
+**ready**, so pushes keep indexing it, and shows the job's error.
+
 ## Not yet on Actions
 
 Learning from a merged PR keeps its rule-based signals on a repo that reviews

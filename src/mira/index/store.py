@@ -9,9 +9,10 @@ import re
 import sqlite3
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 from uuid import uuid4
 
 from mira.index._package_search import PackageGroups, matching_sqlite_packages
@@ -243,6 +244,17 @@ class FileSummary:
     updated_at: float = 0.0
 
 
+@dataclass(frozen=True)
+class FileDigest:
+    """What indexing reads back about an indexed file: its content hash, to
+    skip the file while it is unchanged, and its summary, for its
+    directory's summary."""
+
+    path: str
+    content_hash: str
+    summary: str
+
+
 @dataclass
 class DirectorySummary:
     path: str
@@ -430,6 +442,37 @@ class IndexingSuperseded(Exception):
     """A newer indexing run owns this repository."""
 
 
+class IndexWriter(Protocol):
+    """The index store as indexing uses it: IndexStore, PgIndexStore, and
+    the runner's RemoteIndexStore, which buffers the writes."""
+
+    def claim_index_run(self, token: str | None = None) -> IndexRun: ...
+
+    def index_write(self, run: IndexRun) -> AbstractContextManager[None]: ...
+
+    def finish_index_run(self, run: IndexRun) -> None: ...
+
+    def get_summary(self, path: str) -> FileSummary | None: ...
+
+    def all_paths(self) -> set[str]: ...
+
+    def upsert_summary(self, summary: FileSummary) -> None: ...
+
+    def upsert_directory(self, summary: DirectorySummary) -> None: ...
+
+    def remove_paths(self, paths: list[str]) -> None: ...
+
+    def replace_manifest_packages(self, file_path: str, packages: list[dict]) -> int: ...
+
+    def clear_manifest_packages_for_missing_files(self, live_paths: set[str]) -> int: ...
+
+    def set_repo_conventions(
+        self, owner: str, repo: str, conventions: str, *, platform: str
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class IndexStore(_StoreSharedMixin):
     """SQLite-backed index for a single repository."""
 
@@ -613,11 +656,12 @@ class IndexStore(_StoreSharedMixin):
         db_path = os.path.join(repo_dir, f"{repo}.db")
         return cls(db_path)
 
-    def claim_index_run(self) -> IndexRun:
-        """Persist a new owner before acquiring any index input."""
+    def claim_index_run(self, token: str | None = None) -> IndexRun:
+        """Persist a new owner before acquiring any index input. A run that
+        outlives this process, such as a runner job, names its own token."""
         if self._conn.in_transaction:
             raise RuntimeError("Cannot claim an index run inside another transaction")
-        token = uuid4().hex
+        token = token or uuid4().hex
         with self._conn:
             self._conn.execute("BEGIN IMMEDIATE")
             previous = self._conn.execute("SELECT pending FROM index_runs WHERE id=1").fetchone()
@@ -774,6 +818,10 @@ class IndexStore(_StoreSharedMixin):
         """Return all indexed file paths."""
         rows = self._conn.execute("SELECT path FROM files").fetchall()
         return {r[0] for r in rows}
+
+    def list_file_digests(self) -> list[FileDigest]:
+        rows = self._conn.execute("SELECT path, content_hash, summary FROM files").fetchall()
+        return [FileDigest(*row) for row in rows]
 
     def get_call_graph(self, path: str, symbol: str) -> list[tuple[str, str]]:
         """Who calls this symbol? Returns list of (file_path, calling_symbol)."""

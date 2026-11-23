@@ -44,6 +44,15 @@ class _StoreSharedMixin:
             result.extend(self._load_external_refs(path))  # type: ignore[attr-defined]
         return result
 
+    def set_repo_conventions(
+        self, owner: str, repo: str, conventions: str, *, platform: str
+    ) -> None:
+        """Store the conventions indexing extracted on the repo's row, which
+        lives in the app database rather than the index."""
+        from mira.dashboard.api import _app_db
+
+        _app_db.set_repo_conventions(owner, repo, conventions, platform=platform)
+
     def get_learned_rules_text(self) -> list[str]:
         rules = self.list_active_learned_rules()  # type: ignore[attr-defined]
         return [r.rule_text for r in rules[:10]]

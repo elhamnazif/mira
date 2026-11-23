@@ -3,7 +3,7 @@
 ``local`` runs every model call in the server process. ``actions``
 dispatches the repo's ``mira.yml`` workflow, whose ``runs-on`` takes the
 target's labels, and tracks the run as a :class:`ReviewJob`. A job runs one
-:data:`JobTask`: a review, or an answer to an @mention.
+:data:`JobTask`: a review, an answer to an @mention, or an index of the repo.
 """
 
 from __future__ import annotations
@@ -126,12 +126,20 @@ class JobKind(StrEnum):
     REVIEW_REST = "review_rest"
     ASK = "ask"
     THREAD_REPLY = "thread_reply"
+    INDEX_REPO = "index_repo"
+    INDEX_DIFF = "index_diff"
 
     @property
     def reviews_pr(self) -> bool:
         """Whether the job reviews the PR and writes its review state. A PR
         has one such job active at a time. The others only post a reply."""
         return self in (JobKind.REVIEW, JobKind.REVIEW_REST)
+
+    @property
+    def indexes(self) -> bool:
+        """Whether the job writes the repo's index. Such a job is on the
+        repo, not a PR, and a repo has one active at a time."""
+        return self in (JobKind.INDEX_REPO, JobKind.INDEX_DIFF)
 
 
 class _Task(BaseModel):
@@ -181,8 +189,31 @@ class ThreadReplyTask(_Task):
     may_resolve: bool
 
 
+class IndexRepoTask(_Task):
+    """Index the repo's default branch. ``full`` summarizes unchanged files
+    again and ``reset`` first drops the whole index. ``reconcile`` is set at
+    dispatch when an earlier index run did not finish: the run must then
+    reach every file, or it leaves the index pending."""
+
+    kind: Literal[JobKind.INDEX_REPO] = JobKind.INDEX_REPO
+    full: bool = False
+    reset: bool = False
+    reconcile: bool = False
+
+
+class IndexDiffTask(_Task):
+    """Index a push to the default branch ``branch``."""
+
+    kind: Literal[JobKind.INDEX_DIFF] = JobKind.INDEX_DIFF
+    branch: str
+    changed_paths: tuple[str, ...]
+    removed_paths: tuple[str, ...]
+
+
+IndexTask = IndexRepoTask | IndexDiffTask
 JobTask = Annotated[
-    ReviewTask | ReviewRestTask | AskTask | ThreadReplyTask, Field(discriminator="kind")
+    ReviewTask | ReviewRestTask | AskTask | ThreadReplyTask | IndexRepoTask | IndexDiffTask,
+    Field(discriminator="kind"),
 ]
 _JOB_TASK: TypeAdapter[JobTask] = TypeAdapter(JobTask)
 
@@ -196,10 +227,15 @@ def parse_task(kind: str, payload: str) -> JobTask:
     return _JOB_TASK.validate_python({**json.loads(payload), "kind": kind})
 
 
+# The pr_number of a job on the whole repo. GitHub numbers PRs from 1.
+REPO_JOB = 0
+
+
 @dataclass
 class ReviewJob:
     """One dispatched job. ``id`` is the unguessable workflow input the
-    runner later presents to claim the job."""
+    runner later presents to claim the job. An index job is on the whole
+    repo: its ``pr_number`` is :data:`REPO_JOB` and its ``head_sha`` empty."""
 
     id: str
     owner: str
