@@ -369,7 +369,8 @@ export interface ContributorSummary {
   previous: ContributionWindow
 }
 
-export type ContributorSort = "commits" | "prs" | "reviews" | "recent" | "additions"
+export type ContributorSort =
+  "commits" | "prs" | "reviews" | "recent" | "additions"
 export type StatsPeriod = "day" | "week" | "month"
 
 // ── Review insights ──

@@ -173,16 +173,15 @@ function groupByPR(events: ActivityEventModel[]): PRGroup[] {
 }
 
 type SortKey =
-  | "repo"
-  | "pr_number"
-  | "reviews"
-  | "last_reviewed"
-  | "comments"
-  | "severity"
+  "repo" | "pr_number" | "reviews" | "last_reviewed" | "comments" | "severity"
 type SortDir = "asc" | "desc"
 
 // Rank by severity: blockers dominate, then warnings, then suggestions.
-function severityWeight(c: { blockers: number; warnings: number; suggestions: number }) {
+function severityWeight(c: {
+  blockers: number
+  warnings: number
+  suggestions: number
+}) {
   return c.blockers * 1_000_000 + c.warnings * 1_000 + c.suggestions
 }
 
@@ -213,7 +212,20 @@ function formatChartDate(d: string) {
   if (d.includes("W")) return `Week ${parseInt(d.split("W")[1])}`
   if (d.length === 7) {
     const [y, m] = d.split("-")
-    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    const months = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sep",
+      "Oct",
+      "Nov",
+      "Dec",
+    ]
     return `${months[parseInt(m) - 1]} ${y}`
   }
   const parts = d.split("-")
@@ -262,11 +274,15 @@ function AuthorAvatar({
       title={username || undefined}
       className={cn(
         "inline-flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted text-[10px] font-medium text-muted-foreground ring-1 ring-foreground/10",
-        className,
+        className
       )}
     >
       {avatarUrl ? (
-        <img src={avatarUrl} alt={username} className="h-full w-full object-cover" />
+        <img
+          src={avatarUrl}
+          alt={username}
+          className="h-full w-full object-cover"
+        />
       ) : (
         initial
       )}
@@ -282,11 +298,19 @@ function MiraMark({ className }: { className?: string }) {
       title="Mira"
       className={cn(
         "inline-flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded-full bg-primary/10 ring-1 ring-primary/20",
-        className,
+        className
       )}
     >
-      <img src="/logo.png" alt="Mira" className="hidden h-3.5 w-3.5 dark:block" />
-      <img src="/logo-light.png" alt="Mira" className="h-3.5 w-3.5 dark:hidden" />
+      <img
+        src="/logo.png"
+        alt="Mira"
+        className="hidden h-3.5 w-3.5 dark:block"
+      />
+      <img
+        src="/logo-light.png"
+        alt="Mira"
+        className="h-3.5 w-3.5 dark:hidden"
+      />
     </span>
   )
 }
@@ -297,10 +321,17 @@ function SeverityBadges({
   counts: { blockers: number; warnings: number; suggestions: number }
 }) {
   const parts: { label: string; kind: keyof typeof SEVERITY_PILL }[] = []
-  if (counts.blockers > 0) parts.push({ label: plural(counts.blockers, "blocker"), kind: "blocker" })
-  if (counts.warnings > 0) parts.push({ label: plural(counts.warnings, "warning"), kind: "warning" })
-  if (counts.suggestions > 0) parts.push({ label: plural(counts.suggestions, "suggestion"), kind: "suggestion" })
-  if (parts.length === 0) return <span className="text-muted-foreground">—</span>
+  if (counts.blockers > 0)
+    parts.push({ label: plural(counts.blockers, "blocker"), kind: "blocker" })
+  if (counts.warnings > 0)
+    parts.push({ label: plural(counts.warnings, "warning"), kind: "warning" })
+  if (counts.suggestions > 0)
+    parts.push({
+      label: plural(counts.suggestions, "suggestion"),
+      kind: "suggestion",
+    })
+  if (parts.length === 0)
+    return <span className="text-muted-foreground">—</span>
   return (
     <div className="flex flex-wrap gap-1">
       {parts.map((p) => (
@@ -377,26 +408,34 @@ export function ActivityPage() {
 
   const { data: timeseries, loading: chartLoading } = useAsync(
     () => api.getTimeseries(period),
-    [period, refreshKey],
+    [period, refreshKey]
   )
 
-  const { data: activity, loading, error } = useAsync(
+  const {
+    data: activity,
+    loading,
+    error,
+  } = useAsync(
     () =>
       api.listActivity({
         limit: 1000,
         q: debouncedSearch || undefined,
         repo: repo === ALL_REPOS ? undefined : repo,
       }),
-    [debouncedSearch, repo, refreshKey],
+    [debouncedSearch, repo, refreshKey]
   )
 
   // Full per-PR detail (reviews + comments + files + replies) for the panel.
   const { data: detail, loading: detailLoading } = useAsync(
     () =>
       selected
-        ? api.getActivityDetail(selected.owner, selected.repo, selected.pr_number)
+        ? api.getActivityDetail(
+            selected.owner,
+            selected.repo,
+            selected.pr_number
+          )
         : Promise.resolve(null),
-    [selected?.owner, selected?.repo, selected?.pr_number],
+    [selected?.owner, selected?.repo, selected?.pr_number]
   )
 
   const events = useMemo(() => activity?.events ?? [], [activity?.events])
@@ -436,7 +475,7 @@ export function ActivityPage() {
       s.key === key
         ? { key, dir: s.dir === "asc" ? "desc" : "asc" }
         : // Text sorts ascending first; numbers/dates descending first.
-          { key, dir: key === "repo" ? "asc" : "desc" },
+          { key, dir: key === "repo" ? "asc" : "desc" }
     )
 
   // Pagination. Reset to the first page whenever the result set changes shape.
@@ -458,7 +497,7 @@ export function ActivityPage() {
   const safePage = Math.min(page, totalPages - 1)
   const pagedPRs = sortedPRs.slice(
     safePage * pageSize,
-    safePage * pageSize + pageSize,
+    safePage * pageSize + pageSize
   )
   const rangeStart = sortedPRs.length === 0 ? 0 : safePage * pageSize + 1
   const rangeEnd = Math.min(sortedPRs.length, safePage * pageSize + pageSize)
@@ -483,7 +522,7 @@ export function ActivityPage() {
             <button
               key={p}
               onClick={() => setPeriod(p)}
-              className={`inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+              className={`inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
                 period === p
                   ? "border-primary bg-primary/10 text-primary"
                   : "border-input bg-background text-muted-foreground hover:bg-accent hover:text-accent-foreground"
@@ -502,15 +541,34 @@ export function ActivityPage() {
             <Skeleton className="h-[160px] w-full" />
           ) : timeseries && timeseries.length > 0 ? (
             <ChartContainer config={chartConfig} className="h-[160px] w-full">
-              <AreaChart data={timeseries} margin={{ left: 4, right: 4, top: 4 }}>
+              <AreaChart
+                data={timeseries}
+                margin={{ left: 4, right: 4, top: 4 }}
+              >
                 <defs>
                   <linearGradient id="fillReviews" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="var(--color-reviews)" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="var(--color-reviews)" stopOpacity={0.05} />
+                    <stop
+                      offset="5%"
+                      stopColor="var(--color-reviews)"
+                      stopOpacity={0.4}
+                    />
+                    <stop
+                      offset="95%"
+                      stopColor="var(--color-reviews)"
+                      stopOpacity={0.05}
+                    />
                   </linearGradient>
                   <linearGradient id="fillComments" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="var(--color-comments)" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="var(--color-comments)" stopOpacity={0.05} />
+                    <stop
+                      offset="5%"
+                      stopColor="var(--color-comments)"
+                      stopOpacity={0.4}
+                    />
+                    <stop
+                      offset="95%"
+                      stopColor="var(--color-comments)"
+                      stopOpacity={0.05}
+                    />
                   </linearGradient>
                 </defs>
                 <CartesianGrid vertical={false} />
@@ -550,7 +608,7 @@ export function ActivityPage() {
       {/* Controls: search, recency filter, repo filter, refresh, live */}
       <div className="flex shrink-0 flex-col gap-2 lg:flex-row lg:items-center">
         <div className="relative flex-1">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             aria-label="Search activity"
             placeholder="Search by PR title, number, repo, or category…"
@@ -560,7 +618,9 @@ export function ActivityPage() {
           />
         </div>
         <Select value={windowSel} onValueChange={setWindowSel}>
-          <SelectTrigger className={cn("lg:w-44", windowSel !== "any" && ACTIVE_FILTER)}>
+          <SelectTrigger
+            className={cn("lg:w-44", windowSel !== "any" && ACTIVE_FILTER)}
+          >
             <SelectValue placeholder="Any time" />
           </SelectTrigger>
           <SelectContent>
@@ -572,7 +632,9 @@ export function ActivityPage() {
           </SelectContent>
         </Select>
         <Select value={repo} onValueChange={setRepo}>
-          <SelectTrigger className={cn("lg:w-56", repo !== ALL_REPOS && ACTIVE_FILTER)}>
+          <SelectTrigger
+            className={cn("lg:w-56", repo !== ALL_REPOS && ACTIVE_FILTER)}
+          >
             <SelectValue placeholder="All repos" />
           </SelectTrigger>
           <SelectContent>
@@ -600,13 +662,15 @@ export function ActivityPage() {
           size="sm"
           onClick={() => setLive((v) => !v)}
           title={live ? "Live — auto-refreshing" : "Enable live auto-refresh"}
-          aria-label={live ? "Disable live auto-refresh" : "Enable live auto-refresh"}
+          aria-label={
+            live ? "Disable live auto-refresh" : "Enable live auto-refresh"
+          }
           aria-pressed={live}
         >
           <span
             className={cn(
               "h-2 w-2 rounded-full",
-              live ? "animate-pulse bg-green-500" : "bg-muted-foreground",
+              live ? "animate-pulse bg-green-500" : "bg-muted-foreground"
             )}
           />
           {live ? (
@@ -648,13 +712,43 @@ export function ActivityPage() {
               <Table containerClassName="overflow-x-visible overflow-y-visible">
                 <TableHeader className="sticky top-0 z-10 bg-background shadow-[0_1px_0_0_var(--border)]">
                   <TableRow>
-                    <SortHead label="Repo" sortKey="repo" sort={sort} onSort={toggleSort} />
+                    <SortHead
+                      label="Repo"
+                      sortKey="repo"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
                     <TableHead>Author</TableHead>
-                    <SortHead label="PR" sortKey="pr_number" sort={sort} onSort={toggleSort} />
-                    <SortHead label="Reviews" sortKey="reviews" sort={sort} onSort={toggleSort} />
-                    <SortHead label="Last reviewed" sortKey="last_reviewed" sort={sort} onSort={toggleSort} />
-                    <SortHead label="Comments" sortKey="comments" sort={sort} onSort={toggleSort} />
-                    <SortHead label="Severity" sortKey="severity" sort={sort} onSort={toggleSort} />
+                    <SortHead
+                      label="PR"
+                      sortKey="pr_number"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
+                    <SortHead
+                      label="Reviews"
+                      sortKey="reviews"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
+                    <SortHead
+                      label="Last reviewed"
+                      sortKey="last_reviewed"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
+                    <SortHead
+                      label="Comments"
+                      sortKey="comments"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
+                    <SortHead
+                      label="Severity"
+                      sortKey="severity"
+                      sort={sort}
+                      onSort={toggleSort}
+                    />
                     <TableHead>Categories</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -666,7 +760,7 @@ export function ActivityPage() {
                       className="cursor-pointer data-[active=true]:bg-muted/60"
                       onClick={() => openDetail(g)}
                     >
-                      <TableCell className="whitespace-nowrap font-mono text-xs text-muted-foreground">
+                      <TableCell className="font-mono text-xs whitespace-nowrap text-muted-foreground">
                         {g.owner}/{g.repo}
                       </TableCell>
                       <TableCell>
@@ -711,7 +805,11 @@ export function ActivityPage() {
                       <TableCell>
                         <div className="flex flex-wrap gap-1">
                           {splitCategories(g.categories).map((c) => (
-                            <Badge key={c} variant="secondary" className={PILL_RING}>
+                            <Badge
+                              key={c}
+                              variant="secondary"
+                              className={PILL_RING}
+                            >
                               {c}
                             </Badge>
                           ))}
@@ -764,7 +862,9 @@ export function ActivityPage() {
                 <Button
                   variant="outline"
                   size="icon-sm"
-                  onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                  onClick={() =>
+                    setPage((p) => Math.min(totalPages - 1, p + 1))
+                  }
                   disabled={safePage >= totalPages - 1}
                   aria-label="Next page"
                 >
@@ -782,8 +882,8 @@ export function ActivityPage() {
       <div
         aria-hidden={!panelOpen}
         className={cn(
-          "fixed right-0 top-12 bottom-0 z-30 flex w-full max-w-[640px] flex-col border-l bg-background shadow-2xl transition-transform duration-300 ease-in-out",
-          panelOpen ? "translate-x-0" : "pointer-events-none translate-x-full",
+          "fixed top-12 right-0 bottom-0 z-30 flex w-full max-w-[640px] flex-col border-l bg-background shadow-2xl transition-transform duration-300 ease-in-out",
+          panelOpen ? "translate-x-0" : "pointer-events-none translate-x-full"
         )}
       >
         {selected && (
@@ -837,7 +937,7 @@ export function ActivityPage() {
             <div className="themed-scrollbar flex-1 space-y-6 overflow-y-auto p-6">
               {/* Summary — findings + totals across all review passes */}
               <div>
-                <h3 className="mb-2 text-xs font-medium uppercase text-muted-foreground">
+                <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase">
                   Findings
                 </h3>
                 <SeverityBadges
@@ -852,15 +952,27 @@ export function ActivityPage() {
               <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
                 <Stat label="Reviews" value={selected.reviewCount} />
                 <Stat label="Comments posted" value={selected.totalComments} />
-                <Stat label="Files reviewed" value={selected.latest.files_reviewed} />
-                <Stat label="Lines changed" value={selected.latest.lines_changed.toLocaleString()} />
-                <Stat label="Tokens used" value={selected.totalTokens.toLocaleString()} />
-                <Stat label="Total time" value={`${(selected.totalDurationMs / 1000).toFixed(1)}s`} />
+                <Stat
+                  label="Files reviewed"
+                  value={selected.latest.files_reviewed}
+                />
+                <Stat
+                  label="Lines changed"
+                  value={selected.latest.lines_changed.toLocaleString()}
+                />
+                <Stat
+                  label="Tokens used"
+                  value={selected.totalTokens.toLocaleString()}
+                />
+                <Stat
+                  label="Total time"
+                  value={`${(selected.totalDurationMs / 1000).toFixed(1)}s`}
+                />
               </dl>
 
               {splitCategories(selected.categories).length > 0 && (
                 <div>
-                  <h3 className="mb-2 text-xs font-medium uppercase text-muted-foreground">
+                  <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase">
                     Categories
                   </h3>
                   <div className="flex flex-wrap gap-1">
@@ -875,7 +987,7 @@ export function ActivityPage() {
 
               {/* Conversation timeline — review passes + human replies */}
               <div>
-                <h3 className="mb-4 text-xs font-medium uppercase text-muted-foreground">
+                <h3 className="mb-4 text-xs font-medium text-muted-foreground uppercase">
                   Timeline
                 </h3>
                 {(() => {
@@ -889,7 +1001,9 @@ export function ActivityPage() {
                   if (!matched) {
                     return (
                       <div className="text-xs text-muted-foreground">
-                        {detailLoading ? "Loading timeline…" : "No timeline recorded."}
+                        {detailLoading
+                          ? "Loading timeline…"
+                          : "No timeline recorded."}
                       </div>
                     )
                   }
@@ -930,13 +1044,16 @@ function ConversationTimeline({ detail }: { detail: ActivityDetailModel }) {
     const reviewIdForComment = new Map<number, number>()
     for (const r of detail.reviews) {
       for (const c of r.comments) {
-        if (c.github_comment_id) reviewIdForComment.set(c.github_comment_id, r.id)
+        if (c.github_comment_id)
+          reviewIdForComment.set(c.github_comment_id, r.id)
       }
     }
 
     const byComment: RepliesByComment = new Map()
     const looseByReview = new Map<number, PRReplyModel[]>()
-    const passesAsc = [...detail.reviews].sort((a, b) => a.created_at - b.created_at)
+    const passesAsc = [...detail.reviews].sort(
+      (a, b) => a.created_at - b.created_at
+    )
 
     for (const reply of detail.replies) {
       const owns =
@@ -958,7 +1075,8 @@ function ConversationTimeline({ detail }: { detail: ActivityDetailModel }) {
       }
     }
 
-    for (const arr of byComment.values()) arr.sort((a, b) => a.created_at - b.created_at)
+    for (const arr of byComment.values())
+      arr.sort((a, b) => a.created_at - b.created_at)
 
     return [...detail.reviews]
       .sort((a, b) => b.created_at - a.created_at)
@@ -966,13 +1084,15 @@ function ConversationTimeline({ detail }: { detail: ActivityDetailModel }) {
         review,
         repliesByComment: byComment,
         looseReplies: (looseByReview.get(review.id) ?? []).sort(
-          (a, b) => a.created_at - b.created_at,
+          (a, b) => a.created_at - b.created_at
         ),
       }))
   }, [detail])
 
   if (threads.length === 0) {
-    return <div className="text-xs text-muted-foreground">No activity recorded.</div>
+    return (
+      <div className="text-xs text-muted-foreground">No activity recorded.</div>
+    )
   }
 
   return (
@@ -986,7 +1106,10 @@ function ConversationTimeline({ detail }: { detail: ActivityDetailModel }) {
               {!last && <span className="w-px grow bg-border" />}
             </div>
             <div className={cn("flex-1", last ? "pb-1" : "pb-8")}>
-              <ReviewEntry review={t.review} repliesByComment={t.repliesByComment} />
+              <ReviewEntry
+                review={t.review}
+                repliesByComment={t.repliesByComment}
+              />
               {t.looseReplies.length > 0 && (
                 <div className="mt-3 space-y-2">
                   {t.looseReplies.map((r) => (
@@ -1038,7 +1161,7 @@ function ReviewEntry({
                 <span
                   className={cn(
                     "h-1.5 w-1.5 shrink-0 rounded-full",
-                    SEV_DOT[c.severity?.toLowerCase()] ?? "bg-muted-foreground",
+                    SEV_DOT[c.severity?.toLowerCase()] ?? "bg-muted-foreground"
                   )}
                 />
                 <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
@@ -1047,10 +1170,12 @@ function ReviewEntry({
                 </span>
               </div>
               {c.title && (
-                <div className="mt-0.5 pl-[0.875rem] text-xs font-medium">{c.title}</div>
+                <div className="mt-0.5 pl-[0.875rem] text-xs font-medium">
+                  {c.title}
+                </div>
               )}
               {c.body && (
-                <div className="mt-0.5 pl-[0.875rem] whitespace-pre-wrap text-xs text-muted-foreground">
+                <div className="mt-0.5 pl-[0.875rem] text-xs whitespace-pre-wrap text-muted-foreground">
                   {c.body}
                 </div>
               )}
@@ -1092,8 +1217,10 @@ function ReviewEntry({
       )}
 
       <div className="mt-2 text-xs text-muted-foreground">
-        {plural(review.comments_posted, "comment")} · {review.lines_changed.toLocaleString()} lines ·{" "}
-        {review.tokens_used.toLocaleString()} tokens · {(review.duration_ms / 1000).toFixed(1)}s
+        {plural(review.comments_posted, "comment")} ·{" "}
+        {review.lines_changed.toLocaleString()} lines ·{" "}
+        {review.tokens_used.toLocaleString()} tokens ·{" "}
+        {(review.duration_ms / 1000).toFixed(1)}s
       </div>
     </>
   )
@@ -1114,7 +1241,9 @@ function ReplyEntry({ reply }: { reply: PRReplyModel }) {
           <span className="truncate text-sm font-medium">
             {reply.author || "Someone"}
           </span>
-          <span className="shrink-0 text-xs text-muted-foreground">replied</span>
+          <span className="shrink-0 text-xs text-muted-foreground">
+            replied
+          </span>
         </div>
         <span
           className="shrink-0 text-xs text-muted-foreground"
@@ -1130,7 +1259,7 @@ function ReplyEntry({ reply }: { reply: PRReplyModel }) {
         </div>
       )}
       {reply.body && (
-        <div className="mt-1 whitespace-pre-wrap text-xs">{reply.body}</div>
+        <div className="mt-1 text-xs whitespace-pre-wrap">{reply.body}</div>
       )}
     </div>
   )
@@ -1150,7 +1279,11 @@ function SortHead({
   align?: "left" | "right"
 }) {
   const active = sort.key === sortKey
-  const Icon = active ? (sort.dir === "asc" ? ChevronUp : ChevronDown) : ChevronsUpDown
+  const Icon = active
+    ? sort.dir === "asc"
+      ? ChevronUp
+      : ChevronDown
+    : ChevronsUpDown
   return (
     <TableHead className={align === "right" ? "text-right" : undefined}>
       <button
@@ -1160,14 +1293,14 @@ function SortHead({
         className={cn(
           "inline-flex items-center gap-1 transition-colors hover:text-foreground",
           align === "right" && "flex-row-reverse",
-          active ? "text-foreground" : "text-muted-foreground",
+          active ? "text-foreground" : "text-muted-foreground"
         )}
       >
         {label}
         <Icon
           className={cn(
             "h-3.5 w-3.5",
-            active ? "text-foreground" : "text-muted-foreground/50",
+            active ? "text-foreground" : "text-muted-foreground/50"
           )}
         />
       </button>
