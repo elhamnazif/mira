@@ -1,14 +1,15 @@
 """The wire protocol between the Mira server and an Actions review runner.
 
-The runner claims its job and receives a :class:`JobSpec`: a snapshot of
-every piece of review state ``engine.review_pr`` reads for the PR, plus a
-repo-scoped GitHub token. It reviews through a :class:`RemoteStateStore`,
-which answers reads from the snapshot and buffers writes, and sends the
-writes back in one :class:`ResultBundle`. The server applies them with
-:func:`apply_writes`.
+The runner claims its job and receives a :class:`JobSpec`: the task to run,
+a snapshot of every piece of review state ``engine.review_pr`` reads for the
+PR, and a repo-scoped GitHub token. It runs the task through a
+:class:`RemoteStateStore`, which answers reads from the snapshot and buffers
+writes, and sends the writes back in one :class:`ResultBundle`. The server
+applies them with :func:`apply_writes`.
 
-Writes carry no owner, repo or PR number. The server applies them to the
-job's own PR, so a runner cannot write state for a repo it was not sent to.
+Writes carry no owner or repo, and only review and feedback records name a
+PR. The server applies them to the job's own PR, so a runner cannot write
+state for a repo it was not sent to.
 """
 
 from __future__ import annotations
@@ -20,10 +21,11 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, SecretStr
 
 from mira.config import MiraConfig, _strip_deployment_only_settings
-from mira.core.state_store import ReviewRecord, ReviewStateStore
+from mira.core.state_store import FeedbackRecord, ReviewRecord, ReviewStateStore
 from mira.dashboard.db import PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import ReviewContext
 from mira.models import PRFingerprint
+from mira.runner import JobTask, ReviewTask
 
 # A secret that serializes to its value on the wire but never shows in a repr
 # or a log line.
@@ -92,14 +94,25 @@ class UpsertPRFingerprint(_Wire):
     fingerprint: PRFingerprint
 
 
+class RecordFeedback(_Wire):
+    op: Literal["record_feedback"] = "record_feedback"
+    feedback: FeedbackRecord
+
+
 StateWrite = Annotated[
-    SetLastReviewedSha | UpsertPRReviewProgress | RecordReview | UpsertPRFingerprint,
+    SetLastReviewedSha
+    | UpsertPRReviewProgress
+    | RecordReview
+    | UpsertPRFingerprint
+    | RecordFeedback,
     Field(discriminator="op"),
 ]
 
 
 class JobSpec(_Wire):
     job_id: str
+    # A spec from a server older than job kinds carries no task: a review.
+    task: JobTask = ReviewTask()
     pr_url: str
     head_sha: str
     platform: Literal["github"]
@@ -259,6 +272,12 @@ class RemoteStateStore:
         self._fingerprints[fingerprint.pr_number] = fingerprint
         self.writes.append(UpsertPRFingerprint(fingerprint=fingerprint))
 
+    def record_feedback(
+        self, owner: str, repo: str, feedback: FeedbackRecord, *, platform: str
+    ) -> None:
+        self._check_pr(owner, repo, feedback.pr_number, platform)
+        self.writes.append(RecordFeedback(feedback=feedback))
+
     def bundle(
         self,
         job_id: str,
@@ -277,11 +296,15 @@ class RemoteStateStore:
 
 
 def check_writes(pr: PRKey, writes: Sequence[StateWrite]) -> None:
-    """Raise ValueError when a write does not belong to ``pr``. Only a review
-    record names its PR; every other write takes the job's."""
+    """Raise ValueError when a write does not belong to ``pr``. Only review
+    and feedback records name their PR; every other write takes the job's."""
     for write in writes:
-        if isinstance(write, RecordReview) and write.review.pr_number != pr.pr_number:
-            raise ValueError(f"review record for PR {write.review.pr_number}, job is {pr}")
+        match write:
+            case (
+                RecordReview(review=ReviewRecord(pr_number=number))
+                | RecordFeedback(feedback=FeedbackRecord(pr_number=number))
+            ) if number != pr.pr_number:
+                raise ValueError(f"{write.op} for PR {number}, job is {pr}")
 
 
 def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite]) -> None:
@@ -309,3 +332,5 @@ def apply_writes(store: ReviewStateStore, pr: PRKey, writes: Sequence[StateWrite
                 store.record_review(owner, repo, review, platform=platform)
             case UpsertPRFingerprint(fingerprint=fingerprint):
                 store.upsert_pr_fingerprint(owner, repo, fingerprint, platform=platform)
+            case RecordFeedback(feedback=feedback):
+                store.record_feedback(owner, repo, feedback, platform=platform)

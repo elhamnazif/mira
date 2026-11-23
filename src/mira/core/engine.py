@@ -619,10 +619,14 @@ class ReviewEngine:
         security_llm: LLMProviderProtocol | None = None,
         state: ReviewStateStore | None = None,
         check_run_id: int | None = None,
+        review_only_paths: set[str] | None = None,
     ) -> None:
         """``check_run_id`` names a check run already queued for this PR's head,
         as the server does for an Actions runner. The review starts and
-        completes that run instead of creating its own."""
+        completes that run instead of creating its own.
+
+        ``review_only_paths`` makes this a review-rest pass over just those
+        files, the ones an earlier pass skipped."""
         self.config = config
         self.llm = llm
         self.indexing_llm = indexing_llm or llm
@@ -630,6 +634,7 @@ class ReviewEngine:
         self.provider = provider
         self.state = state
         self.check_run_id = check_run_id
+        self._review_only_paths = review_only_paths
         self.bot_name = bot_name
         self.dry_run = dry_run
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
@@ -1046,7 +1051,7 @@ class ReviewEngine:
         # round 1 onto never-reviewed files, so it stays round 1 (full
         # thresholds, full diff) even though the first pass left threads behind.
         review_round = 1
-        is_review_rest = getattr(self, "_review_only_paths", None) is not None
+        is_review_rest = self._review_only_paths is not None
         resolved_thread_dicts: list[dict] = []
         # Threads from earlier rounds nobody has resolved. The walkthrough is
         # the verdict on the whole PR, so they count in its score, its key
@@ -1592,7 +1597,7 @@ class ReviewEngine:
                 skipped_reason="All files matched exclusion rules",
             )
 
-        only_paths = getattr(self, "_review_only_paths", None)
+        only_paths = self._review_only_paths
         selected, skipped = _select_files_by_priority(
             filtered,
             max_total_size=self.config.review.max_diff_size,

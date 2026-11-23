@@ -1,13 +1,15 @@
-"""``mira runner``: review one dispatched job inside its GitHub Actions run.
+"""``mira runner``: run one dispatched job inside its GitHub Actions run.
 
 The run proves who it is with its Actions OIDC token, claims the job from
-the server, reviews the PR with the real engine against the claimed state
-snapshot, and posts the writes back in one result bundle. Exit codes:
+the server, and runs the job's task: a review with the real engine against
+the claimed state snapshot, or an answer to an @mention through the same
+handler the server uses in local mode. It posts the writes back in one
+result bundle. Exit codes:
 
-- 0: the review finished and the server has its result, or the job was
+- 0: the task finished and the server has its result, or the job was
   no longer this run's to claim (409).
-- 1: the server refused or could not be reached, or the review failed.
-  A failed review still posts ``outcome=failed`` first.
+- 1: the server refused or could not be reached, or the task failed.
+  A failed task still posts ``outcome=failed`` first.
 """
 
 from __future__ import annotations
@@ -36,8 +38,10 @@ from mira.llm import provider_profiles as profiles
 from mira.llm.agent_cli import CLAUDE_CODE_PROVIDER_NAMES
 from mira.llm.provider_errors import classify_provider_error
 from mira.models import ReviewResult
+from mira.platforms.handlers import answer_question, reply_in_thread
 from mira.providers.github import _GITHUB_API_URL as GITHUB_API_URL
 from mira.providers.github import GitHubProvider
+from mira.runner import AskTask, ReviewRestTask, ReviewTask, ThreadReplyTask
 from mira.runner_protocol import JobSpec, RemoteStateStore, ResultBundle, TokenGrant, UsageReport
 
 logger = logging.getLogger(__name__)
@@ -406,7 +410,9 @@ async def run_job(
         return 1
     if spec is None:
         return 0
-    logger.info("Claimed job %s: %s at %s", job_id, spec.pr_url, spec.head_sha[:12])
+    logger.info(
+        "Claimed %s job %s: %s at %s", spec.task.kind, job_id, spec.pr_url, spec.head_sha[:12]
+    )
     _adopt_credentials(spec)
     if not llm.chosen():
         llm = RunnerLLM(
@@ -419,10 +425,10 @@ async def run_job(
     store = RemoteStateStore(spec.snapshot)
     # Filled as the LLMs are made, so a failed review still reports their usage.
     llms: list[Any] = []
-    review = asyncio.create_task(_review(spec, llm, tokens, store, llms))
-    with _cancel_on_signal(review) as signals:
+    work = asyncio.create_task(_run_task(spec, llm, tokens, store, llms))
+    with _cancel_on_signal(work) as signals:
         try:
-            error = await _review_error(review, signals, timeout, spec.pr_url)
+            error = await _task_error(work, signals, timeout, spec.pr_url)
             outcome: Literal["succeeded", "failed"] = "failed" if error else "succeeded"
             bundle = store.bundle(job_id, outcome, error=error, usage=usage_report(llms))
             try:
@@ -449,9 +455,10 @@ def _adopt_credentials(spec: JobSpec) -> None:
             os.environ[name] = value
 
 
-async def _review(
+async def _run_task(
     spec: JobSpec, llm: RunnerLLM, tokens: TokenSupplier, store: RemoteStateStore, llms: list[Any]
-) -> ReviewResult:
+) -> str:
+    """Run the job's task. Returns why it failed, or "" if it did not."""
     config = job_config(spec, llm)
     llms += [
         create_llm(llm_config_for(purpose, config.llm, use_dashboard=False))
@@ -460,36 +467,43 @@ async def _review(
     # A missing secret fails the job here, not after a review of failed calls.
     for each in {id(each): each for each in llms}.values():
         each.preflight()
-    engine = ReviewEngine(
-        config=config,
-        llm=llms[0],
-        provider=GitHubProvider(tokens, on_unauthorized=tokens.invalidate),
-        bot_name=spec.bot_name,
-        indexing_llm=llms[1],
-        security_llm=llms[2],
-        state=store,
-        check_run_id=spec.check_run_id,
-    )
-    return await engine.review_pr(spec.pr_url)
+    provider = GitHubProvider(tokens, on_unauthorized=tokens.invalidate)
+    task = spec.task
+    match task:
+        case AskTask():
+            await answer_question(provider, llms[0], spec.pr_url, task)
+            return ""
+        case ThreadReplyTask(may_resolve=verdict):
+
+            async def may_resolve() -> bool:
+                return verdict
+
+            await reply_in_thread(
+                provider,
+                llms[1],
+                await provider.get_pr_info(spec.pr_url),
+                task.reply,
+                may_resolve=may_resolve,
+                state=store,
+                platform=spec.platform,
+            )
+            return ""
+        case ReviewTask() | ReviewRestTask():
+            engine = ReviewEngine(
+                config=config,
+                llm=llms[0],
+                provider=provider,
+                bot_name=spec.bot_name,
+                indexing_llm=llms[1],
+                security_llm=llms[2],
+                state=store,
+                check_run_id=spec.check_run_id,
+                review_only_paths=set(task.paths) if isinstance(task, ReviewRestTask) else None,
+            )
+            return _review_failure(await engine.review_pr(spec.pr_url), spec.pr_url)
 
 
-async def _review_error(
-    review: asyncio.Task[ReviewResult], signals: list[str], timeout: timedelta | None, pr_url: str
-) -> str:
-    """Wait for the review. Returns why the job failed, or "" if it did not."""
-    try:
-        result = await asyncio.wait_for(review, timeout.total_seconds() if timeout else None)
-    except asyncio.CancelledError:
-        if not signals:
-            raise
-        logger.error("Review of %s stopped by %s", pr_url, signals[0])
-        return "Review stopped: the Actions run was cancelled before the review finished"
-    except Exception as exc:
-        if isinstance(exc, TimeoutError) and review.cancelled() and timeout:
-            logger.error("Review of %s did not finish within %s", pr_url, timeout)
-            return f"Review timed out after {int(timeout.total_seconds() // 60)} minutes"
-        logger.exception("Review of %s failed", pr_url)
-        return _safe_error(exc)
+def _review_failure(result: ReviewResult, pr_url: str) -> str:
     if result.all_chunks_failed:
         # Nothing was reviewed. A partial failure still succeeds: the engine
         # records the failed paths as retryable. The reasons are Mira's own text.
@@ -499,6 +513,25 @@ async def _review_error(
         return error
     logger.info("Reviewed %s: %d comments", pr_url, len(result.comments))
     return ""
+
+
+async def _task_error(
+    work: asyncio.Task[str], signals: list[str], timeout: timedelta | None, pr_url: str
+) -> str:
+    """Wait for the task. Returns why the job failed, or "" if it did not."""
+    try:
+        return await asyncio.wait_for(work, timeout.total_seconds() if timeout else None)
+    except asyncio.CancelledError:
+        if not signals:
+            raise
+        logger.error("Review of %s stopped by %s", pr_url, signals[0])
+        return "Review stopped: the Actions run was cancelled before the review finished"
+    except Exception as exc:
+        if isinstance(exc, TimeoutError) and work.cancelled() and timeout:
+            logger.error("Review of %s did not finish within %s", pr_url, timeout)
+            return f"Review timed out after {int(timeout.total_seconds() // 60)} minutes"
+        logger.exception("Review of %s failed", pr_url)
+        return _safe_error(exc)
 
 
 @contextmanager

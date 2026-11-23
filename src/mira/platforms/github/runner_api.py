@@ -1,5 +1,5 @@
-"""The runner API: an Actions review runner claims its job, refreshes its
-GitHub token, and reports its result.
+"""The runner API: an Actions runner claims its job, refreshes its GitHub
+token, and reports its result.
 
 Every route authenticates with the run's GitHub Actions OIDC token only
 (``Authorization: Bearer``), never a dashboard session. A periodic sweep
@@ -191,6 +191,7 @@ def create_runner_router(
         }
         spec = JobSpec(
             job_id=job.id,
+            task=job.task,
             pr_url=_pr_url(job),
             head_sha=job.head_sha,
             platform="github",
@@ -204,7 +205,7 @@ def create_runner_router(
             llm_provider=llm.provider,
             llm_model=llm.model,
         )
-        logger.info("Run %s claimed review job %s for %s", job.run_id, job.id, _pr_url(job))
+        logger.info("Run %s claimed %s job %s for %s", job.run_id, job.kind, job.id, _pr_url(job))
         return Response(content=spec.model_dump_json(), media_type="application/json")
 
     @router.post("/jobs/{job_id}/token")

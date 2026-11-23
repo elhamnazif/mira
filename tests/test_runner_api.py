@@ -33,7 +33,7 @@ from mira.platforms.github.runner_api import (
     create_runner_router,
     expire_stale_jobs,
 )
-from mira.runner import JobStatus, ReviewJob
+from mira.runner import AskTask, JobStatus, ReviewJob, ReviewTask
 from mira.runner_protocol import (
     JobSpec,
     PRKey,
@@ -698,6 +698,18 @@ def test_the_claim_carries_the_listed_credentials_and_default_model(
     # The job's config carries none of it, and no log line has the key.
     assert "runner_credentials" not in spec.config.get("review", {})
     assert "zai-server-key-123" not in caplog.text
+
+
+def test_the_claim_carries_the_jobs_task(client: TestClient, db: AppDatabase) -> None:
+    seed_job(db, task=AskTask(question="why cents?", actor="dev"), check_run_id=None)
+
+    data = claim(client).json()
+
+    assert data["task"] == {"kind": "ask", "question": "why cents?", "actor": "dev"}
+    assert data["check_run_id"] is None
+    # A spec from a server older than job kinds names no task: a review.
+    del data["task"]
+    assert JobSpec.model_validate(data).task == ReviewTask()
 
 
 @pytest.mark.parametrize("name", ["MIRA_GITHUB_PRIVATE_KEY", "MIRA_WEBHOOK_SECRET", "zai key"])

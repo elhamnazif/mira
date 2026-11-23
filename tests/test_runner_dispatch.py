@@ -18,8 +18,18 @@ import pytest
 
 from mira.config import MiraConfig, ReviewConfig
 from mira.dashboard.db import AppDatabase
+from mira.models import PRInfo
+from mira.platforms.github.dispatch import dispatch_job
 from mira.platforms.github.webhook import handle_pull_request
-from mira.runner import JobStatus
+from mira.providers.github import GitHubProvider
+from mira.runner import (
+    AskTask,
+    JobStatus,
+    JobTask,
+    ReviewRestTask,
+    ThreadReply,
+    ThreadReplyTask,
+)
 
 INSTALLATION = 184691606
 
@@ -238,6 +248,58 @@ async def test_push_during_dispatch_retires_the_older_run(db, github, app_auth, 
     closes = github.calls("PATCH", "/repos/o/r/check-runs/501")
     assert closes
     assert {(c["status"], c["conclusion"]) for c in closes if c} == {("completed", "neutral")}
+
+
+async def _dispatch(db: AppDatabase, task: JobTask, sha: str = "sha1") -> None:
+    pr_info = PRInfo(
+        title="Fix cents",
+        description="",
+        base_branch="main",
+        head_branch="fix",
+        url="https://github.com/o/r/pull/7",
+        number=7,
+        owner="o",
+        repo="r",
+        head_sha=sha,
+    )
+    await dispatch_job(
+        GitHubProvider("ghs_test_token"),
+        db,
+        pr_info,
+        task,
+        default_branch="trunk",
+        installation_id=INSTALLATION,
+        runs_on=("ubuntu-latest",),
+        server_url="https://mira.example",
+    )
+
+
+async def test_new_head_supersedes_reviews_but_not_answers(db, github, app_auth, local_review):
+    await _deliver(db, _payload("sha1"), app_auth, runner="actions")
+    [(review_id, _, _)] = _jobs(db)
+    db.transition_review_job(review_id, JobStatus.DISPATCHED, JobStatus.CLAIMED)
+    db.transition_review_job(review_id, JobStatus.CLAIMED, JobStatus.SUCCEEDED)
+    await _dispatch(db, ReviewRestTask(paths=("b.py",)))
+    await _dispatch(db, AskTask(question="why cents?", actor="dev"))
+    reply = ThreadReply(comment_id=10, body="why?", comment_node_id="C_10")
+    await _dispatch(db, ThreadReplyTask(reply=reply, may_resolve=True))
+
+    await _deliver(db, _payload("sha2", "synchronize"), app_auth, runner="actions")
+
+    rows = db._rows("SELECT kind, head_sha, status FROM review_jobs ORDER BY created_at")
+    assert [tuple(r) for r in rows] == [
+        ("review", "sha1", "succeeded"),
+        ("review_rest", "sha1", "superseded"),
+        ("ask", "sha1", "dispatched"),
+        ("thread_reply", "sha1", "dispatched"),
+        ("review", "sha2", "dispatched"),
+    ]
+    # Only the review-rest's run (the second dispatched) is cancelled.
+    assert [url for m, url, _ in github.requests if url.endswith("/cancel")] == [
+        "https://api.github.com/repos/o/r/actions/runs/1002/cancel"
+    ]
+    # The answers started no check run: one per review job.
+    assert len(github.calls("POST", "/check-runs")) == 3
 
 
 async def test_same_head_is_not_dispatched_twice(db, github, app_auth, local_review):

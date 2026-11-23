@@ -692,9 +692,11 @@ async def test_handle_pause_exception_logged_not_raised(
 # ---------------------------------------------------------------------------
 
 
-async def _run_disagreement_reply(config: MiraConfig):
+async def _run_disagreement_reply(config: MiraConfig, tmp_path, monkeypatch):
+    from mira.index.store import IndexStore
     from mira.platforms.handlers import run_thread_reply
 
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
     provider = MagicMock()
     provider.get_repo_permission = AsyncMock(return_value="write")
     provider.reply_to_review_comment = AsyncMock()
@@ -703,13 +705,11 @@ async def _run_disagreement_reply(config: MiraConfig):
     llm.complete_with_tools = AsyncMock(
         return_value='{"intent": "disagreement", "reply": "Understood."}'
     )
-    store = MagicMock()
     pr_info = MagicMock(owner="testowner", repo="testrepo", number=42, url="u")
     with (
         patch("mira.platforms.handlers.load_config", return_value=config),
         patch("mira.platforms.handlers.create_llm", return_value=llm),
         patch("mira.platforms.handlers.llm_config_for"),
-        patch("mira.platforms.handlers._open_store", return_value=store),
     ):
         await run_thread_reply(
             provider,
@@ -717,25 +717,31 @@ async def _run_disagreement_reply(config: MiraConfig):
             "I disagree",
             1,
             thread_id="T1",
+            comment_path="billing.py",
             actor="alice",
         )
-    return provider, store
+    store = IndexStore.open("testowner", "testrepo")
+    try:
+        feedback = [(f.pr_number, f.comment_path, f.signal, f.actor) for f in store.list_feedback()]
+    finally:
+        store.close()
+    return provider, feedback
 
 
-async def test_thread_reply_disagreement_resolves_when_reject_allowed():
-    provider, store = await _run_disagreement_reply(MiraConfig())
+async def test_thread_reply_disagreement_resolves_when_reject_allowed(tmp_path, monkeypatch):
+    provider, feedback = await _run_disagreement_reply(MiraConfig(), tmp_path, monkeypatch)
     provider.reply_to_review_comment.assert_awaited_once()
     provider.resolve_threads.assert_awaited_once()
-    store.record_feedback.assert_called_once()
+    assert feedback == [(42, "billing.py", "rejected", "alice")]
 
 
-async def test_thread_reply_disagreement_skips_mutations_when_reject_denied():
+async def test_thread_reply_disagreement_skips_mutations_when_reject_denied(tmp_path, monkeypatch):
     config = MiraConfig(
         commands=CommandsConfig.model_validate({"reject": {"blocked_users": ["alice"]}})
     )
-    provider, store = await _run_disagreement_reply(config)
+    provider, feedback = await _run_disagreement_reply(config, tmp_path, monkeypatch)
     # ``ask`` is still allowed, so the reply is posted ...
     provider.reply_to_review_comment.assert_awaited_once()
     # ... but the denied ``reject`` must not resolve the thread or record feedback.
     provider.resolve_threads.assert_not_awaited()
-    store.record_feedback.assert_not_called()
+    assert feedback == []

@@ -157,8 +157,28 @@ runner's tool cache. It needs network access to GitHub, PyPI, the npm
 registry and the Mira server. uv, Python and Node come from its own setup
 steps, so the machine needs none of them.
 
-## Not yet on Actions
+## @mentions
 
 On a repo that reviews on Actions, `@mira review`, `@mira review-rest`,
-questions and free-form thread replies are skipped and logged by the
-server. `help`, `pause`, `resume` and `reject` still work.
+questions and free-form replies in Mira's review threads each become a job
+for the repo's runner, dispatched through the same `mira.yml`. The server
+first checks that the commenter may run the command, so a denied user starts
+no workflow run. `help`, `pause`, `resume` and `reject` run no model, and the
+server answers them itself.
+
+- `@mira review` dispatches a review of the PR's head, as a push does. While
+  a review of that head is queued or running, it is not dispatched again.
+- `@mira review-rest` dispatches a review of only the files an earlier pass
+  skipped. When nothing was skipped, the server replies so itself.
+- A question or a thread reply gets its own run and shows no check. A
+  disagreeing thread reply resolves the thread only when the commenter may
+  also `reject`.
+
+A push supersedes the PR's queued or running review and review-rest jobs and
+cancels their runs. It never cancels a question or a thread reply, and a
+question never cancels a review.
+
+## Not yet on Actions
+
+Learning from a merged PR keeps its rule-based signals on a repo that reviews
+on Actions, but skips the model pass over human reviews.

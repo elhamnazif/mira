@@ -27,6 +27,8 @@ from mira.runner import (
     check_transition,
     parse_runner_llm,
     parse_runner_override,
+    parse_task,
+    task_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,7 +225,7 @@ CREATE TABLE IF NOT EXISTS pr_reviewers (
     PRIMARY KEY (owner, repo, pr_number, reviewer)
 );
 
--- One row per review dispatched to a GitHub Actions runner (mira.runner).
+-- One row per job dispatched to a GitHub Actions runner (mira.runner).
 -- id is the random job id passed as the workflow input. status follows
 -- mira.runner.JobStatus; run_id and run_url name the workflow run.
 CREATE TABLE IF NOT EXISTS review_jobs (
@@ -242,7 +244,9 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     created_at REAL NOT NULL DEFAULT 0,
     claimed_at REAL NOT NULL DEFAULT 0,
     finished_at REAL NOT NULL DEFAULT 0,
-    usage TEXT  -- the runner's JSON UsageReport; NULL until its result lands
+    usage TEXT,  -- the runner's JSON UsageReport; NULL until its result lands
+    kind TEXT NOT NULL DEFAULT 'review',  -- mira.runner.JobKind
+    payload TEXT NOT NULL DEFAULT '{}'  -- the job's task, as JSON without its kind
 );
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
 """
@@ -403,7 +407,7 @@ CREATE TABLE IF NOT EXISTS pr_reviewers (
     PRIMARY KEY (owner, repo, pr_number, reviewer)
 );
 
--- One row per review dispatched to a GitHub Actions runner (mira.runner).
+-- One row per job dispatched to a GitHub Actions runner (mira.runner).
 -- id is the random job id passed as the workflow input. status follows
 -- mira.runner.JobStatus; run_id and run_url name the workflow run.
 CREATE TABLE IF NOT EXISTS review_jobs (
@@ -422,7 +426,9 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     claimed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     finished_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-    usage TEXT  -- the runner's JSON UsageReport; NULL until its result lands
+    usage TEXT,  -- the runner's JSON UsageReport; NULL until its result lands
+    kind TEXT NOT NULL DEFAULT 'review',  -- mira.runner.JobKind
+    payload TEXT NOT NULL DEFAULT '{}'  -- the job's task, as JSON without its kind
 );
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pr ON review_jobs(owner, repo, pr_number);
 """
@@ -644,6 +650,14 @@ class AppDatabase:
         }
         if "usage" not in job_cols:
             self._sqlite_conn.execute("ALTER TABLE review_jobs ADD COLUMN usage TEXT")
+        if "kind" not in job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE review_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'review'"
+            )
+        if "payload" not in job_cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE review_jobs ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'"
+            )
         progress_cols = {
             r[1]
             for r in self._sqlite_conn.execute("PRAGMA table_info(pr_review_progress)").fetchall()
@@ -741,6 +755,14 @@ class AppDatabase:
                     "last_reviewed_base_sha TEXT NOT NULL DEFAULT ''"
                 )
                 cur.execute("ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS usage TEXT")
+                cur.execute(
+                    "ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS "
+                    "kind TEXT NOT NULL DEFAULT 'review'"
+                )
+                cur.execute(
+                    "ALTER TABLE review_jobs ADD COLUMN IF NOT EXISTS "
+                    "payload TEXT NOT NULL DEFAULT '{}'"
+                )
                 cur.execute(
                     "ALTER TABLE pr_reviewers ADD COLUMN IF NOT EXISTS "
                     "bare_approval INTEGER NOT NULL DEFAULT 0"
@@ -1909,7 +1931,8 @@ class AppDatabase:
 
     _REVIEW_JOB_COLUMNS = (
         "id, owner, repo, pr_number, head_sha, installation_id, runs_on, status, "
-        "check_run_id, run_id, run_url, error, created_at, claimed_at, finished_at, usage"
+        "check_run_id, run_id, run_url, error, created_at, claimed_at, finished_at, usage, "
+        "kind, payload"
     )
 
     @staticmethod
@@ -1931,12 +1954,13 @@ class AppDatabase:
             claimed_at=row[13],
             finished_at=row[14],
             usage=None if row[15] is None else json.loads(row[15]),
+            task=parse_task(row[16], row[17]),
         )
 
     def create_review_job(self, job: ReviewJob) -> None:
         self._exec(
             f"INSERT INTO review_jobs ({self._REVIEW_JOB_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job.id,
                 job.owner,
@@ -1954,6 +1978,8 @@ class AppDatabase:
                 job.claimed_at,
                 job.finished_at,
                 None if job.usage is None else json.dumps(job.usage),
+                job.kind.value,
+                task_payload(job.task),
             ),
         )
 
