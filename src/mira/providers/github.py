@@ -626,7 +626,11 @@ class GitHubProvider(BaseProvider):
                 # so human replies can later link to the exact comment.
                 try:
                     by_loc: dict[tuple[str, int], int] = {}
-                    for posted_c in review.get_comments():
+                    # A review object lists its comments without their line,
+                    # so read them from the PR's review comments instead.
+                    for posted_c in pr.get_review_comments():
+                        if posted_c.pull_request_review_id != review.id:
+                            continue
                         ln = posted_c.line
                         if ln is None:
                             ln = getattr(posted_c, "original_line", 0) or 0

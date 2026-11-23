@@ -2071,3 +2071,50 @@ class TestCheckoutSource:
     @pytest.mark.asyncio
     async def test_none_without_head_sha(self):
         assert await GitHubProvider("token").checkout_source(self._pr("")) is None
+
+
+@pytest.mark.asyncio
+async def test_post_review_maps_each_comment_to_its_github_id():
+    from github.PullRequest import PullRequest
+    from github.PullRequestComment import PullRequestComment
+    from github.PullRequestReview import PullRequestReview
+
+    provider = GitHubProvider.__new__(GitHubProvider)
+    provider._token_supplier = _async_constant("test-token")
+
+    def comment(path: str, line: int, end_line: int | None = None) -> ReviewComment:
+        return ReviewComment(
+            path=path,
+            line=line,
+            end_line=end_line,
+            severity=Severity.WARNING,
+            category="bug",
+            title="Issue",
+            body="desc",
+            confidence=0.9,
+        )
+
+    def posted(id_: int, path: str, line: int, review_id: int) -> MagicMock:
+        c = MagicMock(spec=PullRequestComment)
+        c.id, c.path, c.line, c.pull_request_review_id = id_, path, line, review_id
+        return c
+
+    review = MagicMock(spec=PullRequestReview)
+    review.id = 77
+    mock_pr = MagicMock(spec=PullRequest)
+    mock_pr.get_commits.return_value = [MagicMock()]
+    mock_pr.create_review.return_value = review
+    mock_pr.get_review_comments.return_value = [
+        posted(1001, "a.py", 3, 77),
+        posted(1002, "b.py", 9, 77),
+        # Another review's comment at the same place is not ours.
+        posted(5, "a.py", 3, 12),
+    ]
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value.get_pull.return_value = mock_pr
+    result = ReviewResult(comments=[comment("a.py", 3), comment("b.py", 7, 9)], summary="s")
+
+    with patch("mira.providers.github.Github", return_value=mock_gh):
+        ids = await provider.post_review(_make_pr_info(), result)
+
+    assert ids == [1001, 1002]
