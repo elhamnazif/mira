@@ -2118,3 +2118,33 @@ async def test_post_review_maps_each_comment_to_its_github_id():
         ids = await provider.post_review(_make_pr_info(), result)
 
     assert ids == [1001, 1002]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compare_fails", [False, True])
+async def test_get_pr_info_records_the_current_merge_base(compare_fails: bool):
+    from github import GithubException
+
+    provider = GitHubProvider.__new__(GitHubProvider)
+    provider._token_supplier = _async_constant("test-token")
+    mock_pr = MagicMock()
+    mock_pr.title, mock_pr.body, mock_pr.number = "PR", "", 1
+    mock_pr.html_url = "https://github.com/o/r/pull/1"
+    mock_pr.base.ref, mock_pr.head.ref = "main", "feat"
+    # GitHub leaves base.sha at the base tip from when the PR was opened.
+    mock_pr.base.sha, mock_pr.head.sha = "stale-base", "head-sha"
+    mock_repo = MagicMock()
+    mock_repo.get_pull.return_value = mock_pr
+    if compare_fails:
+        mock_repo.compare.side_effect = GithubException(404, {"message": "Not Found"}, None)
+    else:
+        mock_repo.compare.return_value.merge_base_commit.sha = "merge-base"
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    with patch("mira.providers.github.Github", return_value=mock_gh):
+        info = await provider.get_pr_info("https://github.com/o/r/pull/1")
+
+    assert info.base_sha == ("stale-base" if compare_fails else "merge-base")
+    if not compare_fails:
+        mock_repo.compare.assert_called_once_with("main", "head-sha")

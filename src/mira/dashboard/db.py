@@ -123,8 +123,9 @@ CREATE TABLE IF NOT EXISTS pr_review_progress (
     -- as the base for an incremental diff so unchanged files aren't
     -- re-flagged after a new push.
     last_reviewed_sha TEXT NOT NULL DEFAULT '',
-    -- The PR's base-branch tip at that review. Round 2+ diffs the old
-    -- version against it to tell the PR's own changes from a rebase's.
+    -- The merge base of the PR's base branch and head at that review.
+    -- Round 2+ diffs the old version against it to tell the PR's own
+    -- changes from a rebase's.
     last_reviewed_base_sha TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, owner, repo, pr_number)
@@ -454,7 +455,7 @@ class GlobalRule:
 
 @dataclass(frozen=True)
 class ReviewedVersion:
-    """The PR version the last review saw: its head and its base-branch tip.
+    """The PR version the last review saw: its head and the merge base under it.
 
     Empty strings mean no review has been recorded, or one recorded before
     base SHAs were.

@@ -325,6 +325,14 @@ class GitHubProvider(BaseProvider):
             gh_repo = gh.get_repo(f"{owner}/{repo}")
             pr = gh_repo.get_pull(number)
             user = pr.user
+            # pr.base.sha is the base branch's tip when the PR was opened or
+            # last retargeted, not where it is now. Round 2+ needs the merge
+            # base of the current base branch and head.
+            try:
+                base_sha = gh_repo.compare(pr.base.ref, pr.head.sha).merge_base_commit.sha
+            except GithubException as exc:
+                logger.info("Could not find the merge base of %s: %s", pr.html_url, exc)
+                base_sha = pr.base.sha or ""
             return PRInfo(
                 title=pr.title or "",
                 description=pr.body or "",
@@ -335,7 +343,7 @@ class GitHubProvider(BaseProvider):
                 owner=owner,
                 repo=repo,
                 head_sha=pr.head.sha or "",
-                base_sha=pr.base.sha or "",
+                base_sha=base_sha,
                 author=(user.login or "") if user else "",
                 author_avatar_url=(user.avatar_url or "") if user else "",
             )
