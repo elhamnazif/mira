@@ -238,7 +238,9 @@ IndexWrite = Annotated[
 _INDEX_WRITE: TypeAdapter[IndexWrite] = TypeAdapter(IndexWrite)
 
 MAX_INDEX_PART_BYTES = 4 * 1024 * 1024
-MAX_INDEX_PARTS = 256
+# 128 MiB in all: room for a large repo's index, and the most one job can
+# make the server store.
+MAX_INDEX_PARTS = 32
 # Paths per RemoveIndexedPaths, so a reset of a large repo still fits a part.
 _PATHS_PER_WRITE = 1000
 
@@ -518,13 +520,29 @@ class RemoteLearningStore:
         )
 
 
+_REVIEW_WRITES = (SetLastReviewedSha, UpsertPRReviewProgress, RecordReview, UpsertPRFingerprint)
+
+# The writes each kind of job may send. Index jobs send theirs as index parts.
+_ALLOWED_WRITES: dict[JobKind, tuple[type[BaseModel], ...]] = {
+    JobKind.REVIEW: _REVIEW_WRITES,
+    JobKind.REVIEW_REST: _REVIEW_WRITES,
+    JobKind.ASK: (),
+    JobKind.THREAD_REPLY: (RecordFeedback,),
+    JobKind.LEARN: (UpsertLearnedRule,),
+    JobKind.INDEX_REPO: (),
+    JobKind.INDEX_DIFF: (),
+}
+
+
 def check_writes(job: ReviewJob, writes: Sequence[StateWrite]) -> None:
-    """Raise ValueError when a write does not belong to ``job``. Only a
-    learning job learns rules, and it writes nothing else. Only review and
-    feedback records name their PR; every other write takes the job's."""
+    """Raise ValueError when a write does not belong to ``job``: each kind
+    of job may send only its own writes (:data:`_ALLOWED_WRITES`). Only
+    review and feedback records name their PR; every other write takes the
+    job's."""
     pr = job_pr(job)
+    allowed = _ALLOWED_WRITES[job.kind]
     for write in writes:
-        if isinstance(write, UpsertLearnedRule) != (job.kind is JobKind.LEARN):
+        if not isinstance(write, allowed):
             raise ValueError(f"a {job.kind} job cannot send {write.op}")
         match write:
             case (

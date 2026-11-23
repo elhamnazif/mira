@@ -4,7 +4,7 @@ learning job's rules land as the server's own synthesis would write them."""
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +14,7 @@ from mira.core.state_store import FeedbackRecord, LocalStateStore, ReviewRecord
 from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
-from mira.runner import LearnTask, ReviewJob
+from mira.runner import LearnTask, ReviewJob, ThreadReply, ThreadReplyTask
 from mira.runner_protocol import (
     LearningSnapshot,
     PRKey,
@@ -24,6 +24,7 @@ from mira.runner_protocol import (
     RemoteStateStore,
     RepoKey,
     ResultBundle,
+    SetLastReviewedSha,
     StateSnapshot,
     UpsertLearnedRule,
     UsageReport,
@@ -45,6 +46,39 @@ JOB = ReviewJob(
     runs_on=("self-hosted", "sora"),
     run_url="https://github.com/o/r/actions/runs/1",
 )
+
+REPLY_JOB = replace(
+    JOB,
+    task=ThreadReplyTask(reply=ThreadReply(comment_id=1, body="no"), may_resolve=True),
+)
+
+
+@pytest.mark.parametrize(
+    ("job", "write"),
+    [
+        # A question or thread-reply job must not rewrite the PR's review state.
+        (
+            replace(
+                JOB,
+                task=ThreadReplyTask(reply=ThreadReply(comment_id=1, body="x"), may_resolve=False),
+            ),
+            "sha",
+        ),
+        (REPLY_JOB, "review"),
+        # A review job does not record thread feedback.
+        (JOB, "feedback"),
+    ],
+)
+def test_each_job_kind_may_send_only_its_own_writes(
+    local: LocalStateStore, job: ReviewJob, write: str
+) -> None:
+    writes = {
+        "sha": SetLastReviewedSha(sha="sha-2"),
+        "review": RecordReview(review=_review()),
+        "feedback": RecordFeedback(feedback=_feedback()),
+    }
+    with pytest.raises(ValueError, match="cannot send"):
+        apply_writes(local, job, [writes[write]])
 
 
 def _review(pr_number: int = 7) -> ReviewRecord:
@@ -331,7 +365,7 @@ def test_applied_feedback_equals_direct_local_feedback(
     remote = RemoteStateStore(_snapshot())
     remote.record_feedback("o", "r", _feedback(), platform="github")
     bundle = ResultBundle.model_validate_json(remote.bundle("j", "succeeded").model_dump_json())
-    apply_writes(local, JOB, bundle.writes)
+    apply_writes(local, REPLY_JOB, bundle.writes)
 
     assert _feedback_rows() == direct
     assert [(r["signal"], r["comment_path"], r["actor"]) for r in direct] == [
@@ -343,7 +377,7 @@ def test_feedback_for_another_pr_is_refused(local: LocalStateStore) -> None:
     with pytest.raises(ValueError):
         RemoteStateStore(_snapshot()).record_feedback("o", "r", _feedback(8), platform="github")
     with pytest.raises(ValueError):
-        apply_writes(local, JOB, [RecordFeedback(feedback=_feedback(8))])
+        apply_writes(local, REPLY_JOB, [RecordFeedback(feedback=_feedback(8))])
     assert _feedback_rows() == []
 
 

@@ -150,6 +150,18 @@ so no other workflow can get them. The runner masks each value in the run's
 log. A repo secret of the same name takes precedence. `runner_credentials`
 cannot name the server's own `MIRA_*` secrets, except `MIRA_LLM_API_KEY`.
 
+A repo that points the model at its own endpoint (`MIRA_RUNNER_LLM_BASE_URL`
+or any `*_BASE_URL` variable) gets none of the server's keys, since they
+would go to that host; it must supply the endpoint's key as a repo secret.
+
+The claim must also come from the kind of runner the job was sent to:
+GitHub-hosted for `ubuntu-latest` and the like, self-hosted for labels that
+include `self-hosted`. A repo writer can edit `mira.yml` to pass other
+labels, and this stops them moving a GitHub-hosted job onto a machine they
+control. It cannot tell one self-hosted runner from another, so only send
+the server's keys to repos whose admins you trust not to register their own
+self-hosted runner under your labels.
+
 ## Self-hosted runners
 
 `review.yml` needs no sudo and writes only to `$RUNNER_TEMP` and the

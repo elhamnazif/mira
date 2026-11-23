@@ -41,6 +41,8 @@ class RunnerClaims:
     run_id: int
     event_name: str
     job_workflow_ref: str
+    # "github-hosted" or "self-hosted": the kind of machine the job runs on.
+    runner_environment: str = ""
 
 
 def _github_jwks() -> SigningKeyResolver:
@@ -73,6 +75,7 @@ class GitHubOIDCVerifier:
                 run_id=int(claims["run_id"]),
                 event_name=str(claims["event_name"]),
                 job_workflow_ref=str(claims.get("job_workflow_ref", "")),
+                runner_environment=str(claims.get("runner_environment", "")),
             )
         except ValueError as exc:
             raise InvalidRunnerToken(f"malformed run_id claim: {exc}") from exc
@@ -97,4 +100,10 @@ def binding_error(
         return f"token is from a {claims.event_name} event"
     if claims.job_workflow_ref not in allowed_workflow_refs:
         return f"workflow {claims.job_workflow_ref!r} is not in review.runner_workflow_refs"
+    # The caller's mira.yml passes runs_on to the trusted workflow, so a repo
+    # writer can edit it to send the job elsewhere. A job dispatched to
+    # GitHub-hosted runners must run on one, not on a machine they control.
+    expected = "self-hosted" if "self-hosted" in job.runs_on else "github-hosted"
+    if claims.runner_environment != expected:
+        return f"job was dispatched to a {expected} runner, token is from {claims.runner_environment or 'an unknown'} one"
     return None

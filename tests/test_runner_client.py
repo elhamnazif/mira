@@ -248,11 +248,11 @@ async def test_the_dashboard_shows_where_a_runner_review_ran(
 
     db.register_repo("test", "repo")
     run_url = "https://github.com/test/repo/actions/runs/1001"
-    seed_job(db, runs_on=("self-hosted", "sora"), run_url=run_url)
+    seed_job(db, runs_on=("ubuntu-latest",), run_url=run_url)
 
     assert await _run(server) == 0
 
-    ran = api.ReviewRunModel(where="actions", runs_on=["self-hosted", "sora"], url=run_url)
+    ran = api.ReviewRunModel(where="actions", runs_on=["ubuntu-latest"], url=run_url)
     [review] = api.get_activity_detail("test", "repo", 1).reviews
     assert review.run == ran
     [event] = core.list_activity().events
@@ -426,7 +426,7 @@ def test_server_credentials_fill_only_what_the_runner_lacks(
             }
         ),
     )
-    runner_client._adopt_credentials(spec)
+    runner_client._adopt_credentials(spec, RunnerLLM())
     assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "repo-secret-token"
     assert os.environ["ZAI_API_KEY"] == "server-zai-key"
     assert capsys.readouterr().out == ("::add-mask::server-token\n::add-mask::server-zai-key\n")
@@ -1056,3 +1056,23 @@ async def test_a_review_rest_job_reviews_only_the_skipped_files(
     # It completes the job's queued check, as a review does.
     checks = [body for m, url, body, _ in github.requests if url.endswith("/check-runs/501")]
     assert checks[-1]["conclusion"] == "success"
+
+
+@pytest.mark.parametrize(
+    ("env", "llm"),
+    [
+        ({}, RunnerLLM(base_url="https://attacker.example/v1")),
+        ({"ANTHROPIC_BASE_URL": "https://attacker.example"}, RunnerLLM()),
+        ({"OPENAI_COMPATIBLE_BASE_URL": "https://attacker.example/v1"}, RunnerLLM()),
+    ],
+)
+def test_a_repo_chosen_endpoint_never_gets_the_servers_keys(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], llm: RunnerLLM
+) -> None:
+    for name in ("ANTHROPIC_BASE_URL", "OPENAI_COMPATIBLE_BASE_URL", "MIRA_LLM_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    spec = cast(JobSpec, SimpleNamespace(credentials={"MIRA_LLM_API_KEY": SecretStr("server-key")}))
+    runner_client._adopt_credentials(spec, llm)
+    assert "MIRA_LLM_API_KEY" not in os.environ

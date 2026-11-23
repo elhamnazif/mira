@@ -66,6 +66,7 @@ def oidc_token(key: Any = _KEY, **overrides: Any) -> str:
         "event_name": "workflow_dispatch",
         "job_workflow_ref": REF,
         "workflow_ref": "test/repo/.github/workflows/mira.yml@refs/heads/main",
+        "runner_environment": "github-hosted",
     }
     claims.update(overrides)
     claims = {k: v for k, v in claims.items() if v is not None}
@@ -743,3 +744,26 @@ def test_a_repo_model_overrides_the_deployment_default_at_claim(
     db.set_repo_runner_llm("test", "repo", "claude-code:sonnet")
     spec = JobSpec.model_validate_json(claim(client).content)
     assert (spec.llm_provider, spec.llm_model) == ("claude-code", "sonnet")
+
+
+@pytest.mark.parametrize(
+    ("runs_on", "environment", "allowed"),
+    [
+        (("ubuntu-latest",), "github-hosted", True),
+        # A repo writer pointed mira.yml's runs-on at a machine they control.
+        (("ubuntu-latest",), "self-hosted", False),
+        (("ubuntu-latest",), None, False),
+        (("self-hosted", "sora"), "self-hosted", True),
+        (("self-hosted", "sora"), "github-hosted", False),
+    ],
+)
+def test_the_claim_must_come_from_the_kind_of_runner_the_job_was_sent_to(
+    client: TestClient,
+    db: AppDatabase,
+    runs_on: tuple[str, ...],
+    environment: str | None,
+    allowed: bool,
+) -> None:
+    seed_job(db, runs_on=runs_on)
+    resp = claim(client, runner_environment=environment)
+    assert resp.status_code == (200 if allowed else 403)

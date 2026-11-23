@@ -450,7 +450,7 @@ async def run_job(
     logger.info(
         "Claimed %s job %s: %s at %s", spec.task.kind, job_id, spec.pr_url, spec.head_sha[:12]
     )
-    _adopt_credentials(spec)
+    _adopt_credentials(spec, llm)
     if not llm.chosen():
         llm = RunnerLLM(
             provider=spec.llm_provider or None,
@@ -481,10 +481,25 @@ async def run_job(
                     await tokens.revoke(http)
 
 
-def _adopt_credentials(spec: JobSpec) -> None:
+def _repo_endpoints(llm: RunnerLLM) -> list[str]:
+    """The model endpoints the repo chose for this run, by setting name.
+    Any ``*_BASE_URL`` variable can point a provider at another host."""
+    chosen = [name for name, value in os.environ.items() if value and name.endswith("_BASE_URL")]
+    return ["MIRA_RUNNER_LLM_BASE_URL"] * bool(llm.base_url) + sorted(chosen)
+
+
+def _adopt_credentials(spec: JobSpec, llm: RunnerLLM) -> None:
     """Put the server's model credentials in this process's environment,
     where the LLM providers read them. One the runner already has, from a
-    repo secret, wins."""
+    repo secret, wins. When the repo points the model at an endpoint of its
+    own, the server's keys are not used at all: they would go to that host."""
+    if spec.credentials and (endpoints := _repo_endpoints(llm)):
+        logger.warning(
+            "Not using the server's model keys: this repo sets its own endpoint (%s). "
+            "Give the endpoint's key as a repo secret.",
+            ", ".join(endpoints),
+        )
+        return
     for name, secret in spec.credentials.items():
         value = secret.get_secret_value()
         _mask(value)
