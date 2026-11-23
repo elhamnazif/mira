@@ -1,5 +1,7 @@
 import { deleteJson, fetchJson, postJson, putJson } from "./http"
 import type {
+  RepoRunnerSettings,
+  RepoRunnerView,
   BaseBranchPolicy,
   DependencyGraph,
   ExternalRefModel,
@@ -128,4 +130,15 @@ export const reposApi = {
       `/api/repos/${owner}/${repo}/branch-policy`,
       { mode, branches }
     ),
+
+  // Per-repo review runner and model
+  getRunnerSettings: (owner: string, repo: string) =>
+    fetchJson<RepoRunnerView>(`/api/repos/${owner}/${repo}/runner`),
+
+  saveRunnerSettings: (
+    owner: string,
+    repo: string,
+    settings: RepoRunnerSettings
+  ) =>
+    putJson<RepoRunnerView>(`/api/repos/${owner}/${repo}/runner`, settings),
 }

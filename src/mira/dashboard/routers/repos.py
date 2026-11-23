@@ -29,6 +29,8 @@ from mira.dashboard.api import (
     RepoBaseBranchPolicy,
     RepoDetail,
     RepoListItem,
+    RepoRunnerSettings,
+    RepoRunnerView,
     ReviewEventModel,
     SymbolModel,
     _open_relationships,
@@ -662,6 +664,69 @@ def set_branch_policy(
     blob = json.dumps({"mode": body.mode, "branches": branches})
     _api._app_db.set_repo_base_branch_policy(owner, repo, blob, platform=record.platform)
     return RepoBaseBranchPolicy(mode=body.mode, branches=branches)
+
+
+# Agent CLIs a runner can review through, beside the providers.json profiles.
+_RUNNER_HARNESSES = ("claude-code", "opencode", "codex", "bedrock")
+
+
+def _runner_view(record_runner: str, record_llm: str) -> RepoRunnerView:
+    from mira.config import load_config
+    from mira.llm import provider_profiles
+    from mira.runner import RunnerKind
+
+    review = load_config().review
+    default_runner = (
+        "local" if review.runner is RunnerKind.LOCAL else "actions:" + ",".join(review.runs_on)
+    )
+    default_llm = (
+        f"{review.runner_llm_provider}:{review.runner_model}" if review.runner_llm_provider else ""
+    )
+    providers = [*_RUNNER_HARNESSES, *sorted(provider_profiles.all_profiles())]
+    return RepoRunnerView(
+        runner=record_runner,
+        llm=record_llm,
+        default_runner=default_runner,
+        default_llm=default_llm,
+        providers=list(dict.fromkeys(providers)),
+    )
+
+
+@router.get("/api/repos/{owner:path}/{repo}/runner", response_model=RepoRunnerView)
+def get_runner_settings(owner: str, repo: str) -> RepoRunnerView:
+    """Where this repo's reviews run and with which model."""
+    records = _api._app_db.get_repo_any_platform(owner, repo)
+    record = _pick_platform_record(records) if records else None
+    return _runner_view(record.runner if record else "", record.runner_llm if record else "")
+
+
+@router.put("/api/repos/{owner:path}/{repo}/runner", response_model=RepoRunnerView)
+def set_runner_settings(
+    owner: str, repo: str, body: RepoRunnerSettings, request: Request
+) -> RepoRunnerView:
+    """Store where this repo's reviews run and with which model. Takes
+    effect on the next review; no restart needed."""
+    _require_admin(request)
+    from mira.runner import parse_runner_llm, parse_runner_override
+
+    runner, llm = body.runner.strip(), body.llm.strip()
+    try:
+        parse_runner_override(runner)
+        choice = parse_runner_llm(llm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    view = _runner_view(runner, llm)
+    if choice is not None and choice.provider not in view.providers:
+        raise HTTPException(status_code=400, detail=f"Unknown provider {choice.provider!r}")
+    records = _api._app_db.get_repo_any_platform(owner, repo)
+    record = _pick_platform_record(records) if records else None
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail="Repository not registered with this Mira instance"
+        )
+    _api._app_db.set_repo_runner(owner, repo, runner, platform=record.platform)
+    _api._app_db.set_repo_runner_llm(owner, repo, llm, platform=record.platform)
+    return view
 
 
 # Keep the catch-all detail route last.  For nested GitLab namespaces it can

@@ -713,3 +713,21 @@ def test_a_repo_file_cannot_add_runner_credentials(tmp_path: Path) -> None:
     config = load_config(str(tmp_path / ".mira.yaml"))
     assert config.review.runner_credentials == []
     assert config.review.runner_model == ""
+
+
+def test_a_repo_model_overrides_the_deployment_default_at_claim(
+    client: TestClient, db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = {
+        "runner_workflow_refs": [REF],
+        "runner_llm_provider": "zai-coding",
+        "runner_model": "glm-5.3",
+    }
+    monkeypatch.setattr(mira_config, "_global_defaults", {"review": review})
+    db.register_repo("test", "repo")
+    seed_job(db)
+    assert JobSpec.model_validate_json(claim(client).content).llm_model == "glm-5.3"
+
+    db.set_repo_runner_llm("test", "repo", "claude-code:sonnet")
+    spec = JobSpec.model_validate_json(claim(client).content)
+    assert (spec.llm_provider, spec.llm_model) == ("claude-code", "sonnet")

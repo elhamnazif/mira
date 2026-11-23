@@ -25,6 +25,7 @@ from mira.runner import (
     JobStatus,
     ReviewJob,
     check_transition,
+    parse_runner_llm,
     parse_runner_override,
 )
 
@@ -83,6 +84,9 @@ CREATE TABLE IF NOT EXISTS repos (
     -- Per-repo review runner: '' (inherit the deployment default), 'local',
     -- or 'actions:<label>[,<label>...]'. Parsed by mira.runner.
     runner TEXT NOT NULL DEFAULT '',
+    -- Per-repo runner model: '' (inherit) or '<provider>:<model>'. Parsed
+    -- by mira.runner.parse_runner_llm.
+    runner_llm TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (platform, owner, repo)
 );
 
@@ -282,8 +286,9 @@ CREATE TABLE IF NOT EXISTS repos (
     private BOOLEAN,
     -- Per-repo auto-review destination-branch policy; see the SQLite schema.
     base_branch_policy TEXT NOT NULL DEFAULT '',
-    -- Per-repo review runner; see the SQLite schema.
+    -- Per-repo review runner and model; see the SQLite schema.
     runner TEXT NOT NULL DEFAULT '',
+    runner_llm TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (platform, owner, repo)
 );
 
@@ -502,6 +507,7 @@ class RepoRecord:
     private: bool | None = None  # None = visibility not yet known
     base_branch_policy: str = ""  # '' = inherit the deployment default
     runner: str = ""  # '' = inherit; see mira.runner.parse_runner_override
+    runner_llm: str = ""  # '' = inherit; see mira.runner.parse_runner_llm
 
 
 @dataclass
@@ -629,6 +635,10 @@ class AppDatabase:
             self._sqlite_conn.execute(
                 "ALTER TABLE repos ADD COLUMN runner TEXT NOT NULL DEFAULT ''"
             )
+        if "runner_llm" not in cols:
+            self._sqlite_conn.execute(
+                "ALTER TABLE repos ADD COLUMN runner_llm TEXT NOT NULL DEFAULT ''"
+            )
         job_cols = {
             r[1] for r in self._sqlite_conn.execute("PRAGMA table_info(review_jobs)").fetchall()
         }
@@ -718,6 +728,9 @@ class AppDatabase:
                 )
                 cur.execute(
                     "ALTER TABLE repos ADD COLUMN IF NOT EXISTS runner TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute(
+                    "ALTER TABLE repos ADD COLUMN IF NOT EXISTS runner_llm TEXT NOT NULL DEFAULT ''"
                 )
                 cur.execute(
                     "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
@@ -1280,6 +1293,7 @@ class AppDatabase:
             base_branch_policy=row[13] or "",
             platform=row[14],
             runner=row[15] or "",
+            runner_llm=row[16] or "",
         )
 
     @staticmethod
@@ -1306,6 +1320,7 @@ class AppDatabase:
             base_branch_policy=row[13] or "",
             platform=row[14],
             runner=row[15] or "",
+            runner_llm=row[16] or "",
         )
 
     def list_repos(self) -> list[RepoRecord]:
@@ -1314,14 +1329,14 @@ class AppDatabase:
             rows = self._sqlite_conn.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform, runner FROM repos ORDER BY owner, repo"
+                "base_branch_policy, platform, runner, runner_llm FROM repos ORDER BY owner, repo"
             ).fetchall()
             return [self._sqlite_row_to_repo(r) for r in rows]
         with self._pg_cursor() as cur:
             cur.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform, runner FROM repos ORDER BY owner, repo"
+                "base_branch_policy, platform, runner, runner_llm FROM repos ORDER BY owner, repo"
             )
             return [self._pg_row_to_repo(r) for r in cur.fetchall()]
 
@@ -1331,7 +1346,7 @@ class AppDatabase:
             row = self._sqlite_conn.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform, runner FROM repos WHERE platform=? AND owner=? AND repo=?",
+                "base_branch_policy, platform, runner, runner_llm FROM repos WHERE platform=? AND owner=? AND repo=?",
                 (platform, owner, repo),
             ).fetchone()
             if row:
@@ -1341,7 +1356,7 @@ class AppDatabase:
             cur.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform, runner FROM repos WHERE platform=%s AND owner=%s AND repo=%s",
+                "base_branch_policy, platform, runner, runner_llm FROM repos WHERE platform=%s AND owner=%s AND repo=%s",
                 (platform, owner, repo),
             )
             row = cur.fetchone()
@@ -1369,7 +1384,7 @@ class AppDatabase:
             rows = self._sqlite_conn.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform, runner FROM repos WHERE owner=? AND repo=?",
+                "base_branch_policy, platform, runner, runner_llm FROM repos WHERE owner=? AND repo=?",
                 (owner, repo),
             ).fetchall()
             return [self._sqlite_row_to_repo(r) for r in rows]
@@ -1377,7 +1392,7 @@ class AppDatabase:
             cur.execute(
                 "SELECT owner, repo, status, index_mode, files_indexed, file_count_estimate, "
                 "error, installation_id, created_at, updated_at, last_indexed_at, conventions, private, "
-                "base_branch_policy, platform, runner FROM repos WHERE owner=%s AND repo=%s",
+                "base_branch_policy, platform, runner, runner_llm FROM repos WHERE owner=%s AND repo=%s",
                 (owner, repo),
             )
             return [self._pg_row_to_repo(r) for r in cur.fetchall()]
@@ -1458,6 +1473,17 @@ class AppDatabase:
         self._exec(
             "UPDATE repos SET runner=? WHERE platform=? AND owner=? AND repo=?",
             (runner, platform, owner, repo),
+        )
+
+    def set_repo_runner_llm(
+        self, owner: str, repo: str, runner_llm: str, platform: str = "github"
+    ) -> None:
+        """Store the per-repo runner model ('' inherits), checked like the
+        runner override. It never creates a row."""
+        parse_runner_llm(runner_llm)
+        self._exec(
+            "UPDATE repos SET runner_llm=? WHERE platform=? AND owner=? AND repo=?",
+            (runner_llm, platform, owner, repo),
         )
 
     def get_setting(self, key: str) -> str | None:

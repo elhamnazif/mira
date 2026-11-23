@@ -32,7 +32,7 @@ from mira.platforms.github.oidc import (
 )
 from mira.providers.base import CheckConclusion
 from mira.providers.github import GitHubProvider
-from mira.runner import JobStatus, ReviewJob
+from mira.runner import JobStatus, ReviewJob, RunnerLLMChoice, parse_runner_llm
 from mira.runner_protocol import (
     JobSpec,
     PRKey,
@@ -180,6 +180,10 @@ def create_runner_router(
         grant = await mint(job)
         config = load_config()
         review = config.review
+        record = db.get_repo(job.owner, job.repo)
+        llm = parse_runner_llm(record.runner_llm if record else "") or RunnerLLMChoice(
+            review.runner_llm_provider, review.runner_model
+        )
         credentials = {
             name: SecretStr(value)
             for name in review.runner_credentials
@@ -197,8 +201,8 @@ def create_runner_router(
             github_token=SecretStr(grant.token),
             token_expires_at=grant.expires_at,
             credentials=credentials,
-            llm_provider=review.runner_llm_provider,
-            llm_model=review.runner_model,
+            llm_provider=llm.provider,
+            llm_model=llm.model,
         )
         logger.info("Run %s claimed review job %s for %s", job.run_id, job.id, _pr_url(job))
         return Response(content=spec.model_dump_json(), media_type="application/json")

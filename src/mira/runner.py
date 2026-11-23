@@ -48,6 +48,31 @@ def parse_runner_override(value: str) -> RunnerTarget | None:
     return RunnerTarget(RunnerKind.ACTIONS, runs_on)
 
 
+@dataclass(frozen=True)
+class RunnerLLMChoice:
+    """The model a runner reviews with: a provider (an agent CLI or a
+    ``providers.json`` profile) and a model id. An empty model means the
+    provider's default."""
+
+    provider: str
+    model: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.provider}:{self.model}"
+
+
+def parse_runner_llm(value: str) -> RunnerLLMChoice | None:
+    """Parse ``RepoRecord.runner_llm``: ``''`` inherits and returns None,
+    else ``<provider>:<model>``, e.g. ``zai-coding:glm-5.3``."""
+    if not value:
+        return None
+    provider, sep, model = value.partition(":")
+    provider, model = provider.strip(), model.strip()
+    if not sep or not provider or any(c.isspace() for c in provider + model):
+        raise ValueError(f"invalid runner model {value!r}, expected '<provider>:<model>'")
+    return RunnerLLMChoice(provider, model)
+
+
 def resolve_runner_target(override: str, review: ReviewConfig) -> RunnerTarget:
     """The repo's override when it has one, else the deployment default."""
     parsed = parse_runner_override(override)

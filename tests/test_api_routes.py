@@ -79,6 +79,8 @@ EXPECTED_ROUTES = {
     ("/api/repos/{owner:path}/{repo}/rules", "POST"),
     ("/api/repos/{owner:path}/{repo}/rules/{rule_id}", "DELETE"),
     ("/api/repos/{owner:path}/{repo}/rules/{rule_id}", "PUT"),
+    ("/api/repos/{owner:path}/{repo}/runner", "GET"),
+    ("/api/repos/{owner:path}/{repo}/runner", "PUT"),
     ("/api/repos/{owner:path}/{repo}/vulnerabilities", "GET"),
     ("/api/rules/global", "GET"),
     ("/api/rules/global", "POST"),

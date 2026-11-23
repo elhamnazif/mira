@@ -143,6 +143,24 @@ class RepoBaseBranchPolicy(BaseModel):
     branches: list[str] = Field(default_factory=list)
 
 
+class RepoRunnerSettings(BaseModel):
+    """Where a repo's reviews run and with which model.
+
+    ``runner`` is '' (inherit), 'local' or 'actions:<label>[,<label>...]';
+    ``llm`` is '' (inherit) or '<provider>:<model>'."""
+
+    runner: str = ""
+    llm: str = ""
+
+
+class RepoRunnerView(RepoRunnerSettings):
+    """The stored settings, plus what inheriting means on this deployment."""
+
+    default_runner: str
+    default_llm: str
+    providers: list[str]
+
+
 class RepoDetail(BaseModel):
     owner: str
     repo: str

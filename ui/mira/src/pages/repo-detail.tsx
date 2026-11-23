@@ -25,6 +25,7 @@ import { Input } from "@/components/ui/input"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { DependenciesTable } from "@/components/dashboard/dependencies-table"
+import { RunnerSettingsCard } from "@/components/dashboard/runner-settings"
 import { api, type BaseBranchPolicy, type ReviewContextModel } from "@/lib/api"
 import { useAuth } from "@/lib/auth-context"
 import { useAsync, useDocumentTitle } from "@/lib/hooks"
@@ -403,6 +404,7 @@ function RepoDetailPageContent({
           <TabsTrigger value="files">Files</TabsTrigger>
           <TabsTrigger value="context">Review Context</TabsTrigger>
           <TabsTrigger value="policy">Review Policy</TabsTrigger>
+          <TabsTrigger value="runner">Runner</TabsTrigger>
           <TabsTrigger value="dependencies">Dependencies</TabsTrigger>
           <TabsTrigger value="blast">Blast Radius</TabsTrigger>
         </TabsList>
@@ -681,6 +683,15 @@ function RepoDetailPageContent({
               )}
             </CardContent>
           </Card>
+        </TabsContent>
+
+        <TabsContent value="runner">
+          <RunnerSettingsCard
+            key={`${owner}/${repo}`}
+            owner={owner}
+            repo={repo}
+            canEdit={canEditContext}
+          />
         </TabsContent>
 
         {/* Dependencies — packages declared in manifests (npm, pip, docker, etc.) */}

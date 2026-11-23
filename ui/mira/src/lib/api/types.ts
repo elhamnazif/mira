@@ -34,6 +34,20 @@ export interface BaseBranchPolicy {
   branches: string[]
 }
 
+// Where a repo's reviews run and with which model. runner: "" (inherit),
+// "local" or "actions:<label>[,<label>...]". llm: "" (inherit) or
+// "<provider>:<model>".
+export interface RepoRunnerSettings {
+  runner: string
+  llm: string
+}
+
+export interface RepoRunnerView extends RepoRunnerSettings {
+  default_runner: string
+  default_llm: string
+  providers: string[]
+}
+
 export interface RepoDetail {
   owner: string
   repo: string
