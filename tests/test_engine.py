@@ -2017,8 +2017,8 @@ class TestRoundDetectionWiring:
             provider=mock_provider,
             bot_name="mira",
             state=LocalStateStore(),
+            review_only_paths={"src/skipped.py"},
         )
-        engine._review_only_paths = {"src/skipped.py"}
         await engine.review_pr("https://github.com/o/r/pull/1")
 
         assert captured["review_round"] == 1

@@ -9,12 +9,13 @@ from pathlib import Path
 import pytest
 
 from mira.config import MiraConfig
-from mira.core.state_store import LocalStateStore, ReviewRecord
+from mira.core.state_store import FeedbackRecord, LocalStateStore, ReviewRecord
 from mira.dashboard.db import AppDatabase, PRReviewProgress, RepoRecord, ReviewedVersion
 from mira.index.store import IndexStore, ReviewContext
 from mira.models import PRFingerprint
 from mira.runner_protocol import (
     PRKey,
+    RecordFeedback,
     RecordReview,
     RemoteStateStore,
     ResultBundle,
@@ -274,6 +275,54 @@ def test_apply_refuses_a_review_of_another_pr_before_writing(local: LocalStateSt
     with pytest.raises(ValueError):
         apply_writes(local, PR, [SetLastReviewedSha(sha="x"), RecordReview(review=_review(8))])
     assert local.get_last_reviewed("o", "r", 7, platform="github") == ReviewedVersion()
+
+
+def _feedback(pr_number: int = 7) -> FeedbackRecord:
+    return FeedbackRecord(
+        pr_number=pr_number,
+        pr_url=f"https://github.com/o/r/pull/{pr_number}",
+        comment_path="billing.py",
+        comment_line=4,
+        signal="rejected",
+        actor="dev",
+    )
+
+
+def _feedback_rows() -> list[dict]:
+    store = IndexStore.open("o", "r")
+    try:
+        return [
+            {k: v for k, v in asdict(e).items() if k not in {"id", "created_at"}}
+            for e in store.list_feedback()
+        ]
+    finally:
+        store.close()
+
+
+def test_applied_feedback_equals_direct_local_feedback(
+    local: LocalStateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local.record_feedback("o", "r", _feedback(), platform="github")
+    direct = _feedback_rows()
+
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "applied"))
+    remote = RemoteStateStore(_snapshot())
+    remote.record_feedback("o", "r", _feedback(), platform="github")
+    bundle = ResultBundle.model_validate_json(remote.bundle("j", "succeeded").model_dump_json())
+    apply_writes(local, PR, bundle.writes)
+
+    assert _feedback_rows() == direct
+    assert [(r["signal"], r["comment_path"], r["actor"]) for r in direct] == [
+        ("rejected", "billing.py", "dev")
+    ]
+
+
+def test_feedback_for_another_pr_is_refused(local: LocalStateStore) -> None:
+    with pytest.raises(ValueError):
+        RemoteStateStore(_snapshot()).record_feedback("o", "r", _feedback(8), platform="github")
+    with pytest.raises(ValueError):
+        apply_writes(local, PR, [RecordFeedback(feedback=_feedback(8))])
+    assert _feedback_rows() == []
 
 
 def test_runner_config_drops_the_servers_own_settings() -> None:

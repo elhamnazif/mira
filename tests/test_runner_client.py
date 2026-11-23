@@ -39,7 +39,7 @@ from mira.platforms.github.auth import InstallationToken
 from mira.platforms.github.oidc import GitHubOIDCVerifier
 from mira.platforms.github.runner_api import create_runner_router
 from mira.providers.github import GitHubProvider
-from mira.runner import JobStatus
+from mira.runner import AskTask, JobStatus, ReviewRestTask, ThreadReply, ThreadReplyTask
 from mira.runner_client import RunnerLLM, run_job, usage_report
 from mira.runner_protocol import JobSpec, ResultBundle, UsageReport
 from tests.test_engine import mock_llm  # noqa: F401  (fixture)
@@ -886,3 +886,151 @@ def test_report_failure_keeps_a_finished_or_superseded_job(
     assert result.exit_code == 0, result.output
     assert status_of(db) is status
     assert _completed_checks(github) == []
+
+
+# ── Jobs for @mentions ──
+
+
+def _check_run_requests(github: GitHubChecks) -> list[str]:
+    return [url for _, url, *_ in github.requests if "/check-runs" in url]
+
+
+async def test_an_ask_job_answers_in_a_pr_comment(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    mock_llm,  # noqa: F811
+    pr_content: AsyncMock,
+) -> None:
+    seed_job(db, task=AskTask(question="why cents?", actor="dev"), check_run_id=None)
+    mock_llm.complete.return_value = "Because amounts are cents."
+
+    assert await _run(server) == 0
+
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.SUCCEEDED
+    assert job.usage == UsageReport(input_tokens=100, output_tokens=50).model_dump(mode="json")
+    [posted] = pr_content.post_comment.await_args_list
+    assert posted.args[1] == "> @dev asked: why cents?\n\nBecause amounts are cents."
+    # The question and the PR's diff reached the model.
+    prompt = str(mock_llm.complete.await_args)
+    assert "why cents?" in prompt and "src/main.py" in prompt
+    # An answer is no review: no check run and no review state.
+    assert _check_run_requests(github) == []
+    rows = state_rows(PR)
+    assert rows["sha"] == "" and rows["events"] == []
+
+
+def _reply_task(*, may_resolve: bool) -> ThreadReplyTask:
+    reply = ThreadReply(
+        comment_id=10,
+        body="Cents are already integers here.",
+        original_suggestion="Divide by 100 before display.",
+        comment_node_id="C_10",
+        path="billing.py",
+        line=4,
+        actor="dev",
+    )
+    return ThreadReplyTask(reply=reply, may_resolve=may_resolve)
+
+
+def _feedback() -> list[tuple[int, str, int, str, str]]:
+    store = IndexStore.open("test", "repo")
+    try:
+        return [
+            (f.pr_number, f.comment_path, f.comment_line, f.signal, f.actor)
+            for f in store.list_feedback()
+        ]
+    finally:
+        store.close()
+
+
+@pytest.fixture
+def disagreement(mock_llm, pr_content: AsyncMock) -> None:  # noqa: F811
+    mock_llm.complete_with_tools.side_effect = None
+    mock_llm.complete_with_tools.return_value = (
+        '{"intent": "disagreement", "reply": "Fair, dropping it."}'
+    )
+    pr_content.get_thread_id_for_comment.return_value = "thread-1"
+
+
+async def test_a_thread_reply_job_that_disagrees_resolves_and_records_feedback(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    mock_llm,  # noqa: F811
+    pr_content: AsyncMock,
+    disagreement: None,
+) -> None:
+    seed_job(db, task=_reply_task(may_resolve=True), check_run_id=None)
+
+    assert await _run(server) == 0
+
+    assert status_of(db) is JobStatus.SUCCEEDED
+    pr_content.reply_to_review_comment.assert_awaited_once()
+    assert pr_content.reply_to_review_comment.await_args.args[1:] == (10, "Fair, dropping it.")
+    pr_content.resolve_threads.assert_awaited_once()
+    assert pr_content.resolve_threads.await_args.args[1] == ["thread-1"]
+    # The runner's feedback write landed in the server's index store.
+    assert _feedback() == [(1, "billing.py", 4, "rejected", "dev")]
+    prompt = str(mock_llm.complete_with_tools.await_args)
+    assert "Cents are already integers here." in prompt
+    assert "Divide by 100 before display." in prompt
+    assert _check_run_requests(github) == []
+
+
+async def test_a_thread_reply_job_without_the_reject_permission_only_replies(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    pr_content: AsyncMock,
+    disagreement: None,
+) -> None:
+    seed_job(db, task=_reply_task(may_resolve=False), check_run_id=None)
+
+    assert await _run(server) == 0
+
+    assert status_of(db) is JobStatus.SUCCEEDED
+    pr_content.reply_to_review_comment.assert_awaited_once()
+    pr_content.resolve_threads.assert_not_awaited()
+    assert _feedback() == []
+
+
+async def test_a_thread_reply_job_whose_model_fails_fails(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    mock_llm,  # noqa: F811
+    pr_content: AsyncMock,
+) -> None:
+    seed_job(db, task=_reply_task(may_resolve=True), check_run_id=None)
+    mock_llm.complete_with_tools.side_effect = RuntimeError("model down")
+
+    assert await _run(server) == 1
+
+    job = db.get_review_job("job-1")
+    assert job is not None and job.status is JobStatus.FAILED
+    assert job.error == "RuntimeError"
+    pr_content.reply_to_review_comment.assert_not_awaited()
+
+
+async def test_a_review_rest_job_reviews_only_the_skipped_files(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+) -> None:
+    seed_job(db, task=ReviewRestTask(paths=("src/main.py",)))
+
+    assert await _run(server) == 0
+
+    assert status_of(db) is JobStatus.SUCCEEDED
+    [event] = state_rows(PR)["events"]
+    assert (event["files_reviewed"], event["reviewed_paths"]) == (1, '["src/main.py"]')
+    # It completes the job's queued check, as a review does.
+    checks = [body for m, url, body, _ in github.requests if url.endswith("/check-runs/501")]
+    assert checks[-1]["conclusion"] == "success"

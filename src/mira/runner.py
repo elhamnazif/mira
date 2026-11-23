@@ -1,15 +1,19 @@
-"""Where a review runs, and the job record for reviews run outside the server.
+"""Where a review runs, and the job record for work run outside the server.
 
-``local`` reviews in the server process. ``actions`` dispatches the repo's
-``mira.yml`` workflow, whose ``runs-on`` takes the target's labels, and tracks
-the run as a :class:`ReviewJob`.
+``local`` runs every model call in the server process. ``actions``
+dispatches the repo's ``mira.yml`` workflow, whose ``runs-on`` takes the
+target's labels, and tracks the run as a :class:`ReviewJob`. A job runs one
+:data:`JobTask`: a review, or an answer to an @mention.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 if TYPE_CHECKING:
     from mira.config import ReviewConfig
@@ -117,9 +121,84 @@ def check_transition(old: JobStatus, new: JobStatus) -> None:
         raise IllegalJobTransition(f"review job cannot go from {old} to {new}")
 
 
+class JobKind(StrEnum):
+    REVIEW = "review"
+    REVIEW_REST = "review_rest"
+    ASK = "ask"
+    THREAD_REPLY = "thread_reply"
+
+    @property
+    def reviews_pr(self) -> bool:
+        """Whether the job reviews the PR and writes its review state. A PR
+        has one such job active at a time. The others only post a reply."""
+        return self in (JobKind.REVIEW, JobKind.REVIEW_REST)
+
+
+class _Task(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class ReviewTask(_Task):
+    kind: Literal[JobKind.REVIEW] = JobKind.REVIEW
+
+
+class ReviewRestTask(_Task):
+    """Review only ``paths``, the files an earlier pass skipped."""
+
+    kind: Literal[JobKind.REVIEW_REST] = JobKind.REVIEW_REST
+    paths: tuple[str, ...]
+
+
+class AskTask(_Task):
+    """Answer a question ``actor`` asked in a PR comment."""
+
+    kind: Literal[JobKind.ASK] = JobKind.ASK
+    question: str
+    actor: str
+
+
+class ThreadReply(_Task):
+    """A human's reply in one of Mira's review threads. ``body`` has the
+    mention stripped. A thread is named by ``thread_id`` or, on GitHub, by
+    the reply's ``comment_node_id``."""
+
+    comment_id: int
+    body: str
+    original_suggestion: str = ""
+    thread_id: str | None = None
+    comment_node_id: str | None = None
+    path: str = ""
+    line: int = 0
+    actor: str = ""
+
+
+class ThreadReplyTask(_Task):
+    """Answer a thread reply. A disagreement also resolves the thread, which
+    needs the reject permission: ``may_resolve`` is the server's verdict."""
+
+    kind: Literal[JobKind.THREAD_REPLY] = JobKind.THREAD_REPLY
+    reply: ThreadReply
+    may_resolve: bool
+
+
+JobTask = Annotated[
+    ReviewTask | ReviewRestTask | AskTask | ThreadReplyTask, Field(discriminator="kind")
+]
+_JOB_TASK: TypeAdapter[JobTask] = TypeAdapter(JobTask)
+
+
+def task_payload(task: JobTask) -> str:
+    """The task as stored beside its kind: JSON without the kind."""
+    return task.model_dump_json(exclude={"kind"})
+
+
+def parse_task(kind: str, payload: str) -> JobTask:
+    return _JOB_TASK.validate_python({**json.loads(payload), "kind": kind})
+
+
 @dataclass
 class ReviewJob:
-    """One dispatched review. ``id`` is the unguessable workflow input the
+    """One dispatched job. ``id`` is the unguessable workflow input the
     runner later presents to claim the job."""
 
     id: str
@@ -129,6 +208,7 @@ class ReviewJob:
     head_sha: str
     installation_id: int
     runs_on: tuple[str, ...]
+    task: JobTask = ReviewTask()
     status: JobStatus = JobStatus.DISPATCHED
     check_run_id: int | None = None
     run_id: int | None = None
@@ -139,3 +219,7 @@ class ReviewJob:
     finished_at: float = 0.0
     # The runner's UsageReport as plain data. None until its result lands.
     usage: dict[str, Any] | None = None
+
+    @property
+    def kind(self) -> JobKind:
+        return self.task.kind

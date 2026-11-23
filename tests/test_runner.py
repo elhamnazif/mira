@@ -12,10 +12,15 @@ from mira.dashboard.db import AppDatabase
 from mira.exceptions import ConfigError
 from mira.runner import (
     IllegalJobTransition,
+    JobKind,
     JobStatus,
     ReviewJob,
+    ReviewRestTask,
+    ReviewTask,
     RunnerKind,
     RunnerTarget,
+    ThreadReply,
+    ThreadReplyTask,
     parse_runner_override,
     resolve_runner_target,
 )
@@ -175,6 +180,26 @@ class TestReviewJobs:
         assert job.run_id == 45_038_116_508
         assert job.run_url == "https://github.com/o/r/actions/runs/1"
 
+    @pytest.mark.parametrize(
+        "task",
+        [
+            ReviewTask(),
+            ReviewRestTask(paths=("a.py", "b.py")),
+            ThreadReplyTask(
+                reply=ThreadReply(comment_id=10, body="why?", comment_node_id="C_10", line=4),
+                may_resolve=True,
+            ),
+        ],
+    )
+    def test_a_jobs_task_round_trips(self, db: AppDatabase, task):
+        job = _job()
+        job.task = task
+        db.create_review_job(job)
+        stored = db.get_review_job("j1")
+        assert stored is not None
+        assert stored.task == task
+        assert db._rows("SELECT kind FROM review_jobs") == [(task.kind.value,)]
+
     def test_active_jobs_exclude_finished(self, db: AppDatabase):
         db.create_review_job(_job("old"))
         db.create_review_job(_job("new", head_sha="sha2"))
@@ -226,7 +251,7 @@ class TestReviewJobs:
         assert job is not None
         assert job.usage == {"model": "opus", "input_tokens": 10}
 
-    def test_migration_adds_usage_column(self, tmp_path: Path):
+    def test_migration_adds_usage_and_task_columns(self, tmp_path: Path):
         raw = tmp_path / "pr2.db"
         conn = sqlite3.connect(raw)
         conn.executescript(
@@ -259,4 +284,6 @@ class TestReviewJobs:
         job = db.get_review_job("old")
         assert job is not None
         assert job.usage is None
+        # Every job before job kinds was a review.
+        assert job.kind is JobKind.REVIEW and job.task == ReviewTask()
         assert db.record_review_job_result("old", {})

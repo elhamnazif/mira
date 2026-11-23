@@ -1,8 +1,9 @@
 """Persistent review state the engine reads and writes outside the Git host.
 
-``ReviewEngine.review_pr`` goes through a ``ReviewStateStore`` instead of the
-dashboard database and the per-repo index store, so a review can run where
-neither exists. Every argument and return value is plain data.
+``ReviewEngine.review_pr`` and the thread-reply handler go through a
+``ReviewStateStore`` instead of the dashboard database and the per-repo index
+store, so they can run where neither exists. Every argument and return value
+is plain data.
 """
 
 from __future__ import annotations
@@ -44,6 +45,18 @@ class ReviewRecord:
     comments: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class FeedbackRecord:
+    """A human's verdict on one of Mira's review comments."""
+
+    pr_number: int
+    pr_url: str
+    comment_path: str
+    comment_line: int
+    signal: str
+    actor: str
+
+
 class ReviewStateStore(Protocol):
     def get_repo(self, owner: str, repo: str) -> RepoRecord | None: ...
 
@@ -81,6 +94,10 @@ class ReviewStateStore(Protocol):
 
     def upsert_pr_fingerprint(
         self, owner: str, repo: str, fingerprint: PRFingerprint, *, platform: str
+    ) -> None: ...
+
+    def record_feedback(
+        self, owner: str, repo: str, feedback: FeedbackRecord, *, platform: str
     ) -> None: ...
 
 
@@ -177,3 +194,19 @@ class LocalStateStore:
     ) -> None:
         with _index(owner, repo, platform) as store:
             store.upsert_pr_fingerprint(fingerprint)
+
+    def record_feedback(
+        self, owner: str, repo: str, feedback: FeedbackRecord, *, platform: str
+    ) -> None:
+        with _index(owner, repo, platform) as store:
+            store.record_feedback(
+                pr_number=feedback.pr_number,
+                pr_url=feedback.pr_url,
+                comment_path=feedback.comment_path,
+                comment_line=feedback.comment_line,
+                comment_category="",
+                comment_severity="",
+                comment_title="",
+                signal=feedback.signal,
+                actor=feedback.actor,
+            )

@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,7 @@ from jinja2 import Environment, FileSystemLoader
 from mira.config import load_config
 from mira.core.engine import ReviewEngine
 from mira.core.review_status import tracker as review_tracker
-from mira.core.state_store import LocalStateStore
+from mira.core.state_store import FeedbackRecord, LocalStateStore, ReviewStateStore
 from mira.dashboard.models_config import llm_config_for
 from mira.index.store import IndexStore
 from mira.llm import create_llm
@@ -24,8 +26,19 @@ from mira.llm.tool_schemas import SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.mentions import strip_mentions
+from mira.runner import (
+    AskTask,
+    JobTask,
+    ReviewRestTask,
+    ReviewTask,
+    ThreadReply,
+    ThreadReplyTask,
+)
 
 logger = logging.getLogger(__name__)
+
+# Hands a task to an Actions runner. A handler given one runs no model itself.
+Dispatch = Callable[[JobTask], Awaitable[None]]
 
 _REVIEW_KEYWORDS = {"review", "review this", "review this pr"}
 
@@ -197,11 +210,13 @@ async def run_pr_command(
     platform: str = "github",
     pr_title: str = "",
     user_id: int | str | None = None,
+    dispatch: Dispatch | None = None,
 ) -> None:
     """Platform-neutral handler for an @-mention command on a PR/MR.
 
     Dispatches help / review / review-rest / free-form Q&A through the provider
-    and engine. Shared by the GitHub and GitLab comment handlers.
+    and engine. Shared by the GitHub and GitLab comment handlers. With
+    ``dispatch``, review, review-rest and Q&A go to it as a task instead.
     """
     repo_full = f"{owner}/{repo}"
     config = load_config()
@@ -224,24 +239,15 @@ async def run_pr_command(
         logger.warning("Command %r cannot run through run_pr_command", command)
         return
 
-    from mira.dashboard.models_config import llm_config_for
-
-    llm = create_llm(llm_config_for("review", config.llm))
-    indexing_llm = create_llm(llm_config_for("indexing", config.llm))
-    security_llm = create_llm(llm_config_for("security", config.llm))
-
-    is_review = command == "review"
-    is_review_rest = command == "review_rest"
-    is_help = command == "help"
-
-    if is_help:
+    if command == "help":
         pr_info_for_help = await provider.get_pr_info(pr_url)
         await provider.post_comment(pr_info_for_help, _help_message(bot_name))
         logger.info("Help requested on %s by @%s", pr_url, actor)
         return
 
     state = LocalStateStore()
-    if is_review_rest:
+    task: JobTask
+    if command == "review_rest":
         progress = state.get_pr_review_progress(owner, repo, number, platform=platform)
         if not progress or not progress.skipped_paths:
             pr_info_for_reply = await provider.get_pr_info(pr_url)
@@ -251,60 +257,58 @@ async def run_pr_command(
                 "PR has already been covered. 🎉",
             )
             return
-        engine = ReviewEngine(
-            config=config,
-            llm=llm,
-            provider=provider,
-            bot_name=bot_name,
-            indexing_llm=indexing_llm,
-            security_llm=security_llm,
-            state=state,
-        )
-        engine._review_only_paths = set(progress.skipped_paths)  # type: ignore[attr-defined]
-        if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
-            logger.info("Review already in progress for %s, skipping", pr_url)
-            return
-        logger.info(
-            "review-rest on %s by @%s — %d file(s)", pr_url, actor, len(progress.skipped_paths)
-        )
-        try:
-            await engine.review_pr(pr_url)
-            review_tracker.complete(repo_full, number)
-        except Exception as exc:
-            review_tracker.fail(repo_full, number, str(exc))
-            raise
-    elif is_review:
-        engine = ReviewEngine(
-            config=config,
-            llm=llm,
-            provider=provider,
-            bot_name=bot_name,
-            indexing_llm=indexing_llm,
-            security_llm=security_llm,
-            state=state,
-        )
-        if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
-            logger.info("Review already in progress for %s, skipping", pr_url)
-            return
-        logger.info("Re-review triggered for %s by @%s", pr_url, actor)
-        try:
-            await engine.review_pr(pr_url)
-            review_tracker.complete(repo_full, number)
-        except Exception as exc:
-            review_tracker.fail(repo_full, number, str(exc))
-            raise
+        task = ReviewRestTask(paths=tuple(progress.skipped_paths))
+    elif command == "review":
+        task = ReviewTask()
     else:
-        pr_info = await provider.get_pr_info(pr_url)
-        diff_text = await provider.get_pr_diff(pr_info)
-        messages = build_conversation_prompt(
-            question=question,
-            diff_text=diff_text,
-            pr_title=pr_info.title,
-            pr_description=pr_info.description,
-        )
-        response = await llm.complete(messages, json_mode=False)
-        await provider.post_comment(pr_info, f"> @{actor} asked: {question}\n\n{response}")
-        logger.info("Replied to comment on %s", pr_url)
+        task = AskTask(question=question, actor=actor)
+    if dispatch is not None:
+        await dispatch(task)
+        return
+
+    llm = create_llm(llm_config_for("review", config.llm))
+    if isinstance(task, AskTask):
+        await answer_question(provider, llm, pr_url, task)
+        return
+    only_paths = set(task.paths) if isinstance(task, ReviewRestTask) else None
+    engine = ReviewEngine(
+        config=config,
+        llm=llm,
+        provider=provider,
+        bot_name=bot_name,
+        indexing_llm=create_llm(llm_config_for("indexing", config.llm)),
+        security_llm=create_llm(llm_config_for("security", config.llm)),
+        state=state,
+        review_only_paths=only_paths,
+    )
+    if not review_tracker.try_start(repo_full, number, pr_title, pr_url):
+        logger.info("Review already in progress for %s, skipping", pr_url)
+        return
+    if only_paths is None:
+        logger.info("Re-review triggered for %s by @%s", pr_url, actor)
+    else:
+        logger.info("review-rest on %s by @%s — %d file(s)", pr_url, actor, len(only_paths))
+    try:
+        await engine.review_pr(pr_url)
+        review_tracker.complete(repo_full, number)
+    except Exception as exc:
+        review_tracker.fail(repo_full, number, str(exc))
+        raise
+
+
+async def answer_question(provider: Any, llm: Any, pr_url: str, task: AskTask) -> None:
+    """Answer a question about the PR in a comment, with its diff as context."""
+    pr_info = await provider.get_pr_info(pr_url)
+    diff_text = await provider.get_pr_diff(pr_info)
+    messages = build_conversation_prompt(
+        question=task.question,
+        diff_text=diff_text,
+        pr_title=pr_info.title,
+        pr_description=pr_info.description,
+    )
+    response = await llm.complete(messages, json_mode=False)
+    await provider.post_comment(pr_info, f"> @{task.actor} asked: {task.question}\n\n{response}")
+    logger.info("Replied to comment on %s", pr_url)
 
 
 async def run_thread_reply(
@@ -322,42 +326,83 @@ async def run_thread_reply(
     bot_name: str = "miracodeai",
     platform: str = "github",
     user_id: int | str | None = None,
+    dispatch: Dispatch | None = None,
 ) -> None:
-    """Platform-neutral free-form thread reply with intent classification.
-
-    The LLM classifies the human's message and we respond accordingly:
-    ``disagreement`` → reply + resolve the thread + record a ``rejected``
-    feedback signal (same learning signal as an explicit reject); ``question``
-    → answer, leave open; ``agreement`` / ``other`` → acknowledge, leave open.
-    """
+    """Platform-neutral free-form thread reply (see :func:`reply_in_thread`).
+    With ``dispatch``, the reply goes to it as a task instead."""
     config = load_config()
-    if not await is_command_allowed(
-        config,
-        "ask",
-        actor,
-        provider=provider,
-        owner=pr_info.owner,
-        repo=pr_info.repo,
-        user_id=user_id,
-    ):
+
+    async def allowed(command: str) -> bool:
+        return await is_command_allowed(
+            config,
+            command,
+            actor,
+            provider=provider,
+            owner=pr_info.owner,
+            repo=pr_info.repo,
+            user_id=user_id,
+        )
+
+    if not await allowed("ask"):
+        return
+    reply = ThreadReply(
+        comment_id=comment_id,
+        body=human_reply,
+        original_suggestion=original_suggestion,
+        thread_id=thread_id,
+        comment_node_id=comment_node_id,
+        path=comment_path,
+        line=comment_line,
+        actor=actor,
+    )
+    if dispatch is not None:
+        await dispatch(ThreadReplyTask(reply=reply, may_resolve=await allowed("reject")))
         return
     llm = create_llm(llm_config_for("indexing", config.llm))
+    try:
+        await reply_in_thread(
+            provider,
+            llm,
+            pr_info,
+            reply,
+            may_resolve=partial(allowed, "reject"),
+            state=LocalStateStore(),
+            platform=platform,
+        )
+    except Exception as exc:
+        logger.warning("Free-form thread reply failed: %s", exc)
+
+
+async def reply_in_thread(
+    provider: Any,
+    llm: Any,
+    pr_info: Any,
+    reply: ThreadReply,
+    *,
+    may_resolve: Callable[[], Awaitable[bool]],
+    state: ReviewStateStore,
+    platform: str,
+) -> None:
+    """Classify the human's reply with the model and answer in the thread.
+
+    ``disagreement`` → reply + resolve the thread + record a ``rejected``
+    feedback signal (same learning signal as an explicit reject), if
+    ``may_resolve`` says the human may reject; ``question`` → answer, leave
+    open; ``agreement`` / ``other`` → acknowledge, leave open. Raises when the
+    model call or posting the reply fails.
+    """
     prompt = _THREAD_REPLY_TEMPLATE.render(
-        user_reply=human_reply or "(empty)",
-        original_suggestion=original_suggestion,
+        user_reply=reply.body or "(empty)",
+        original_suggestion=reply.original_suggestion,
     )
     # Tool calling forces a schema-valid result — more reliable than parsing
     # free-form JSON. The provider's tenacity decorator retries transient fails.
-    try:
-        raw = await llm.complete_with_tools(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[SUBMIT_THREAD_REPLY_TOOL],
-            temperature=0.0,
-        )
-        data = json.loads(strip_think_blocks(strip_code_fences(raw))) if raw else {}
-    except Exception as exc:
-        logger.warning("Free-form thread reply LLM call failed: %s", exc)
-        return
+    raw = await llm.complete_with_tools(
+        messages=[{"role": "user", "content": prompt}],
+        tools=[SUBMIT_THREAD_REPLY_TOOL],
+        temperature=0.0,
+    )
+    data = json.loads(strip_think_blocks(strip_code_fences(raw))) if raw else {}
 
     intent = str(data.get("intent", "other")).lower()
     reply_text = str(data.get("reply", "")).strip()
@@ -365,47 +410,29 @@ async def run_thread_reply(
         logger.warning("Free-form thread reply: empty reply (intent=%s). Skipping.", intent)
         return
 
-    try:
-        await provider.reply_to_review_comment(pr_info, comment_id, reply_text)
-    except Exception as exc:
-        logger.warning("Failed to post thread reply: %s", exc)
-        return
+    await provider.reply_to_review_comment(pr_info, reply.comment_id, reply_text)
 
     # A free-form disagreement is an implicit ``reject``: resolving the thread
     # and recording feedback must honour the reject policy, not just ``ask``.
-    if intent == "disagreement" and await is_command_allowed(
-        config,
-        "reject",
-        actor,
-        provider=provider,
-        owner=pr_info.owner,
-        repo=pr_info.repo,
-        user_id=user_id,
-    ):
+    if intent == "disagreement" and await may_resolve():
         try:
-            tid = thread_id
-            if tid is None and comment_node_id:
-                tid = await provider.get_thread_id_for_comment(comment_node_id, pr_info)
+            tid = reply.thread_id
+            if tid is None and reply.comment_node_id:
+                tid = await provider.get_thread_id_for_comment(reply.comment_node_id, pr_info)
             if tid:
                 await provider.resolve_threads(pr_info, [tid])
         except Exception as exc:
             logger.warning("Failed to resolve disagreement thread: %s", exc)
+        feedback = FeedbackRecord(
+            pr_number=pr_info.number,
+            pr_url=pr_info.url,
+            comment_path=reply.path,
+            comment_line=reply.line,
+            signal="rejected",
+            actor=reply.actor,
+        )
         try:
-            store = _open_store(pr_info.owner, pr_info.repo, platform)
-            try:
-                store.record_feedback(
-                    pr_number=pr_info.number,
-                    pr_url=pr_info.url,
-                    comment_path=comment_path,
-                    comment_line=comment_line,
-                    comment_category="",
-                    comment_severity="",
-                    comment_title="",
-                    signal="rejected",
-                    actor=actor,
-                )
-            finally:
-                store.close()
+            state.record_feedback(pr_info.owner, pr_info.repo, feedback, platform=platform)
         except Exception as fb_err:
             logger.debug("Failed to record disagreement feedback: %s", fb_err)
 

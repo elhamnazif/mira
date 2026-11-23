@@ -22,14 +22,14 @@ from mira.platforms.base_branch_policy import base_branch_is_filtered_for_repo
 from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.fetch import make_fetcher
 from mira.platforms.github.auth import GitHubAppAuth
-from mira.platforms.github.dispatch import dispatch_review
+from mira.platforms.github.dispatch import dispatch_job
 from mira.platforms.handlers import (
     _PAUSE_KEYWORDS,
     _REJECT_KEYWORDS,
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
+    Dispatch,
     _open_store,
-    classify_command,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -44,8 +44,9 @@ from mira.platforms.mentions import (
     strip_mentions,
 )
 from mira.providers import create_provider
+from mira.providers.base import BaseProvider
 from mira.providers.github import GitHubProvider
-from mira.runner import RunnerKind, RunnerTarget, resolve_runner_target
+from mira.runner import JobTask, ReviewTask, RunnerKind, RunnerTarget, resolve_runner_target
 
 logger = logging.getLogger(__name__)
 
@@ -421,8 +422,6 @@ async def _handle_thread_freeform_reply(
         # Record the human reply for the activity conversation timeline
         # (best-effort — never let bookkeeping break the reply handler).
         _record_human_reply(owner, repo, number, pr_info.url, comment)
-        if _skip_model_command(owner, repo, number, "a thread reply"):
-            return
 
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         user_reply = strip_mentions(comment["body"], names)
@@ -442,6 +441,7 @@ async def _handle_thread_freeform_reply(
             actor=comment["user"]["login"],
             bot_name=bot_name,
             user_id=comment["user"].get("id"),
+            dispatch=_dispatcher(provider, payload, pr_info.url),
         )
     except Exception:
         logger.exception("Error handling free-form thread reply")
@@ -619,23 +619,28 @@ def _runner_target(owner: str, repo: str) -> RunnerTarget:
     return resolve_runner_target(record.runner if record else "", load_config().review)
 
 
-# The @mention commands that run a model. On a repo that reviews on Actions
-# the server runs none of them; until they are dispatched as jobs, they are
-# skipped. help, pause, resume and reject run no model and still work.
-_MODEL_COMMANDS = frozenset({"review", "review_rest", "ask"})
+def _dispatcher(provider: BaseProvider, payload: dict[str, Any], pr_url: str) -> Dispatch | None:
+    """Where a comment's model work goes: None runs it in this process, else
+    it becomes a job for the repo's Actions runner, as a review does."""
+    repository = payload["repository"]
+    target = _runner_target(repository["owner"]["login"], repository["name"])
+    if target.kind is not RunnerKind.ACTIONS:
+        return None
+    assert isinstance(provider, GitHubProvider)
 
+    async def dispatch(task: JobTask) -> None:
+        await dispatch_job(
+            provider,
+            _get_app_db(),
+            await provider.get_pr_info(pr_url),
+            task,
+            default_branch=repository["default_branch"],
+            installation_id=payload.get("installation", {}).get("id", 0),
+            runs_on=target.runs_on,
+            server_url=load_config().review.runner_server_url,
+        )
 
-def _skip_model_command(owner: str, repo: str, number: int, what: str) -> bool:
-    if _runner_target(owner, repo).kind is not RunnerKind.ACTIONS:
-        return False
-    logger.info(
-        "Skipped %s on %s/%s#%d: this repo reviews on GitHub Actions, and the server runs no model",
-        what,
-        owner,
-        repo,
-        number,
-    )
-    return True
+    return dispatch
 
 
 async def handle_pull_request(
@@ -679,10 +684,11 @@ async def handle_pull_request(
                 repo=repo,
                 head_sha=pr["head"]["sha"],
             )
-            await dispatch_review(
+            await dispatch_job(
                 provider,
                 _get_app_db(),
                 pr_info,
+                ReviewTask(),
                 default_branch=payload["repository"]["default_branch"],
                 installation_id=installation_id,
                 runs_on=target.runs_on,
@@ -728,12 +734,6 @@ async def handle_comment(
         repo = payload["repository"]["name"]
         number = payload["issue"]["number"]
         pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
-        command = classify_command(question, [])
-        if command in _MODEL_COMMANDS and _skip_model_command(
-            owner, repo, number, f"@{bot_name} {command}"
-        ):
-            return
-
         provider = create_provider(
             "github", partial(app_auth.get_installation_token, installation_id)
         )
@@ -748,6 +748,7 @@ async def handle_comment(
             bot_name,
             pr_title=payload["issue"].get("title", ""),
             user_id=payload["comment"]["user"].get("id"),
+            dispatch=_dispatcher(provider, payload, pr_url),
         )
     except Exception:
         logger.exception("Error handling comment event")
