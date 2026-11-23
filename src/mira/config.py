@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
@@ -436,6 +437,30 @@ class ReviewConfig(BaseModel):
     # the workflow as its server_url input. An actions review dispatched
     # without one fails its check and says so. Deployment only.
     runner_server_url: str = ""
+    # Model credentials a runner gets with its job, by env var name, e.g.
+    # ["CLAUDE_CODE_OAUTH_TOKEN", "ZAI_API_KEY"]. Each value comes from this
+    # server's environment, so the repos it reviews need no secrets of their
+    # own. A repo secret of the same name wins. Deployment only.
+    runner_credentials: list[str] = Field(default_factory=list)
+    # The model a runner uses when its repo sets no MIRA_RUNNER_* variables,
+    # e.g. runner_llm_provider "zai" and runner_model "glm-5.3". Empty means
+    # the runner's own default. Deployment only.
+    runner_llm_provider: str = ""
+    runner_model: str = ""
+
+    @field_validator("runner_credentials")
+    @classmethod
+    def _validate_runner_credentials(cls, v: list[str]) -> list[str]:
+        for name in v:
+            if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+                raise ValueError(
+                    f"review.runner_credentials entries must be env var names: {name!r}"
+                )
+            # The server's own secrets (the App key, the webhook secret, the
+            # database URL) are MIRA_*; only the runner key among them may go.
+            if name.startswith("MIRA_") and name != "MIRA_LLM_API_KEY":
+                raise ValueError(f"review.runner_credentials cannot forward {name}")
+        return v
 
     @field_validator("runs_on")
     @classmethod
@@ -552,6 +577,9 @@ _DEPLOYMENT_ONLY_REVIEW_KEYS = frozenset(
         "runner_oidc_audience",
         "runner_claim_timeout_minutes",
         "runner_server_url",
+        "runner_credentials",
+        "runner_llm_provider",
+        "runner_model",
     }
 )
 

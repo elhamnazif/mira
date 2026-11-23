@@ -388,6 +388,59 @@ def test_tokens_are_masked_in_actions_logs(
     assert capsys.readouterr().out == ""
 
 
+def test_server_credentials_fill_only_what_the_runner_lacks(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "repo-secret-token")
+    # An unset repo secret reaches the step as an empty string.
+    monkeypatch.setenv("ZAI_API_KEY", "")
+    spec = cast(
+        JobSpec,
+        SimpleNamespace(
+            credentials={
+                "CLAUDE_CODE_OAUTH_TOKEN": SecretStr("server-token"),
+                "ZAI_API_KEY": SecretStr("server-zai-key"),
+            }
+        ),
+    )
+    runner_client._adopt_credentials(spec)
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "repo-secret-token"
+    assert os.environ["ZAI_API_KEY"] == "server-zai-key"
+    assert capsys.readouterr().out == ("::add-mask::server-token\n::add-mask::server-zai-key\n")
+
+
+async def test_without_a_model_of_its_own_the_runner_uses_the_servers(
+    server: FastAPI,
+    db: AppDatabase,  # noqa: F811
+    github: GitHubChecks,
+    runner_side: MagicMock,
+    no_llm_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_config = MiraConfig(
+        review=ReviewConfig(
+            runner_workflow_refs=[REF],
+            runner_credentials=["ZAI_API_KEY"],
+            runner_llm_provider="zai",
+            runner_model="glm-5.3",
+        )
+    )
+    monkeypatch.setattr(
+        "mira.platforms.github.runner_api.load_config", lambda *a, **k: server_config
+    )
+    monkeypatch.setenv("ZAI_API_KEY", "server-zai-key")
+    seed_job(db)
+
+    assert await _run(server) == 0
+
+    configs = [c.args[0] for c in runner_side.call_args_list]
+    assert {(c.provider, c.base_url, c.api_key_env) for c in configs} == {
+        ("openai", "https://api.z.ai/api/paas/v4", "ZAI_API_KEY")
+    }
+    assert {c.model for c in configs} == {"glm-5.3"}
+
+
 def test_the_cli_rejects_a_plain_http_server() -> None:
     from click.testing import CliRunner
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from functools import partial
 
@@ -177,6 +178,13 @@ def create_runner_router(
             return _conflict(job)
         snapshot = build_snapshot(LocalStateStore(), _pr_key(job))
         grant = await mint(job)
+        config = load_config()
+        review = config.review
+        credentials = {
+            name: SecretStr(value)
+            for name in review.runner_credentials
+            if (value := os.environ.get(name))
+        }
         spec = JobSpec(
             job_id=job.id,
             pr_url=_pr_url(job),
@@ -184,10 +192,13 @@ def create_runner_router(
             platform="github",
             bot_name=bot_name,
             check_run_id=job.check_run_id,
-            config=runner_config(load_config()),
+            config=runner_config(config),
             snapshot=snapshot,
             github_token=SecretStr(grant.token),
             token_expires_at=grant.expires_at,
+            credentials=credentials,
+            llm_provider=review.runner_llm_provider,
+            llm_model=review.runner_model,
         )
         logger.info("Run %s claimed review job %s for %s", job.run_id, job.id, _pr_url(job))
         return Response(content=spec.model_dump_json(), media_type="application/json")

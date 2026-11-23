@@ -111,6 +111,11 @@ class JobSpec(_Wire):
     snapshot: StateSnapshot
     github_token: WireSecret
     token_expires_at: datetime
+    # Model credentials from the server (review.runner_credentials), by env
+    # var name, and the model to use when the repo names none.
+    credentials: dict[str, WireSecret] = Field(default_factory=dict)
+    llm_provider: str = ""
+    llm_model: str = ""
 
 
 class TokenGrant(_Wire):

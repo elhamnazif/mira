@@ -19,13 +19,16 @@ The job's `runs-on` comes from the server: `review.runs_on` (default
 2. **Add the workflow.** Copy [`mira.yml`](mira.yml) to
    `.github/workflows/mira.yml` on the repo's default branch. GitHub only
    dispatches workflows that exist on the default branch.
-3. **Choose the model.** Set the Actions secret and variables for one of the
-   setups below, on the repo or its org.
+3. **Choose the model.** Nothing to do when the server hands runners its
+   keys and model (see [Keys from the server](#keys-from-the-server)).
+   Otherwise, or to use a different model on this repo, set the Actions
+   secret and variables for one of the setups below.
 
 ## Choose the model
 
-Each repo picks its model with Actions secrets and variables. The key stays
-in the repo's Actions run and never reaches the Mira server. Leave every
+A repo can pick its own model with Actions secrets and variables, which
+override the server's. A key set this way stays in the repo's Actions run and
+never reaches the Mira server. Leave every
 setting a setup does not list unset. A missing secret fails the job at once,
 and the PR's **Mira** check names the secret to set.
 
@@ -122,6 +125,26 @@ check with a message that names the key.
 `runner_workflow_refs` lists the exact reusable workflows the server
 trusts, matched against the OIDC token's `job_workflow_ref` claim. An
 empty list rejects every runner.
+
+### Keys from the server
+
+GitHub Free gives private repos no access to org-level secrets, so a key set
+once for every repo has to come from the server instead. List the env var
+names, set their values in the server's environment, and name a default
+model:
+
+```yaml
+review:
+  runner_credentials: [CLAUDE_CODE_OAUTH_TOKEN, ZAI_API_KEY]
+  runner_llm_provider: zai        # used when the repo sets no MIRA_RUNNER_* variables
+  runner_model: glm-5.3
+```
+
+The server sends these values with the job when the runner claims it. A
+claim needs the job's OIDC token from a workflow in `runner_workflow_refs`,
+so no other workflow can get them. The runner masks each value in the run's
+log. A repo secret of the same name takes precedence. `runner_credentials`
+cannot name the server's own `MIRA_*` secrets, except `MIRA_LLM_API_KEY`.
 
 ## Self-hosted runners
 

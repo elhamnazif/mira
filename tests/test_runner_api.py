@@ -666,3 +666,50 @@ def test_a_bundle_write_is_typed_on_the_wire() -> None:
         '{"job_id": "j", "outcome": "succeeded", "writes": [{"op": "set_last_reviewed_sha", "sha": "a"}]}'
     )
     assert ok.writes == [SetLastReviewedSha(sha="a")]
+
+
+def test_the_claim_carries_the_listed_credentials_and_default_model(
+    client: TestClient,
+    db: AppDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    review = {
+        "runner_workflow_refs": [REF],
+        "runner_credentials": ["ZAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+        "runner_llm_provider": "zai",
+        "runner_model": "glm-5.3",
+    }
+    monkeypatch.setattr(mira_config, "_global_defaults", {"review": review})
+    monkeypatch.setenv("ZAI_API_KEY", "zai-server-key-123")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "not-listed-key-123")
+    seed_job(db)
+
+    with caplog.at_level(logging.DEBUG):
+        resp = claim(client)
+
+    spec = JobSpec.model_validate_json(resp.content)
+    # Only listed names the server has a value for.
+    assert {k: v.get_secret_value() for k, v in spec.credentials.items()} == {
+        "ZAI_API_KEY": "zai-server-key-123"
+    }
+    assert (spec.llm_provider, spec.llm_model) == ("zai", "glm-5.3")
+    # The job's config carries none of it, and no log line has the key.
+    assert "runner_credentials" not in spec.config.get("review", {})
+    assert "zai-server-key-123" not in caplog.text
+
+
+@pytest.mark.parametrize("name", ["MIRA_GITHUB_PRIVATE_KEY", "MIRA_WEBHOOK_SECRET", "zai key"])
+def test_runner_credentials_refuse_server_secrets_and_bad_names(name: str) -> None:
+    with pytest.raises(ValueError):
+        MiraConfig(review={"runner_credentials": [name]})  # type: ignore[arg-type]
+
+
+def test_a_repo_file_cannot_add_runner_credentials(tmp_path: Path) -> None:
+    (tmp_path / ".mira.yaml").write_text(
+        "review:\n  runner_credentials: [ZAI_API_KEY]\n  runner_model: other\n"
+    )
+    config = load_config(str(tmp_path / ".mira.yaml"))
+    assert config.review.runner_credentials == []
+    assert config.review.runner_model == ""

@@ -272,6 +272,10 @@ class RunnerLLM:
     base_url: str | None = None
     api_style: str | None = None
 
+    def chosen(self) -> bool:
+        """Whether the runner named a model or endpoint of its own."""
+        return bool(self.provider or self.model or self.base_url)
+
     def settings(self) -> dict[str, Any]:
         """The llm settings that choose the endpoint. They replace the spec's
         in full: those describe the server's machine, and a repo's
@@ -403,6 +407,13 @@ async def run_job(
     if spec is None:
         return 0
     logger.info("Claimed job %s: %s at %s", job_id, spec.pr_url, spec.head_sha[:12])
+    _adopt_credentials(spec)
+    if not llm.chosen():
+        llm = RunnerLLM(
+            provider=spec.llm_provider or None,
+            model=spec.llm_model or None,
+            api_style=llm.api_style,
+        )
 
     tokens = TokenSupplier(api, spec)
     store = RemoteStateStore(spec.snapshot)
@@ -425,6 +436,17 @@ async def run_job(
             with suppress(TimeoutError):
                 async with asyncio.timeout(_REVOKE_AFTER_STOP_S if signals else None):
                     await tokens.revoke(http)
+
+
+def _adopt_credentials(spec: JobSpec) -> None:
+    """Put the server's model credentials in this process's environment,
+    where the LLM providers read them. One the runner already has, from a
+    repo secret, wins."""
+    for name, secret in spec.credentials.items():
+        value = secret.get_secret_value()
+        _mask(value)
+        if not os.environ.get(name):
+            os.environ[name] = value
 
 
 async def _review(
